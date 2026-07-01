@@ -5,6 +5,7 @@ __pycache__/
 venv/
 env/
 kwan_handover_venv_py39/
+activate_kwan_env.sh
 
 # Data
 handoff_dataset/
