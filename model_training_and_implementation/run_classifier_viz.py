@@ -10,6 +10,7 @@ from src.dino_detector import DINOObjectDetector
 from src.rtmpose_keypoints import RTMPoseKeypointDetector
 from src.head_pose import KwanHeadPoseEstimator
 from src.kwan_classifier import KwanLocalizedMLPClassifier
+from shared.util.extract_all_samples import discover_samples, sample_root_from_dataset_root, read_json, Sample
 
 # Optional: use Kwan's original head-pose drawing utilities if copied over.
 try:
