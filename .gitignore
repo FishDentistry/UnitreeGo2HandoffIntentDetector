@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+kwan_handover_venv_py39/
+
+# Data
+handoff_dataset/
+data/
+datasets/
+videos/
+frames/
+recordings/
+outputs/
+runs/
+
+# Model files
+*.pth
+*.pt
+*.ckpt
+*.onnx
+checkpoints/
+weights/
+
+# Logs and caches
+*.log
+.cache/
+wandb/
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
