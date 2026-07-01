@@ -33,3 +33,35 @@ wandb/
 .DS_Store
 .vscode/
 .idea/
+
+# Archives / datasets
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Images / visual outputs
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.gif
+
+# Model weights / pretrained files
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Project-specific artifacts
+model_training_and_implementation/handoff_dataset.zip
+model_training_and_implementation/kwan_pretrained_weights/
+model_training_and_implementation/test_data/
+model_training_and_implementation/result.jpg

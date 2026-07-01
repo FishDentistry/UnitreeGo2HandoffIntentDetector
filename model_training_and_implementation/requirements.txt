@@ -1,0 +1,8 @@
+numpy==1.23.5
+opencv-python==4.8.1.78
+Pillow==9.5.0
+setuptools==68.2.2
+ultralytics==8.0.196
+torch
+torchvision
+tqdm
