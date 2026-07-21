@@ -1,0 +1,5 @@
+# model_training_and_implementation/configs/handoff_config.yaml
+
+dataset:
+  # Recommended: extracted local dataset folder
+  root: data/handoff_dataset

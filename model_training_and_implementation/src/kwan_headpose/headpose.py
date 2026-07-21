@@ -1,7 +1,7 @@
 from torchvision import transforms
 import torchvision
 
-from src.kwan_models.hopenet import Hopenet
+from ..kwan_models.hopenet import Hopenet
 import torch
 import numpy as np
 from PIL import Image

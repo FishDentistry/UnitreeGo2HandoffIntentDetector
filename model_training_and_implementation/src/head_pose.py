@@ -103,5 +103,32 @@ class KwanHeadPoseEstimator:
         if not results:
             return np.asarray([-999.0, -999.0, -999.0], dtype=np.float32)
 
-        r = results[0]
+        H, W = image_bgr.shape[:2]
+
+        valid = []
+        for r in results:
+            if r.box_xyxy is None:
+                continue
+
+            x1, y1, x2, y2 = r.box_xyxy
+            bw = x2 - x1
+            bh = y2 - y1
+            area = bw * bh
+
+            # reject tiny detections
+            if bw < 25 or bh < 25:
+                continue
+
+            # reject boxes that are implausibly small relative to image
+            if area < 0.0005 * W * H:
+                continue
+
+            valid.append((area, r))
+
+        if not valid:
+            return np.asarray([-999.0, -999.0, -999.0], dtype=np.float32)
+
+        # Use largest detected face/head-ish region
+        _, r = max(valid, key=lambda t: t[0])
+
         return np.asarray([r.yaw, r.pitch, r.roll], dtype=np.float32)

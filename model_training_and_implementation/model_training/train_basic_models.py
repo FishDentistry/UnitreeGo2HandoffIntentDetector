@@ -1,162 +1,25 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Any 
-import json
 import numpy as np
+from src.hand_intent_svm import LinearSVMClassifier, LinearSVMConfig
+from shared.util.extract_all_samples import discover_samples, get_sample_label_name, label_to_binary
+from pathlib import Path
+import yaml
+import argparse
 import cv2
+from src.dino_detector import DINOObjectDetector
+from src.rtmpose_keypoints import RTMPoseKeypointDetector
+from src.rtmpose_headpose import RTMPoseHeadPoseEstimator
+from src.hand_intent_rf import RandomForestClassifier, RandomForestConfig
 
 
-REQUIRED_FILES = ("rgb.png", "joints_raw.json", "meta.json")
+FEATURES_TYPE = ["keypoints","keypoints_headpose","keypoints_headpose_dino"]
 
-@dataclass(frozen=True)
-class Sample:
-    sample_dir: Path
-    rgb_path: Path
-    joints_path: Path
-    meta_path: Path
-    participant_id: str
-    label_name: str
-    condition: str
-    hand: str
-    sample_type: str
-    sample_id: str
+from pathlib import Path
 
+MODEL_IMPL_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
-def get_sample_label_name(sample):
-    """
-    Tries to robustly extract the ground-truth label from a Sample.
-    Adjust this if your Sample dataclass uses a different field.
-    """
+CONFIG_PATH = MODEL_IMPL_ROOT / "configs" / "handoff_config.yaml"
 
-    for attr in ["label_name", "label", "class_name", "target", "y"]:
-        if hasattr(sample, attr):
-            value = getattr(sample, attr)
-            if value is not None:
-                return str(value)
-
-    # Fallback: infer from path.
-    # Check not_handoff first because it contains the substring "handoff".
-    path = str(sample.rgb_path).lower()
-
-    if "not_handoff" in path or "non_handoff" in path or "no_handoff" in path:
-        return "not_handoff"
-
-    if "handoff" in path:
-        return "handoff"
-
-    raise ValueError(f"Could not determine label for sample: {sample}")
-
-def label_to_binary(label_name):
-    """
-    Returns 1 for handoff, 0 for not handoff.
-    """
-
-    label = str(label_name).lower()
-
-    if label in ["handoff", "positive", "pos", "1", "true"]:
-        return 1
-
-    if label in ["not_handoff", "non_handoff", "no_handoff", "negative", "neg", "0", "false"]:
-        return 0
-
-    # Path-style labels sometimes contain these substrings.
-    if "not_handoff" in label or "non_handoff" in label or "no_handoff" in label:
-        return 0
-
-    if "handoff" in label:
-        return 1
-
-    raise ValueError(f"Unknown label name: {label_name}")
-
-
-def read_json(path: Path) -> Dict[str, Any]:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception as exc:
-        print(f"[warning] Could not read JSON {path}: {exc}")
-        return {}
-
-def sample_root_from_dataset_root(dataset_root: Path) -> Path:
-    dataset_root = dataset_root.expanduser().resolve()
-    if (dataset_root / "samples").is_dir():
-        return dataset_root / "samples"
-    return dataset_root
-
-
-def infer_metadata_from_path(sample_dir: Path, sample_root: Path) -> Dict[str, str]:
-    try:
-        rel = sample_dir.relative_to(sample_root).parts
-    except ValueError:
-        rel = sample_dir.parts
-
-    # Expected: participant / label_name / condition / hand / sample_id
-    return {
-        "participant_id": rel[0] if len(rel) > 0 else "unknown_participant",
-        "label_name": rel[1] if len(rel) > 1 else "unknown_label",
-        "condition": rel[2] if len(rel) > 2 else "unknown_condition",
-        "hand": rel[3] if len(rel) > 3 else "unknown_hand",
-        "sample_id": rel[4] if len(rel) > 4 else sample_dir.name,
-        "sample_type": "unknown_sample_type",
-    }
-
-
-def discover_samples(
-    dataset_root: Path,
-    participant_filter: Optional[str],
-    label_filter: Optional[str],
-    condition_filter: Optional[str],
-    hand_filter: Optional[str],
-) -> List[Sample]:
-    sample_root = sample_root_from_dataset_root(dataset_root)
-    if not sample_root.is_dir():
-        raise FileNotFoundError(f"Sample root does not exist: {sample_root}")
-
-    samples: List[Sample] = []
-    for rgb_path in sample_root.rglob("rgb.png"):
-        sample_dir = rgb_path.parent
-        if not all((sample_dir / filename).is_file() for filename in REQUIRED_FILES):
-            continue
-
-        inferred = infer_metadata_from_path(sample_dir, sample_root)
-        meta = read_json(sample_dir / "meta.json")
-
-        participant_id = str(meta.get("participant_id") or inferred["participant_id"])
-        label_name = str(meta.get("label_name") or inferred["label_name"])
-        condition = str(meta.get("condition") or inferred["condition"])
-        hand = str(meta.get("hand") or inferred["hand"])
-        sample_type = str(meta.get("sample_type") or inferred["sample_type"])
-        sample_id = str(meta.get("sample_id") or inferred["sample_id"])
-
-        if participant_filter and participant_id != participant_filter:
-            continue
-        if label_filter and label_name != label_filter:
-            continue
-        if condition_filter and condition != condition_filter:
-            continue
-        if hand_filter and hand != hand_filter:
-            continue
-
-        samples.append(
-            Sample(
-                sample_dir=sample_dir,
-                rgb_path=rgb_path,
-                joints_path=sample_dir / "joints_raw.json",
-                meta_path=sample_dir / "meta.json",
-                participant_id=participant_id,
-                label_name=label_name,
-                condition=condition,
-                hand=hand,
-                sample_type=sample_type,
-                sample_id=sample_id,
-            )
-        )
-
-    samples.sort(key=lambda s: (s.participant_id, s.label_name, s.condition, s.hand, s.sample_id, str(s.sample_dir)))
-    return samples
 
 
 def flatten_feature_vector(feature_vector):
@@ -177,7 +40,7 @@ def flatten_feature_vector(feature_vector):
     visit(feature_vector)
     return flattened
 
-def organize_samples(samples, features_type,obj_detector, keypoint_detector, head_pose_estimator, img_encoder, args):
+def organize_samples(samples, features_type,obj_detector, keypoint_detector, head_pose_estimator, args):
     y_true = []
     rows = []
     skipped_unreadable = 0
@@ -185,15 +48,9 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
     skipped_no_people = 0
     errors = 0
 
-
-
     for local_idx, sample in enumerate(samples):
         image_path = str(sample.rgb_path)
         image = cv2.imread(image_path)
-        objects = []
-        people = []
-
-        
 
         if image is None:
             skipped_unreadable += 1
@@ -209,17 +66,6 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
             continue
 
         try:
-            if(args.crop_around_object):
-                crop_objs = obj_detector.predict(image, class_names=args.crop_object)
-                if len(crop_objs) == 0:
-                    print("SKIP no crop objects detected ")
-                    continue
-                box_xyxy = crop_objs[0]["box_xyxy"]
-                x1, y1, x2, y2 = map(int, box_xyxy)
-                cropped_image = image[y1:y2, x1:x2]
-                image = cropped_image
-                
-
             label_name = get_sample_label_name(sample)
             y = label_to_binary(label_name)
             if(features_type == "keypoints_headpose_dino"):
@@ -246,13 +92,7 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                         }
                     )
                     continue
-            if (
-                features_type == "keypoints"
-                or features_type == "keypoints_headpose"
-                or features_type == "keypoints_headpose_dino"
-                or features_type == "keypoints_resnet"
-                or features_type == "keypoints_headpose_resnet"
-            ):
+            if(features_type == "keypoints" or features_type == "keypoints_headpose" or features_type == "keypoints_headpose_dino"):
                 people = keypoint_detector.predict(image)
 
                 # Optional but usually useful: skip if no person/keypoints.
@@ -280,11 +120,7 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     )
                     continue
 
-            if (
-                features_type == "keypoints_headpose"
-                or features_type == "keypoints_headpose_dino"
-                or features_type == "keypoints_headpose_resnet"
-            ):
+            if features_type == "keypoints_headpose" or features_type == "keypoints_headpose_dino":
                 head_pose = head_pose_estimator.predict_first_or_sentinel(
                     image,
                     rtmpose_results=people,
@@ -297,8 +133,6 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                 right_shoulder = keypoints[6, :2]
                 shoulder_midpoint = (left_shoulder + right_shoulder) / 2.0
                 keypoints[:, :2] = keypoints[:, :2] - shoulder_midpoint
-
-
                 
             
 
@@ -351,39 +185,7 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     ),
                     "skipped": False,
                 }
-            elif features_type == "keypoints_resnet":
-                resnet_embedding = img_encoder.predict(image)["embedding"]
-                row = {
-                    "participant_id": sample.participant_id,
-                    "index": local_idx,
-                    "image": image_path,
-                    "label_name": label_name,
-                    "label_binary": int(y),
-                    "num_people": len(people),
-                    "feature_vector": (
-                        flatten_feature_vector(keypoints)
-                        + resnet_embedding.flatten().astype(np.float32).tolist()
-                    ),
-                    "skipped": False,
-                }
-            elif features_type == "keypoints_headpose_resnet":
-                resnet_embedding = img_encoder.predict(image)["embedding"]
-                row = {
-                    "participant_id": sample.participant_id,
-                    "index": local_idx,
-                    "image": image_path,
-                    "label_name": label_name,
-                    "label_binary": int(y),
-                    "num_people": len(people),
-                    "feature_vector": (
-                        flatten_feature_vector(keypoints)
-                        + head_pose.flatten().astype(np.float32).tolist()
-                        + resnet_embedding.flatten().astype(np.float32).tolist()
-                    ),
-                    "skipped": False,
-                }
-            if(sample.joints_path is not None):
-                row["quest_joints_pth"] = sample.joints_path
+
             rows.append(row)
             y_true.append(y)
             print("Appended new row for sample:", local_idx)
@@ -404,10 +206,46 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
     return y_true, rows, skipped_unreadable, skipped_no_object, skipped_no_people
 
 
+def train_linear_svm(rows, output_path=None, c: float = 1.0, random_state: int = 0):
+    X, y, summary = rows_to_xy(rows)
+
+    clf = LinearSVMClassifier(LinearSVMConfig(c=c, random_state=random_state))
+    clf.fit(X, y)
+
+    if output_path is not None:
+        clf.save(output_path)
+
+    return clf, summary
 
 
+def train_random_forest(
+    rows,
+    output_path=None,
+    n_estimators: int = 300,
+    max_depth: int = 5,
+    min_samples_leaf: int = 2,
+    random_state: int = 0,
+):
+    X, y, summary = rows_to_xy(rows)
 
-def rows_to_xy(rows,feature_key="feature_vector", label_key="label_binary"):
+    clf = RandomForestClassifier(
+        RandomForestConfig(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_leaf=min_samples_leaf,
+            class_weight="balanced",
+            random_state=random_state,
+        )
+    )
+    clf.fit(X, y)
+
+    if output_path is not None:
+        clf.save(output_path)
+
+    return clf, summary
+
+
+def rows_to_xy(rows):
     X = []
     y = []
 
@@ -420,8 +258,8 @@ def rows_to_xy(rows,feature_key="feature_vector", label_key="label_binary"):
             skipped += 1
             continue
 
-        feature_vector = row.get(feature_key)
-        label_binary = row.get(label_key)
+        feature_vector = row.get("feature_vector")
+        label_binary = row.get("label_binary")
 
         if feature_vector is None:
             missing_feature += 1
@@ -512,25 +350,6 @@ def rows_to_xy_and_groups(rows):
 def split_rows_by_participant(rows, test_size: float = 0.25, random_state: int = 0):
     X, y, groups, summary = rows_to_xy_and_groups(rows)
 
-    # Keep an aligned list of usable rows so split indices map correctly.
-    usable_rows = []
-    for row in rows:
-        if row.get("skipped", False):
-            continue
-        if row.get("feature_vector") is None:
-            continue
-        if row.get("label_binary") is None:
-            continue
-        if row.get("participant_id") is None:
-            continue
-        usable_rows.append(row)
-
-    if len(usable_rows) != len(y):
-        raise ValueError(
-            "Internal split mismatch: usable rows and label array length differ "
-            f"({len(usable_rows)} != {len(y)})."
-        )
-
     unique_groups = np.array(sorted(set(groups.tolist())))
     if len(unique_groups) < 2:
         raise ValueError("Need at least two participants to do participant-based evaluation.")
@@ -566,7 +385,236 @@ def split_rows_by_participant(rows, test_size: float = 0.25, random_state: int =
         "test_participants": sorted(set(groups[test_idx].tolist())),
     }
 
-    train_rows = [usable_rows[i] for i in train_idx]
-    test_rows = [usable_rows[i] for i in test_idx]
+    train_rows = [rows[i] for i in train_idx]
+    test_rows = [rows[i] for i in test_idx]
 
     return train_rows, test_rows, summary, split_summary
+
+
+def compute_binary_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.int32)
+    y_pred = np.asarray(y_pred, dtype=np.int32)
+
+    total = int(len(y_true))
+    correct = int(np.sum(y_true == y_pred))
+    accuracy = float(correct / total) if total > 0 else 0.0
+
+    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+    tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else None
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else None
+    specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else None
+    f1 = (
+        float(2 * precision * recall / (precision + recall))
+        if precision is not None and recall is not None and (precision + recall) > 0
+        else 0.0
+    )
+
+    balanced_accuracy = None
+    if recall is not None and specificity is not None:
+        balanced_accuracy = float(0.5 * (recall + specificity))
+
+    return {
+        "total": total,
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced_accuracy,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "tp": tp,
+        "confusion_matrix": [[tn, fp], [fn, tp]],
+    }
+
+
+def evaluate_model_on_rows(
+    model,
+    train_rows,
+    test_rows,
+    fit_model: bool = True,
+    model_name: str = "model",
+):
+    """Evaluate any binary classifier on participant-separated rows.
+
+    The model only needs `fit` and `predict`. If it also exposes
+    `decision_function` or `predict_proba`, those scores are included in the
+    return value for downstream analysis.
+    """
+
+    def participant_ids(rows):
+        ids = []
+        for row in rows:
+            if row.get("skipped", False):
+                continue
+            participant_id = row.get("participant_id")
+            if participant_id is None:
+                continue
+            ids.append(str(participant_id))
+        return sorted(set(ids))
+
+    X_train, y_train, train_summary = rows_to_xy(train_rows)
+    X_test, y_test, test_summary = rows_to_xy(test_rows)
+
+    if len(np.unique(y_train)) < 2:
+        raise ValueError("Need both classes present in the training split.")
+
+    if fit_model:
+        model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    metrics = compute_binary_metrics(y_test, y_pred)
+
+    scores = None
+    if hasattr(model, "decision_function"):
+        scores = model.decision_function(X_test)
+    elif hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X_test)
+        if proba.ndim == 2 and proba.shape[1] > 1:
+            scores = proba[:, 1]
+
+    evaluation = {
+        "model_name": model_name,
+        "train_summary": train_summary,
+        "test_summary": test_summary,
+        "split": {
+            "train_size": int(len(train_rows)),
+            "test_size_count": int(len(test_rows)),
+            "train_label_counts": train_summary["label_counts"],
+            "test_label_counts": test_summary["label_counts"],
+            "train_participants": participant_ids(train_rows),
+            "test_participants": participant_ids(test_rows),
+        },
+        "metrics": metrics,
+        "y_true": y_test.tolist(),
+        "y_pred": np.asarray(y_pred).tolist(),
+        "scores": None if scores is None else np.asarray(scores).tolist(),
+    }
+
+    return evaluation
+
+
+def evaluate_linear_svm(model, train_rows, test_rows, fit_model: bool = False):
+    return evaluate_model_on_rows(
+        model=model,
+        train_rows=train_rows,
+        test_rows=test_rows,
+        fit_model=fit_model,
+        model_name="linear_svm",
+    )
+
+
+def evaluate_random_forest(model, train_rows, test_rows, fit_model: bool = False):
+    return evaluate_model_on_rows(
+        model=model,
+        train_rows=train_rows,
+        test_rows=test_rows,
+        fit_model=fit_model,
+        model_name="random_forest",
+    )
+
+
+def main():
+    with open(CONFIG_PATH, "r") as f:
+        config = yaml.safe_load(f)
+    dataset_root = REPO_ROOT / config["dataset"]["root"]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dino-classes", default="cup")
+    parser.add_argument("--normalize-keypoints", type=bool, choices=[True, False], default=True)
+    parser.add_argument("--confidence", type=float, default=0.15)
+    parser.add_argument("--features-type", type=str, choices=FEATURES_TYPE, default="keypoints")
+    parser.add_argument("--participant", type=str, default=None, help="Filter to one participant ID, e.g. 1 or P01")
+    parser.add_argument("--label", type=str, default=None, help="Filter to label_name, e.g. handoff or not_handoff")
+    parser.add_argument("--condition", type=str, default=None, help="Filter to one condition")
+    parser.add_argument("--hand", type=str, choices=["left", "right"], default=None, help="Filter to one hand")
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--max-samples", type=int, default=None)
+
+    args = parser.parse_args()
+    samples = discover_samples(
+        dataset_root=dataset_root,
+        participant_filter=args.participant,
+        label_filter=args.label,
+        condition_filter=args.condition,
+        hand_filter=args.hand,
+    )
+    samples = samples[args.start_index:]
+
+
+    object_detector = DINOObjectDetector(
+        model_id="IDEA-Research/grounding-dino-base",
+        confidence=args.confidence,
+    )
+
+    keypoint_detector = RTMPoseKeypointDetector(
+        confidence=args.confidence,
+        device="cuda",
+    )
+
+    head_pose_estimator = RTMPoseHeadPoseEstimator(
+        weights_path="kwan_pretrained_weights/head-pose-pretrained.pkl",
+        gpu_id=0,
+    )
+
+    y_true, rows, skipped_unreadable, skipped_no_object, skipped_no_people = organize_samples(
+        samples=samples,
+        features_type=args.features_type,
+        obj_detector=object_detector,
+        keypoint_detector=keypoint_detector,
+        head_pose_estimator=head_pose_estimator,
+        args=args,
+    )
+
+    train_rows, test_rows, split_summary, participant_split_summary = split_rows_by_participant(
+        rows,
+        test_size=0.5,
+        random_state=0,
+    )
+
+    svm_clf, svm_summary = train_linear_svm(train_rows)
+    svm_evaluation = evaluate_linear_svm(
+        svm_clf,
+        train_rows,
+        test_rows,
+        fit_model=False,
+    )
+
+    rf_clf, rf_summary = train_random_forest(train_rows)
+    rf_evaluation = evaluate_random_forest(
+        rf_clf,
+        train_rows,
+        test_rows,
+        fit_model=False,
+    )
+
+    print("Linear SVM training summary:", svm_summary)
+    print("Participant split summary:", participant_split_summary)
+    print("Linear SVM evaluation metrics:", svm_evaluation["metrics"])
+    print("Random forest training summary:", rf_summary)
+    print("Random forest evaluation metrics:", rf_evaluation["metrics"])
+    return {
+        "linear_svm": {
+            "model": svm_clf,
+            "summary": svm_summary,
+            "evaluation": svm_evaluation,
+        },
+        "random_forest": {
+            "model": rf_clf,
+            "summary": rf_summary,
+            "evaluation": rf_evaluation,
+        },
+        "participant_split_summary": participant_split_summary,
+    }
+
+    
+
+if __name__ == "__main__":
+    main()
+
+
+

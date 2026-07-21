@@ -145,8 +145,10 @@ def build_kwan_localized_features(objects, people, head_pose):
     upper_body_xy = keypoints[:NUM_UPPER_BODY_KEYPOINTS, 0:2]
 
     # Kwan localizes keypoints relative to the object centroid.
-    object_center = box_center_xy(object_box)
-    localized_keypoints = upper_body_xy - object_center
+    # object_center = box_center_xy(object_box)
+    # localized_keypoints = upper_body_xy - object_center
+    object_anchor = object_box[0:2]  # [x1, y1], matching Kwan
+    localized_keypoints = upper_body_xy - object_anchor
     localized_keypoints = localized_keypoints.flatten().astype(np.float32)
 
     if head_pose is None:

@@ -10,4 +10,13 @@ requires-python = ">=3.8"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["shared*"]
+include = [
+    "model_training_and_implementation*",
+    "quest_hand_intent_model_est*",
+    "shared*",
+]
+exclude = [
+    "dataset_collection*",
+    "data*",
+    "outputs*",
+]
