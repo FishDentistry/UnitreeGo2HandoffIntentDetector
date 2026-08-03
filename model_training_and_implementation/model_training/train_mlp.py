@@ -18,6 +18,7 @@ from ..src.rtmpose_keypoints import RTMPoseKeypointDetector
 from ..src.rtmpose_headpose import RTMPoseHeadPoseEstimator
 from ..src.hand_intent_mlp import HandIntentMLP
 from ..src.resnet_encoder import ResNet18ImageEncoder
+from ..src.dino_encoder import DINOv2ImageEncoder
 
 
 FEATURES_TYPE = ["keypoints","keypoints_headpose","keypoints_headpose_dino","keypoints_resnet","keypoints_headpose_resnet"]
@@ -554,6 +555,7 @@ def main():
     parser.add_argument("--normalize-keypoints",action=argparse.BooleanOptionalAction,default=True,)
     parser.add_argument("--confidence",type=float,default=0.15,)
     parser.add_argument("--features-type",type=str,choices=FEATURES_TYPE,default="keypoints",)
+    parser.add_argument("--img-encoder",type=str,choices=["dino", "resnet"],default="resnet",)
     parser.add_argument("--participant",type=str,default=None,help="Filter to one participant ID, e.g. 1 or P01",)
     parser.add_argument("--label",type=str,default=None,help="Filter to label_name, e.g. handoff or not_handoff",)
     parser.add_argument("--condition",type=str,default=None,help="Filter to one condition",)
@@ -608,7 +610,13 @@ def main():
         gpu_id=0,
     )
 
-    resnet_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
+    if(args.img_encoder == "dino"):
+        img_encoder = DINOv2ImageEncoder()
+    elif(args.img_encoder == "resnet"):
+        img_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
+    else:
+        raise ValueError(f"Unsupported encoder type: {args.img_encoder}")
+
 
     y_true, rows, skipped_unreadable, skipped_no_object, skipped_no_people = organize_samples(
         samples=samples,
@@ -616,7 +624,7 @@ def main():
         obj_detector=object_detector,
         keypoint_detector=keypoint_detector,
         head_pose_estimator=head_pose_estimator,
-        img_encoder=resnet_encoder,
+        img_encoder=img_encoder,
         args=args,
     )
 
@@ -725,3 +733,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

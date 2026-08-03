@@ -1,0 +1,12 @@
+Dataset for Go2 YOLO model taken from @misc{ unitree-go2-soavc_dataset,
+  title = { unitree go2 Dataset },
+  type = { Open Source Dataset },
+  author = { heejin },
+  howpublished = { \url{ https://universe.roboflow.com/heejin-icg8e/unitree-go2-soavc } },
+  url = { https://universe.roboflow.com/heejin-icg8e/unitree-go2-soavc },
+  journal = { Roboflow Universe },
+  publisher = { Roboflow },
+  year = { 2026 },
+  month = { jul },
+  note = { visited on 2026-08-03 },
+}. Use yolo26s as its latest Ultralytics YOLO and meant for real-time deployment. Perform fine tuning rather than full training.

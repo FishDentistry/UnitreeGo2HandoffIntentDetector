@@ -60,7 +60,7 @@ class DINOObjectDetector:
 		results = self.processor.post_process_grounded_object_detection(
 			outputs,
 			inputs.input_ids,
-			threshold=0.35,
+			threshold=self.confidence,
 			text_threshold=0.25,
 			target_sizes=[self._get_target_size(img)],
 		)
@@ -72,9 +72,20 @@ class DINOObjectDetector:
 
 		detections = []
 
-		for box, score, label in zip(results["boxes"], results["scores"], results["labels"]):
+		labels = results.get("text_labels", results["labels"])
+
+		for box, score, label in zip(
+			results["boxes"],
+			results["scores"],
+			labels
+		):
+			label = str(label).strip()
+
+			if not label:
+				continue
+
 			detections.append({
-				"label": str(label),
+				"label": label,
 				"score": float(score.item()),
 				"box_xyxy": [float(v) for v in box.tolist()],
 			})

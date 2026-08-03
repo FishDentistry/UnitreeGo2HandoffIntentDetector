@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from time import perf_counter
+from typing import Any, Iterator
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 
 from quest_hand_intent_model_est.src.quest_hand_int_inf_wrapper import (
@@ -35,30 +39,47 @@ COUNTERFACTUAL_CONFIG_PATH = CONFIG_DIR / "counterfactual_config.yaml"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 VISUALIZATION_DIR = SCRIPT_DIR / "visualizations"
+OUTPUT_DIR = SCRIPT_DIR.parent / "outputs"
+VISUALIZATION_DIR = OUTPUT_DIR / "visualizations"
 
 MODIFIABLE_JOINT_NAMES = {
-    # "left_upper_arm",
-    # "left_forearm",
     "left_hand",
-    # "left_palm",
-    # "right_upper_arm",
-    # "right_forearm",
     "right_hand",
-    # "right_palm",
 }
 
-IGNORED_SKELETON_JOINT_NAMES = {
-    "left_wrist_twist",
-    "right_wrist_twist",
+ARM_CHAINS = {
+    "left": [
+        "left_scapula",
+        "left_upper_arm",
+        "left_forearm",
+        "left_hand",
+    ],
+    "right": [
+        "right_scapula",
+        "right_upper_arm",
+        "right_forearm",
+        "right_hand",
+    ],
+}
+
+HAND_ATTACHED_JOINTS = {
+    "left": [
+        "left_wrist_twist",
+        "left_palm",
+    ],
+    "right": [
+        "right_wrist_twist",
+        "right_palm",
+    ],
 }
 
 COUNTERFACTUAL_SKELETON_EDGES = [
-    (joint_a, joint_b)
-    for joint_a, joint_b in SKELETON_EDGES
-    if (
-        joint_a not in IGNORED_SKELETON_JOINT_NAMES
-        and joint_b not in IGNORED_SKELETON_JOINT_NAMES
-    )
+    ("left_scapula", "left_upper_arm"),
+    ("left_upper_arm", "left_forearm"),
+    ("left_forearm", "left_hand"),
+    ("right_scapula", "right_upper_arm"),
+    ("right_upper_arm", "right_forearm"),
+    ("right_forearm", "right_hand"),
 ]
 
 for replacement_edge in [
@@ -70,10 +91,221 @@ for replacement_edge in [
             replacement_edge
         )
 
+@dataclass
+class LatencyTracker:
+    """Collect nested CPU, CUDA, and MPS latency measurements."""
+
+    totals_ms: dict[str, float] = field(default_factory=dict)
+    call_counts: dict[str, int] = field(default_factory=dict)
+    _pending_cuda_events: list[
+        tuple[
+            str,
+            torch.device,
+            torch.cuda.Event,
+            torch.cuda.Event,
+        ]
+    ] = field(default_factory=list)
+
+    @staticmethod
+    def _as_device(
+        device: torch.device | str | None,
+    ) -> torch.device | None:
+        if device is None:
+            return None
+        return torch.device(device)
+
+    @staticmethod
+    def _synchronize_mps() -> None:
+        mps_module = getattr(torch, "mps", None)
+        synchronize = getattr(mps_module, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
+    @contextmanager
+    def measure(
+        self,
+        name: str,
+        *,
+        device: torch.device | str | None = None,
+    ) -> Iterator[None]:
+        resolved_device = self._as_device(device)
+
+        if (
+            resolved_device is not None
+            and resolved_device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+            with torch.cuda.device(resolved_device):
+                start_event.record(
+                    torch.cuda.current_stream(resolved_device)
+                )
+
+            try:
+                yield
+            finally:
+                with torch.cuda.device(resolved_device):
+                    end_event.record(
+                        torch.cuda.current_stream(resolved_device)
+                    )
+
+                self._pending_cuda_events.append(
+                    (
+                        name,
+                        resolved_device,
+                        start_event,
+                        end_event,
+                    )
+                )
+            return
+
+        if (
+            resolved_device is not None
+            and resolved_device.type == "mps"
+        ):
+            self._synchronize_mps()
+
+        started_at = perf_counter()
+
+        try:
+            yield
+        finally:
+            if (
+                resolved_device is not None
+                and resolved_device.type == "mps"
+            ):
+                self._synchronize_mps()
+
+            self.add_duration_ms(
+                name,
+                (perf_counter() - started_at) * 1000.0,
+            )
+
+    def add_duration_ms(
+        self,
+        name: str,
+        duration_ms: float,
+        *,
+        call_count: int = 1,
+    ) -> None:
+        self.totals_ms[name] = (
+            self.totals_ms.get(name, 0.0)
+            + float(duration_ms)
+        )
+        self.call_counts[name] = (
+            self.call_counts.get(name, 0)
+            + int(call_count)
+        )
+
+    def _finalize_cuda_events(self) -> None:
+        if not self._pending_cuda_events:
+            return
+
+        devices = {
+            device
+            for _, device, _, _ in self._pending_cuda_events
+        }
+
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+        for (
+            name,
+            _,
+            start_event,
+            end_event,
+        ) in self._pending_cuda_events:
+            self.add_duration_ms(
+                name,
+                float(start_event.elapsed_time(end_event)),
+            )
+
+        self._pending_cuda_events.clear()
+
+    def snapshot(self) -> dict[str, dict[str, float | int]]:
+        self._finalize_cuda_events()
+
+        snapshot: dict[
+            str,
+            dict[str, float | int],
+        ] = {}
+
+        for name in sorted(self.totals_ms):
+            total_ms = float(self.totals_ms[name])
+            call_count = int(self.call_counts.get(name, 0))
+
+            snapshot[name] = {
+                "total_ms": total_ms,
+                "call_count": call_count,
+                "mean_ms": (
+                    total_ms / call_count
+                    if call_count
+                    else 0.0
+                ),
+            }
+
+        return snapshot
+
+
+@contextmanager
+def measure_latency(
+    tracker: LatencyTracker | None,
+    name: str,
+    *,
+    device: torch.device | str | None = None,
+) -> Iterator[None]:
+    if tracker is None:
+        yield
+        return
+
+    with tracker.measure(name, device=device):
+        yield
+
+
+def format_latency_snapshot(
+    latency: dict[str, dict[str, float | int]],
+) -> str:
+    def total(name: str) -> float | None:
+        component = latency.get(name)
+        if component is None:
+            return None
+        return float(component["total_ms"])
+
+    def format_value(name: str) -> str:
+        value = total(name)
+        return "n/a" if value is None else f"{value:.3f}"
+
+    fabrik = latency.get("fabrik_solve")
+    if fabrik is None:
+        fabrik_text = "n/a"
+    else:
+        fabrik_text = (
+            f"{float(fabrik['total_ms']):.3f}"
+            f"/{int(fabrik['call_count'])} calls"
+            f"/{float(fabrik['mean_ms']):.3f} avg"
+        )
+
+    return (
+        "latency_ms("
+        f"sample={format_value('sample_total')}, "
+        f"minimal={format_value('minimal_perturbation')}, "
+        f"optimization={format_value('optimization_loop')}, "
+        f"fabrik={fabrik_text}, "
+        f"classifier={format_value('classifier_forward')}, "
+        f"binary_search={format_value('binary_search')}, "
+        f"original_inference={format_value('original_inference')}, "
+        f"final_inference={format_value('final_inference')}, "
+        f"bone_validation={format_value('bone_validation')}"
+        ")"
+    )
+
+
 DEFAULT_COUNTERFACTUAL_CONFIG: dict[str, Any] = {
     "counterfactual": {
         "classification_weight": 1000.0,
-        "bone_length_weight": 1000.0,
+        "reachability_weight": 1000.0,
         "max_iterations": 1000,
         "step_size": 0.01,
         "probability_margin": 1e-4,
@@ -87,7 +319,7 @@ DEFAULT_COUNTERFACTUAL_CONFIG: dict[str, Any] = {
                 1000.0,
                 10000.0,
             ],
-            "bone_length_weights": [
+            "reachability_weights": [
                 10.0,
                 100.0,
                 1000.0,
@@ -379,122 +611,505 @@ def skeleton_edge_length_statistics(
     }
 
 
-def check_skeleton_edge_lengths(
-    original_joints: dict[str, dict[str, Any]],
-    perturbed_joints: dict[str, dict[str, Any]],
-    relative_tolerance: float = 0.01,
-    absolute_tolerance: float = 1e-6,
-) -> tuple[
-    bool,
-    list[tuple[str, str, float, float]],
-]:
-    """
-    Preserve the original two-value interface while using the richer
-    statistics function internally.
-    """
-    statistics = skeleton_edge_length_statistics(
-        original_joints,
-        perturbed_joints,
-        relative_tolerance=relative_tolerance,
-        absolute_tolerance=absolute_tolerance,
-    )
-
-    violations = [
-        (
-            joint_a,
-            joint_b,
-            original_length,
-            perturbed_length,
-        )
-        for (
-            joint_a,
-            joint_b,
-            original_length,
-            perturbed_length,
-            _,
-        ) in statistics["violating_edges"]
-    ]
-
-    return bool(statistics["has_violation"]), violations
-
-
-def skeleton_edge_length_loss(
-    original_features: torch.Tensor,
-    perturbed_features: torch.Tensor,
-    joint_order: list[str],
-    skeleton_edges: list[tuple[str, str]],
-    features_per_joint: int,
+def unit_vector_or_fallback(
+    vector: torch.Tensor,
+    fallback: torch.Tensor,
+    epsilon: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Penalize the mean squared relative change in each skeleton edge length.
-
-    Both feature tensors must have shape (B, D).
+    Normalize vector. If it is nearly zero, normalize fallback instead.
     """
-    loss = torch.zeros(
-        (),
-        dtype=perturbed_features.dtype,
-        device=perturbed_features.device,
+    vector_length = torch.linalg.vector_norm(
+        vector
     )
 
-    joint_indices = {
-        joint_name: index
-        for index, joint_name in enumerate(joint_order)
+    fallback_length = (
+        torch.linalg.vector_norm(fallback)
+        .clamp_min(epsilon)
+    )
+
+    return torch.where(
+        vector_length > epsilon,
+        vector / vector_length.clamp_min(epsilon),
+        fallback / fallback_length,
+    )
+
+def ensure_realistic_elbow(
+    upper_arm_pos: torch.Tensor,
+    elbow_pos: torch.Tensor,
+    original_forearm_direction: torch.Tensor,
+    proposed_direction: torch.Tensor,
+    min_theta: float = 0.0,
+    max_theta: float = np.pi,
+    epsilon: float = 1e-8,
+) -> torch.Tensor:
+    u = F.normalize(
+        upper_arm_pos - elbow_pos,
+        p=2,
+        dim=0,
+        eps=epsilon,
+    )
+
+    original_v = F.normalize(
+        original_forearm_direction,
+        p=2,
+        dim=0,
+        eps=epsilon,
+    )
+
+    proposed_v = F.normalize(
+        proposed_direction,
+        p=2,
+        dim=0,
+        eps=epsilon,
+    )
+
+    hinge_normal = F.normalize(
+        torch.linalg.cross(u, original_v),
+        p=2,
+        dim=0,
+        eps=epsilon,
+    )
+
+    signed_sine = torch.dot(
+        hinge_normal,
+        torch.linalg.cross(u, proposed_v),
+    )
+
+    cosine = torch.dot(
+        u,
+        proposed_v,
+    ).clamp(-1.0, 1.0)
+
+    proposed_angle = torch.atan2(
+        signed_sine,
+        cosine,
+    )
+
+    constrained_angle = torch.clamp(
+        proposed_angle,
+        min=min_theta,
+        max=max_theta,
+    )
+
+    bend_direction = F.normalize(
+        torch.linalg.cross(hinge_normal, u),
+        p=2,
+        dim=0,
+        eps=epsilon,
+    )
+
+    constrained_v = (
+        torch.cos(constrained_angle) * u
+        + torch.sin(constrained_angle) * bend_direction
+    )
+
+    return F.normalize(
+        constrained_v,
+        p=2,
+        dim=0,
+        eps=epsilon,
+    )
+
+def solve_fabrik_chain(
+    original_points: torch.Tensor,
+    target_position: torch.Tensor,
+    *,
+    iterations: int = 10,
+    epsilon: float = 1e-6,
+    min_elbow_angle: float = 0.0,
+    max_elbow_angle: float = np.pi,
+) -> torch.Tensor:
+    """
+    Reposition a joint chain so its final point approaches the target.
+
+    The first joint remains fixed, and every original segment length
+    is preserved.
+
+    original_points shape: (joint_count, 3)
+    target_position shape: (3,)
+    """
+    if original_points.ndim != 2:
+        raise ValueError(
+            "original_points must have shape "
+            "(joint_count, 3)."
+        )
+
+    if original_points.shape[1] != 3:
+        raise ValueError(
+            "Every joint position must contain XYZ."
+        )
+
+    root_position = original_points[0]
+
+    original_segment_vectors = (
+        original_points[1:]
+        - original_points[:-1]
+    )
+
+    segment_lengths = (
+        torch.linalg.vector_norm(
+            original_segment_vectors,
+            dim=1,
+        )
+        .clamp_min(epsilon)
+    )
+
+    maximum_reach = segment_lengths.sum()
+
+    longest_segment = segment_lengths.max()
+
+    minimum_reach = torch.relu(
+        longest_segment
+        - (
+            maximum_reach
+            - longest_segment
+        )
+    )
+
+    root_to_target = (
+        target_position
+        - root_position
+    )
+
+    requested_distance = (
+        torch.linalg.vector_norm(
+            root_to_target
+        )
+    )
+
+    original_direction = (
+        original_points[-1]
+        - root_position
+    )
+
+    target_direction = unit_vector_or_fallback(
+        root_to_target,
+        original_direction,
+    )
+
+    minimum_distance = (
+        minimum_reach + epsilon
+    )
+
+    maximum_distance = (
+        maximum_reach - epsilon
+    )
+
+    clamped_distance = torch.minimum(
+        torch.maximum(
+            requested_distance,
+            minimum_distance,
+        ),
+        maximum_distance,
+    )
+
+    reachable_target = (
+        root_position
+        + target_direction
+        * clamped_distance
+    )
+
+    points = list(
+        original_points.unbind(dim=0)
+    )
+
+    ELBOW_INDEX = 2
+
+    original_forearm_direction = (
+        original_points[ELBOW_INDEX + 1]
+        - original_points[ELBOW_INDEX]
+    )
+
+    for _ in range(iterations):
+        # Backward pass:
+        # start at the hand and work toward the root.
+        backward_points = [None] * len(points)
+
+        backward_points[-1] = reachable_target
+
+        for index in range(
+            len(points) - 2,
+            -1,
+            -1,
+        ):
+            direction = (
+                points[index]
+                - backward_points[index + 1]
+            )
+
+            fallback = (
+                original_points[index]
+                - original_points[index + 1]
+            )
+
+            direction = unit_vector_or_fallback(
+                direction,
+                fallback,
+            )
+
+            backward_points[index] = (
+                backward_points[index + 1]
+                + direction
+                * segment_lengths[index]
+            )
+
+        # Forward pass:
+        # restore the fixed root and work toward the hand.
+        forward_points = [None] * len(points)
+
+        forward_points[0] = root_position
+
+
+        for index in range(
+            len(points) - 1
+        ):
+            direction = (
+                backward_points[index + 1]
+                - forward_points[index]
+            )
+
+            fallback = (
+                original_points[index + 1]
+                - original_points[index]
+            )
+
+            direction = unit_vector_or_fallback(
+                direction,
+                fallback,
+            )
+
+            if index == ELBOW_INDEX:
+                direction = ensure_realistic_elbow(
+                    upper_arm_pos=forward_points[index - 1],
+                    elbow_pos=forward_points[index],
+                    original_forearm_direction=(
+                        original_forearm_direction
+                    ),
+                    proposed_direction=direction,
+                    min_theta=min_elbow_angle,
+                    max_theta=max_elbow_angle,
+                    epsilon=epsilon,
+                )
+
+            forward_points[index + 1] = (
+                forward_points[index]
+                + direction
+                * segment_lengths[index]
+            )
+
+        points = forward_points
+
+    return torch.stack(points)
+
+def reconstruct_arms_from_hand_perturbation(
+    *,
+    original_features: torch.Tensor,
+    hand_perturbation: torch.Tensor,
+    joint_indices: dict[str, int],
+    features_per_joint: int,
+    fabrik_iterations: int = 4,
+    latency_tracker: LatencyTracker | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply six hand perturbation values and reconstruct both arms.
+
+    hand_perturbation:
+        [left_dx, left_dy, left_dz,
+         right_dx, right_dy, right_dz]
+
+    Returns:
+        reconstructed full feature vector
+        reachability loss
+    """
+    if hand_perturbation.shape != (1, 6):
+        raise ValueError(
+            "hand_perturbation must have shape (1, 6), "
+            f"received {hand_perturbation.shape}."
+        )
+
+    def get_position(
+        features: torch.Tensor,
+        joint_name: str,
+    ) -> torch.Tensor:
+        start = (
+            joint_indices[joint_name]
+            * features_per_joint
+        )
+
+        return features[
+            0,
+            start : start + 3,
+        ]
+
+    def set_position(
+        features: torch.Tensor,
+        joint_name: str,
+        position: torch.Tensor,
+    ) -> None:
+        start = (
+            joint_indices[joint_name]
+            * features_per_joint
+        )
+
+        features[
+            0,
+            start : start + 3,
+        ] = position
+
+    candidate_features = (
+        original_features.clone()
+    )
+
+    hand_deltas = {
+        "left": hand_perturbation[
+            0,
+            0:3,
+        ],
+        "right": hand_perturbation[
+            0,
+            3:6,
+        ],
     }
 
-    valid_edge_count = 0
+    reachability_loss = torch.zeros(
+        (),
+        dtype=original_features.dtype,
+        device=original_features.device,
+    )
 
-    for joint_a, joint_b in skeleton_edges:
-        if (
-            joint_a not in joint_indices
-            or joint_b not in joint_indices
+    for side in ("left", "right"):
+        chain_names = ARM_CHAINS[side]
+
+        original_chain = torch.stack(
+            [
+                get_position(
+                    original_features,
+                    joint_name,
+                )
+                for joint_name in chain_names
+            ]
+        )
+
+        original_hand_position = (
+            original_chain[-1]
+        )
+
+        requested_hand_target = (
+            original_hand_position
+            + hand_deltas[side]
+        )
+
+        segment_lengths = (
+            torch.linalg.vector_norm(
+                original_chain[1:]
+                - original_chain[:-1],
+                dim=1,
+            )
+        )
+
+        maximum_reach = (
+            segment_lengths.sum()
+        )
+
+        longest_segment = (
+            segment_lengths.max()
+        )
+
+        minimum_reach = torch.relu(
+            longest_segment
+            - (
+                maximum_reach
+                - longest_segment
+            )
+        )
+
+        requested_distance = (
+            torch.linalg.vector_norm(
+                requested_hand_target
+                - original_chain[0]
+            )
+        )
+
+        too_far = torch.relu(
+            requested_distance
+            - maximum_reach
+        )
+
+        too_close = torch.relu(
+            minimum_reach
+            - requested_distance
+        )
+
+        reachability_loss = (
+            reachability_loss
+            + too_far.square()
+            + too_close.square()
+        )
+
+        with measure_latency(
+            latency_tracker,
+            "fabrik_solve",
+            device=original_features.device,
         ):
-            continue
+            solved_chain = solve_fabrik_chain(
+                original_points=original_chain,
+                target_position=(
+                    requested_hand_target
+                ),
+                iterations=fabrik_iterations,
+            )
 
-        start_a = (
-            joint_indices[joint_a]
-            * features_per_joint
-        )
-        start_b = (
-            joint_indices[joint_b]
-            * features_per_joint
-        )
+        # The root remains unchanged. Replace the other
+        # positions with the FABRIK solution.
+        for joint_name, solved_position in zip(
+            chain_names[1:],
+            solved_chain[1:],
+        ):
+            set_position(
+                candidate_features,
+                joint_name,
+                solved_position,
+            )
 
-        original_position_a = original_features[
-            :, start_a : start_a + 3
-        ]
-        original_position_b = original_features[
-            :, start_b : start_b + 3
-        ]
-        perturbed_position_a = perturbed_features[
-            :, start_a : start_a + 3
-        ]
-        perturbed_position_b = perturbed_features[
-            :, start_b : start_b + 3
-        ]
-
-        original_length = torch.linalg.vector_norm(
-            original_position_a - original_position_b,
-            dim=1,
-        )
-        perturbed_length = torch.linalg.vector_norm(
-            perturbed_position_a - perturbed_position_b,
-            dim=1,
+        solved_hand_position = (
+            solved_chain[-1]
         )
 
-        relative_change = (
-            perturbed_length - original_length
-        ) / original_length.clamp_min(1e-6)
-
-        loss = (
-            loss
-            + relative_change.square().mean()
+        actual_hand_displacement = (
+            solved_hand_position
+            - original_hand_position
         )
-        valid_edge_count += 1
 
-    if valid_edge_count == 0:
-        return loss
+        # Palm and wrist twist retain their position
+        # relative to the hand.
+        for attached_joint in (
+            HAND_ATTACHED_JOINTS[side]
+        ):
+            if (
+                attached_joint
+                not in joint_indices
+            ):
+                continue
 
-    return loss / valid_edge_count
+            original_attached_position = (
+                get_position(
+                    original_features,
+                    attached_joint,
+                )
+            )
+
+            set_position(
+                candidate_features,
+                attached_joint,
+                original_attached_position
+                + actual_hand_displacement,
+            )
+
+    return (
+        candidate_features,
+        reachability_loss,
+    )
 
 
 def find_minimal_perturbation(
@@ -503,25 +1118,41 @@ def find_minimal_perturbation(
     target_intent: bool,
     *,
     classification_weight: float,
-    bone_length_weight: float,
+    reachability_weight: float,
     max_iterations: int = 1000,
+    bin_search_iterations: int = 10,
     step_size: float = 0.01,
     probability_margin: float = 1e-4,
+    latency_tracker: LatencyTracker | None = None,
 ) -> np.ndarray:
     """
-    Find a small counterfactual perturbation of selected joint positions.
+    Find minimal left- and right-hand position changes that produce
+    the requested classification.
 
-    Only the XYZ features belonging to MODIFIABLE_JOINT_NAMES may change.
-    Rotations and all other joint features remain fixed.
+    Only six independent values are optimized:
+
+        left-hand  XYZ displacement
+        right-hand XYZ displacement
+
+    For every proposed pair of hand displacements, complete left and
+    right arm poses are reconstructed using FABRIK before being passed
+    to the classifier.
+
+    The scapula or shoulder at the start of each configured ARM_CHAINS
+    entry remains fixed. Intermediate arm joints are repositioned while
+    preserving their original segment lengths. Palm and wrist-twist
+    joints move rigidly with their corresponding hand.
     """
     if max_iterations <= 0:
         raise ValueError(
-            f"max_iterations must be positive, got {max_iterations}."
+            f"max_iterations must be positive, "
+            f"got {max_iterations}."
         )
 
     if step_size <= 0.0:
         raise ValueError(
-            f"step_size must be positive, got {step_size}."
+            f"step_size must be positive, "
+            f"got {step_size}."
         )
 
     if classification_weight < 0.0:
@@ -529,9 +1160,9 @@ def find_minimal_perturbation(
             "classification_weight must be nonnegative."
         )
 
-    if bone_length_weight < 0.0:
+    if reachability_weight < 0.0:
         raise ValueError(
-            "bone_length_weight must be nonnegative."
+            "reachability_weight must be nonnegative."
         )
 
     if probability_margin < 0.0:
@@ -546,14 +1177,15 @@ def find_minimal_perturbation(
 
     if feature_array.ndim != 1:
         raise ValueError(
-            "joint_feat_vec must be a single 1D feature vector, "
-            f"but received shape {feature_array.shape}."
+            "joint_feat_vec must be a single 1D feature "
+            f"vector, but received shape "
+            f"{feature_array.shape}."
         )
 
     if model.features_per_joint < 3:
         raise ValueError(
-            "The model must contain at least three position features "
-            "per joint."
+            "The model must contain at least three "
+            "position features per joint."
         )
 
     original_features = model.make_feature_tensor(
@@ -564,13 +1196,20 @@ def find_minimal_perturbation(
     threshold = float(model.threshold)
     target_intent = bool(target_intent)
 
-    with torch.inference_mode():
-        original_probability = float(
-            model.forward_feature_probabilities(
-                original_features
-            )[0].item()
-        )
+    with measure_latency(
+        latency_tracker,
+        "classifier_forward",
+        device=model.device,
+    ):
+        with torch.inference_mode():
+            original_probability = float(
+                model.forward_feature_probabilities(
+                    original_features
+                )[0].item()
+            )
 
+    # No counterfactual is required when the original sample already
+    # belongs to the requested target class.
     if probability_meets_target_class(
         original_probability,
         target_intent,
@@ -578,55 +1217,75 @@ def find_minimal_perturbation(
     ):
         return feature_array.copy()
 
+    joint_indices = {
+        joint_name: joint_index
+        for joint_index, joint_name
+        in enumerate(model.joint_order)
+    }
+
+    required_joint_names: set[str] = set()
+
+    for chain_names in ARM_CHAINS.values():
+        required_joint_names.update(chain_names)
+
     missing_joints = sorted(
-        MODIFIABLE_JOINT_NAMES.difference(
-            model.joint_order
+        required_joint_names.difference(
+            joint_indices
         )
     )
 
     if missing_joints:
         raise ValueError(
-            "The following modifiable joints are absent from "
-            "the model's joint order: "
+            "The following arm-chain joints are absent "
+            "from the model's joint order: "
             + ", ".join(missing_joints)
         )
 
-    modifiable_feature_indices: list[int] = []
+    def reconstruct_candidate(
+        perturbation: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with measure_latency(
+            latency_tracker,
+            "arm_reconstruction",
+            device=model.device,
+        ):
+            return reconstruct_arms_from_hand_perturbation(
+                original_features=original_features,
+                hand_perturbation=perturbation,
+                joint_indices=joint_indices,
+                features_per_joint=(
+                    model.features_per_joint
+                ),
+                fabrik_iterations=10,
+                latency_tracker=latency_tracker,
+            )
 
-    for joint_index, joint_name in enumerate(
-        model.joint_order
-    ):
-        if joint_name not in MODIFIABLE_JOINT_NAMES:
-            continue
+    def classify_candidate(
+        candidate_features: torch.Tensor,
+    ) -> torch.Tensor:
+        with measure_latency(
+            latency_tracker,
+            "classifier_forward",
+            device=model.device,
+        ):
+            return model.forward_feature_probabilities(
+                candidate_features
+            )[0]
 
-        feature_start = (
-            joint_index
-            * model.features_per_joint
-        )
 
-        modifiable_feature_indices.extend(
-            [
-                feature_start,
-                feature_start + 1,
-                feature_start + 2,
-            ]
-        )
-
-    active_indices = torch.tensor(
-        modifiable_feature_indices,
-        dtype=torch.long,
-        device=model.device,
-    )
-
-    perturbation = torch.zeros(
-        (1, len(modifiable_feature_indices)),
-        dtype=torch.float32,
+    # Six optimization variables:
+    #
+    # [left_dx, left_dy, left_dz,
+    #  right_dx, right_dy, right_dz]
+    hand_perturbation = torch.zeros(
+        (1, 6),
+        dtype=original_features.dtype,
         device=model.device,
         requires_grad=True,
     )
 
     optimizer = torch.optim.Adam(
-        [perturbation],
+        [hand_perturbation],
         lr=step_size,
     )
 
@@ -641,186 +1300,233 @@ def find_minimal_perturbation(
             0.0,
         )
 
-    best_perturbation: torch.Tensor | None = None
+    best_hand_perturbation: (
+        torch.Tensor | None
+    ) = None
+
     best_distance_squared = float("inf")
     last_probability = original_probability
 
-    for _ in range(max_iterations):
-        optimizer.zero_grad()
+    with measure_latency(
+        latency_tracker,
+        "optimization_loop",
+        device=model.device,
+    ):
+        for _ in range(max_iterations):
+            optimizer.zero_grad()
 
-        full_perturbation = torch.zeros_like(
-            original_features
-        ).scatter(
-            dim=1,
-            index=active_indices.unsqueeze(0),
-            src=perturbation,
-        )
-
-        candidate_features = (
-            original_features + full_perturbation
-        )
-
-        probability = model.forward_feature_probabilities(
-            candidate_features
-        )[0]
-
-        distance_squared = perturbation.square().sum()
-
-        if target_intent:
-            classification_violation = torch.relu(
-                target_probability - probability
-            )
-        else:
-            classification_violation = torch.relu(
-                probability - target_probability
+            # Convert the six hand variables into a complete pose.
+            (
+                candidate_features,
+                reachability_loss,
+            ) = reconstruct_candidate(
+                hand_perturbation
             )
 
-        classification_loss = (
-            classification_violation.square()
-        )
-
-        bone_loss = skeleton_edge_length_loss(
-            original_features=original_features,
-            perturbed_features=candidate_features,
-            joint_order=model.joint_order,
-            skeleton_edges=COUNTERFACTUAL_SKELETON_EDGES,
-            features_per_joint=model.features_per_joint,
-        )
-
-        loss = (
-            distance_squared
-            + classification_weight
-            * classification_loss
-            + bone_length_weight
-            * bone_loss
-        )
-
-        # Save the exact perturbation whose probability and distance were
-        # evaluated above. This avoids mixing pre-step metrics with a
-        # post-step perturbation.
-        with torch.no_grad():
-            evaluated_probability = float(
-                probability.item()
+            probability = classify_candidate(
+                candidate_features
             )
-            evaluated_distance_squared = float(
-                distance_squared.item()
-            )
-            last_probability = evaluated_probability
 
-            if (
-                probability_meets_target_class(
-                    evaluated_probability,
-                    target_intent,
-                    threshold,
+            # Only independent hand motion contributes directly to the
+            # perturbation-distance objective.
+            distance_squared = (
+                hand_perturbation
+                .square()
+                .sum()
+            )
+
+            if target_intent:
+                classification_violation = torch.relu(
+                    target_probability - probability
                 )
-                and evaluated_distance_squared
-                < best_distance_squared
+            else:
+                classification_violation = torch.relu(
+                    probability - target_probability
+                )
+
+            classification_loss = (
+                classification_violation.square()
+            )
+
+            # FABRIK should preserve the configured arm-chain lengths.
+            # This loss still checks the full configured skeleton and
+            # catches relationships not directly enforced by FABRIK.
+            # bone_loss = calculate_bone_loss(
+            #     candidate_features
+            # )
+
+            loss = (
+                distance_squared
+                + classification_weight
+                * classification_loss
+                + reachability_weight
+                * reachability_loss
+            )
+
+            # Save the exact six-value perturbation whose probability and
+            # distance were evaluated above. This happens before the Adam
+            # step so the recorded metrics and perturbation correspond.
+            with torch.no_grad():
+                evaluated_probability = float(
+                    probability.item()
+                )
+
+                evaluated_distance_squared = float(
+                    distance_squared.item()
+                )
+
+                last_probability = (
+                    evaluated_probability
+                )
+
+                is_successful = (
+                    probability_meets_target_class(
+                        evaluated_probability,
+                        target_intent,
+                        threshold,
+                    )
+                )
+
+                if (
+                    is_successful
+                    and evaluated_distance_squared
+                    < best_distance_squared
+                ):
+                    best_distance_squared = (
+                        evaluated_distance_squared
+                    )
+
+                    best_hand_perturbation = (
+                        hand_perturbation
+                        .detach()
+                        .clone()
+                    )
+                    break
+
+            with measure_latency(
+                latency_tracker,
+                "optimizer_step",
+                device=model.device,
             ):
-                best_distance_squared = (
-                    evaluated_distance_squared
-                )
-                best_perturbation = (
-                    perturbation.detach().clone()
-                )
+                loss.backward()
+                optimizer.step()
 
-        loss.backward()
-        optimizer.step()
-
-    if best_perturbation is None:
+    if best_hand_perturbation is None:
         raise RuntimeError(
-            "Could not find a successful perturbation after "
+            "Could not find a successful hand-based "
+            "perturbation after "
             f"{max_iterations} iterations. "
-            f"Original probability={original_probability:.6f}, "
-            f"last probability={last_probability:.6f}, "
+            f"Original probability="
+            f"{original_probability:.6f}, "
+            f"last probability="
+            f"{last_probability:.6f}, "
             f"threshold={threshold:.6f}, "
             f"target_intent={target_intent}, "
-            f"classification_weight={classification_weight}, "
-            f"bone_length_weight={bone_length_weight}."
+            f"classification_weight="
+            f"{classification_weight}, "
+            f"reachability_weight="
+            f"{reachability_weight}."
         )
 
-    # Reduce the successful perturbation along its direction. This is a
-    # local heuristic and assumes the target class remains reachable along
-    # this line segment.
+    # Reduce the successful hand movement along the line between zero
+    # movement and the best successful movement.
+    #
+    # This finds an approximate smallest successful scale without
+    # restarting gradient optimization.
     low = 0.0
     high = 1.0
 
-    with torch.inference_mode():
-        for _ in range(40):
-            scale = (low + high) / 2.0
-            scaled_perturbation = (
-                scale * best_perturbation
+    with measure_latency(
+        latency_tracker,
+        "binary_search",
+        device=model.device,
+    ):
+        with torch.inference_mode():
+            for _ in range(bin_search_iterations):
+                scale = (
+                    low + high
+                ) / 2.0
+
+                scaled_hand_perturbation = (
+                    scale
+                    * best_hand_perturbation
+                )
+
+                (
+                    candidate_features,
+                    _,
+                ) = reconstruct_candidate(
+                    scaled_hand_perturbation
+                )
+
+                probability = float(
+                    classify_candidate(
+                        candidate_features
+                    ).item()
+                )
+
+                if probability_meets_target_class(
+                    probability,
+                    target_intent,
+                    threshold,
+                ):
+                    high = scale
+                else:
+                    low = scale
+
+            final_hand_perturbation = (
+                high
+                * best_hand_perturbation
             )
 
-            full_perturbation = torch.zeros_like(
-                original_features
-            ).scatter(
-                dim=1,
-                index=active_indices.unsqueeze(0),
-                src=scaled_perturbation,
+            (
+                final_features,
+                _,
+            ) = reconstruct_candidate(
+                final_hand_perturbation
             )
 
-            candidate_features = (
-                original_features
-                + full_perturbation
+            final_probability = float(
+                classify_candidate(
+                    final_features
+                ).item()
             )
 
-            probability = float(
-                model.forward_feature_probabilities(
-                    candidate_features
-                )[0].item()
-            )
-
-            if probability_meets_target_class(
-                probability,
+            # Numerical precision or non-monotonic behavior along the
+            # binary-search line can rarely make the reduced result fail.
+            # In that case, return the known successful perturbation.
+            if not probability_meets_target_class(
+                final_probability,
                 target_intent,
                 threshold,
             ):
-                high = scale
-            else:
-                low = scale
-
-        final_active_perturbation = (
-            high * best_perturbation
-        )
-
-        final_full_perturbation = torch.zeros_like(
-            original_features
-        ).scatter(
-            dim=1,
-            index=active_indices.unsqueeze(0),
-            src=final_active_perturbation,
-        )
-
-        final_features = (
-            original_features
-            + final_full_perturbation
-        )
-
-        final_probability = float(
-            model.forward_feature_probabilities(
-                final_features
-            )[0].item()
-        )
-
-        if not probability_meets_target_class(
-            final_probability,
-            target_intent,
-            threshold,
-        ):
-            fallback_full_perturbation = (
-                torch.zeros_like(
-                    original_features
-                ).scatter(
-                    dim=1,
-                    index=active_indices.unsqueeze(0),
-                    src=best_perturbation,
+                (
+                    final_features,
+                    _,
+                ) = reconstruct_candidate(
+                    best_hand_perturbation
                 )
-            )
 
-            final_features = (
-                original_features
-                + fallback_full_perturbation
-            )
+                fallback_probability = float(
+                    classify_candidate(
+                        final_features
+                    ).item()
+                )
+
+                if not probability_meets_target_class(
+                    fallback_probability,
+                    target_intent,
+                    threshold,
+                ):
+                    raise RuntimeError(
+                        "The stored successful hand "
+                        "perturbation no longer satisfies "
+                        "the target classification. "
+                        f"Probability="
+                        f"{fallback_probability:.6f}, "
+                        f"threshold={threshold:.6f}, "
+                        f"target_intent={target_intent}."
+                    )
 
     return (
         final_features[0]
@@ -855,12 +1561,83 @@ def _safe_max(values: list[float]) -> float | None:
     )
 
 
+def summarize_latency_snapshots(
+    snapshots: list[
+        dict[str, dict[str, float | int]]
+    ],
+    *,
+    evaluation_total_ms: float,
+) -> dict[str, Any]:
+    component_sample_totals: dict[str, list[float]] = {}
+    component_totals: dict[str, float] = {}
+    component_call_counts: dict[str, int] = {}
+
+    for snapshot in snapshots:
+        for name, component in snapshot.items():
+            total_ms = float(component["total_ms"])
+            call_count = int(component["call_count"])
+
+            component_sample_totals.setdefault(
+                name,
+                [],
+            ).append(total_ms)
+            component_totals[name] = (
+                component_totals.get(name, 0.0)
+                + total_ms
+            )
+            component_call_counts[name] = (
+                component_call_counts.get(name, 0)
+                + call_count
+            )
+
+    components: dict[str, dict[str, Any]] = {}
+
+    for name in sorted(component_totals):
+        sample_values = component_sample_totals[name]
+        total_ms = component_totals[name]
+        call_count = component_call_counts[name]
+
+        components[name] = {
+            "total_ms": float(total_ms),
+            "call_count": int(call_count),
+            "sample_count": len(sample_values),
+            "mean_per_call_ms": (
+                float(total_ms / call_count)
+                if call_count
+                else None
+            ),
+            "mean_per_sample_ms": _safe_mean(
+                sample_values
+            ),
+            "median_per_sample_ms": _safe_median(
+                sample_values
+            ),
+            "max_per_sample_ms": _safe_max(
+                sample_values
+            ),
+        }
+
+    return {
+        "evaluation_total_ms": float(evaluation_total_ms),
+        "attempted_sample_count": len(snapshots),
+        "components": components,
+        "timing_method": (
+            "CUDA events for CUDA tensor regions; synchronized "
+            "wall-clock timing for CPU/MPS and whole-sample timing."
+        ),
+        "instrumentation_note": (
+            "Timing instrumentation adds a small amount of overhead, "
+            "especially because every FABRIK invocation is measured."
+        ),
+    }
+
+
 def evaluate_counterfactual_weights(
     *,
     model: QuestHandIntentEstInference,
     rows: list[dict[str, Any]],
     classification_weight: float,
-    bone_length_weight: float,
+    reachability_weight: float,
     max_iterations: int,
     step_size: float,
     probability_margin: float,
@@ -873,8 +1650,12 @@ def evaluate_counterfactual_weights(
     Evaluate one weight pair over every supplied valid joint sample.
     """
     threshold = float(model.threshold)
+    evaluation_started_at = perf_counter()
 
     sample_results: list[dict[str, Any]] = []
+    sample_latency_snapshots: list[
+        dict[str, dict[str, float | int]]
+    ] = []
     perturbation_distances: list[float] = []
     probability_changes: list[float] = []
     maximum_bone_changes: list[float] = []
@@ -889,16 +1670,24 @@ def evaluate_counterfactual_weights(
     to_not_handoff_successes = 0
 
     for sample_number, row in enumerate(rows, start=1):
+        sample_started_at = perf_counter()
+        latency_tracker = LatencyTracker()
+
         original_features = np.asarray(
             row["joint_features"],
             dtype=np.float32,
         )
 
-        original_probability = float(
-            model.predict_features(
-                original_features
-            ).probability
-        )
+        with measure_latency(
+            latency_tracker,
+            "original_inference",
+            device=model.device,
+        ):
+            original_probability = float(
+                model.predict_features(
+                    original_features
+                ).probability
+            )
 
         target_intent = determine_target_intent(
             row=row,
@@ -925,24 +1714,41 @@ def evaluate_counterfactual_weights(
         }
 
         try:
-            perturbed_features = (
-                find_minimal_perturbation(
-                    model=model,
-                    joint_feat_vec=original_features,
-                    target_intent=target_intent,
-                    classification_weight=classification_weight,
-                    bone_length_weight=bone_length_weight,
-                    max_iterations=max_iterations,
-                    step_size=step_size,
-                    probability_margin=probability_margin,
+            with measure_latency(
+                latency_tracker,
+                "minimal_perturbation",
+                device=model.device,
+            ):
+                perturbed_features = (
+                    find_minimal_perturbation(
+                        model=model,
+                        joint_feat_vec=original_features,
+                        target_intent=target_intent,
+                        classification_weight=(
+                            classification_weight
+                        ),
+                        reachability_weight=(
+                            reachability_weight
+                        ),
+                        max_iterations=max_iterations,
+                        step_size=step_size,
+                        probability_margin=(
+                            probability_margin
+                        ),
+                        latency_tracker=latency_tracker,
+                    )
                 )
-            )
 
-            final_probability = float(
-                model.predict_features(
-                    perturbed_features
-                ).probability
-            )
+            with measure_latency(
+                latency_tracker,
+                "final_inference",
+                device=model.device,
+            ):
+                final_probability = float(
+                    model.predict_features(
+                        perturbed_features
+                    ).probability
+                )
 
             success = probability_meets_target_class(
                 final_probability,
@@ -950,29 +1756,37 @@ def evaluate_counterfactual_weights(
                 threshold,
             )
 
-            original_joints = (
-                feature_vector_to_joint_poses(
-                    original_features
+            with measure_latency(
+                latency_tracker,
+                "feature_to_pose_conversion",
+            ):
+                original_joints = (
+                    feature_vector_to_joint_poses(
+                        original_features
+                    )
                 )
-            )
-            perturbed_joints = (
-                feature_vector_to_joint_poses(
-                    perturbed_features
+                perturbed_joints = (
+                    feature_vector_to_joint_poses(
+                        perturbed_features
+                    )
                 )
-            )
 
-            bone_statistics = (
-                skeleton_edge_length_statistics(
-                    original_joints,
-                    perturbed_joints,
-                    relative_tolerance=(
-                        bone_relative_tolerance
-                    ),
-                    absolute_tolerance=(
-                        bone_absolute_tolerance
-                    ),
+            with measure_latency(
+                latency_tracker,
+                "bone_validation",
+            ):
+                bone_statistics = (
+                    skeleton_edge_length_statistics(
+                        original_joints,
+                        perturbed_joints,
+                        relative_tolerance=(
+                            bone_relative_tolerance
+                        ),
+                        absolute_tolerance=(
+                            bone_absolute_tolerance
+                        ),
+                    )
                 )
-            )
 
             perturbation_distance = float(
                 np.linalg.norm(
@@ -1017,6 +1831,11 @@ def evaluate_counterfactual_weights(
                             "violating_edge_count"
                         ]
                     ),
+                    "violating_edges": (
+                        bone_statistics[
+                            "violating_edges"
+                        ]
+                    ),
                 }
             )
 
@@ -1056,6 +1875,17 @@ def evaluate_counterfactual_weights(
         except Exception as error:
             result_record["error"] = str(error)
 
+        # Finalizing pending CUDA events synchronizes the sample, so
+        # whole-sample wall-clock latency also includes GPU completion.
+        latency_tracker.snapshot()
+        latency_tracker.add_duration_ms(
+            "sample_total",
+            (perf_counter() - sample_started_at) * 1000.0,
+        )
+        latency_snapshot = latency_tracker.snapshot()
+
+        result_record["latency_ms"] = latency_snapshot
+        sample_latency_snapshots.append(latency_snapshot)
         sample_results.append(result_record)
 
         if verbose:
@@ -1075,7 +1905,8 @@ def evaluate_counterfactual_weights(
                 f"[{sample_number}/{len(rows)}] "
                 f"sample={row['index']} "
                 f"target={target_intent} "
-                f"status={status}"
+                f"status={status} "
+                f"{format_latency_snapshot(latency_snapshot)}"
             )
 
     attempted_count = len(rows)
@@ -1104,8 +1935,8 @@ def evaluate_counterfactual_weights(
         "classification_weight": float(
             classification_weight
         ),
-        "bone_length_weight": float(
-            bone_length_weight
+        "reachability_weight": float(
+            reachability_weight
         ),
         "attempted_count": attempted_count,
         "success_count": success_count,
@@ -1170,6 +2001,13 @@ def evaluate_counterfactual_weights(
         ),
     }
 
+    summary["latency_ms"] = summarize_latency_snapshots(
+        sample_latency_snapshots,
+        evaluation_total_ms=(
+            perf_counter() - evaluation_started_at
+        ) * 1000.0,
+    )
+
     return {
         "summary": summary,
         "samples": sample_results,
@@ -1199,7 +2037,7 @@ def print_counterfactual_metrics(
     print(
         "Weights: "
         f"classification={summary['classification_weight']}, "
-        f"bone={summary['bone_length_weight']}"
+        f"bone={summary['reachability_weight']}"
     )
     print(
         "Classification success: "
@@ -1251,6 +2089,69 @@ def print_counterfactual_metrics(
         f"{summary['to_not_handoff_successes']}/"
         f"{summary['to_not_handoff_attempts']} "
         f"({percentage(summary['to_not_handoff_success_rate'])})"
+    )
+
+    latency_metrics = summary.get("latency_ms", {})
+    latency_components = latency_metrics.get("components", {})
+
+    def print_latency_component(
+        label: str,
+        component_name: str,
+    ) -> None:
+        component = latency_components.get(component_name)
+        if component is None:
+            print(f"{label}: n/a")
+            return
+
+        print(
+            f"{label} (mean/median/max ms per measured sample): "
+            f"{optional_float(component['mean_per_sample_ms'], 3)} / "
+            f"{optional_float(component['median_per_sample_ms'], 3)} / "
+            f"{optional_float(component['max_per_sample_ms'], 3)}; "
+            f"calls={component['call_count']}, "
+            f"mean/call="
+            f"{optional_float(component['mean_per_call_ms'], 3)} ms"
+        )
+
+    print(
+        "Evaluation wall-clock latency: "
+        f"{optional_float(latency_metrics.get('evaluation_total_ms'), 3)} ms"
+    )
+    print_latency_component(
+        "Whole-sample latency",
+        "sample_total",
+    )
+    print_latency_component(
+        "Minimal-perturbation latency",
+        "minimal_perturbation",
+    )
+    print_latency_component(
+        "Optimization-loop latency",
+        "optimization_loop",
+    )
+    print_latency_component(
+        "FABRIK solve latency",
+        "fabrik_solve",
+    )
+    print_latency_component(
+        "Classifier-forward latency",
+        "classifier_forward",
+    )
+    print_latency_component(
+        "Binary-search latency",
+        "binary_search",
+    )
+    print_latency_component(
+        "Original-inference latency",
+        "original_inference",
+    )
+    print_latency_component(
+        "Final-inference latency",
+        "final_inference",
+    )
+    print_latency_component(
+        "Bone-validation latency",
+        "bone_validation",
     )
     print("=" * 72)
     print()
@@ -1344,28 +2245,28 @@ def tune_counterfactual_weights(
             "classification_weights"
         ]
     ]
-    bone_length_weights = [
+    reachability_weights = [
         float(value)
         for value in tuning_config[
-            "bone_length_weights"
+            "reachability_weights"
         ]
     ]
 
     all_summaries: list[dict[str, Any]] = []
     pair_count = (
         len(classification_weights)
-        * len(bone_length_weights)
+        * len(reachability_weights)
     )
     pair_index = 0
 
     for classification_weight in classification_weights:
-        for bone_length_weight in bone_length_weights:
+        for reachability_weight in reachability_weights:
             pair_index += 1
 
             print(
                 f"\nWeight pair {pair_index}/{pair_count}: "
                 f"classification={classification_weight}, "
-                f"bone={bone_length_weight}"
+                f"bone={reachability_weight}"
             )
 
             evaluation = evaluate_counterfactual_weights(
@@ -1374,8 +2275,8 @@ def tune_counterfactual_weights(
                 classification_weight=(
                     classification_weight
                 ),
-                bone_length_weight=(
-                    bone_length_weight
+                reachability_weight=(
+                    reachability_weight
                 ),
                 max_iterations=int(
                     counterfactual_config[
@@ -1461,9 +2362,9 @@ def save_selected_weights(
         best_summary["classification_weight"]
     )
     counterfactual_config[
-        "bone_length_weight"
+        "reachability_weight"
     ] = float(
-        best_summary["bone_length_weight"]
+        best_summary["reachability_weight"]
     )
 
     counterfactual_config["selection"] = {
@@ -1482,7 +2383,7 @@ def save_selected_weights(
             for key, value in best_summary.items()
             if key not in {
                 "classification_weight",
-                "bone_length_weight",
+                "reachability_weight",
             }
         },
     }
@@ -1604,9 +2505,9 @@ def visualize_counterfactual_samples(
                         "classification_weight"
                     ]
                 ),
-                bone_length_weight=float(
+                reachability_weight=float(
                     counterfactual_config[
-                        "bone_length_weight"
+                        "reachability_weight"
                     ]
                 ),
                 max_iterations=int(
@@ -1647,13 +2548,13 @@ def visualize_counterfactual_samples(
             parents=True,
             exist_ok=True,
         )
-
+        condition = row["condition"]
         visualize_joint_features(
             feature_vector=original_features,
             comparison_feature_vector=perturbed_features,
             features_per_joint=model.features_per_joint,
             title=(
-                f"Sample {sample_index}: original and "
+                f"Sample {sample_index}: original with sample condition {condition} and "
                 f"counterfactual Quest poses "
                 f"({original_probability:.4f} -> "
                 f"{final_probability:.4f})"
@@ -1779,16 +2680,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--tuning-results-path",
         type=Path,
         default=(
-            CONFIG_DIR
-            / "counterfactual_weight_search_results.yaml"
+            OUTPUT_DIR
+            / "counterfactual_eval/counterfactual_weight_search_results.yaml"
         ),
     )
     parser.add_argument(
         "--evaluation-results-path",
         type=Path,
         default=(
-            CONFIG_DIR
-            / "counterfactual_evaluation_results.yaml"
+            OUTPUT_DIR
+            / "counterfactual_eval/counterfactual_evaluation_results.yaml"
         ),
     )
 
@@ -1930,9 +2831,9 @@ def main() -> None:
             "classification_weight"
         ]
         counterfactual_config[
-            "bone_length_weight"
+            "reachability_weight"
         ] = best_summary[
-            "bone_length_weight"
+            "reachability_weight"
         ]
 
     final_evaluation = (
@@ -1944,9 +2845,9 @@ def main() -> None:
                     "classification_weight"
                 ]
             ),
-            bone_length_weight=float(
+            reachability_weight=float(
                 counterfactual_config[
-                    "bone_length_weight"
+                    "reachability_weight"
                 ]
             ),
             max_iterations=int(

@@ -16,6 +16,8 @@ frames/
 recordings/
 outputs/
 runs/
+test_data/
+test_videos/
 
 # Model files
 *.pth
@@ -52,6 +54,7 @@ wandb/
 *.tiff
 *.webp
 *.gif
+*.mp4
 
 # Model weights / pretrained files
 *.pkl

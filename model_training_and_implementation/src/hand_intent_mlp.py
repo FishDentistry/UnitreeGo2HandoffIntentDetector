@@ -1,25 +1,33 @@
+import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 class HandIntentMLP(nn.Module):
-    def __init__(self, input_size, output_size):
-        super(HandIntentMLP, self).__init__()
+    def __init__(self, input_size: int, output_size: int = 1):
+        super().__init__()
+
         self.input_size = input_size
         self.output_size = output_size
-        self.fc1 = nn.Linear(self.input_size, 512)
-        self.fc2 = nn.Linear(512, 1024)
-        self.fc3 = nn.Linear(1024,2048)
-        self.fc4 = nn.Linear(2048, 1024)
-        self.fc5 = nn.Linear(1024, 512)
-        self.fc6 = nn.Linear(512, self.output_size)
-        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))
-        x = F.relu(self.fc5(x))
-        x = self.fc6(x)
-        output = self.sigmoid(x)
-        return output
+        self.network = nn.Sequential(
+            #nn.LayerNorm(input_size),
+
+            nn.Linear(input_size, 256),
+            nn.GELU(),
+            nn.Dropout(0.25),
+
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Dropout(0.25),
+
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Dropout(0.20),
+
+            nn.Linear(64, output_size),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+

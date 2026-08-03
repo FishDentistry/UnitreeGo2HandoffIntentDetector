@@ -1,6 +1,6 @@
 counterfactual:
   classification_weight: 1000.0
-  bone_length_weight: 1000.0
+  reachability_weight: 1000.0
   max_iterations: 1000
   step_size: 0.01
   probability_margin: 0.0001
@@ -13,7 +13,7 @@ counterfactual:
     - 100.0
     - 1000.0
     - 10000.0
-    bone_length_weights:
+    reachability_weights:
     - 10.0
     - 100.0
     - 1000.0
