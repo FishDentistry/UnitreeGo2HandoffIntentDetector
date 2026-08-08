@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import json
 import shutil
 from pathlib import Path
@@ -50,11 +51,28 @@ TRAIN_RUN_DIR = WEIGHTS_DIR / "training_run"
 MODEL_WEIGHTS = "yolo26s.pt"
 
 EPOCHS = 100
-IMAGE_SIZE = 640
-BATCH_SIZE = 16
+IMAGE_SIZE = 1280
+TRAIN_BATCH_SIZE = -1
+EVAL_BATCH_SIZE = 4
 PATIENCE = 20
 WORKERS = 8
 SEED = 42
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--resume-training",action=argparse.BooleanOptionalAction,default=False,)
+parser.add_argument("--eval-only",action=argparse.BooleanOptionalAction,default=False,)
+
+RESUME_TRAINING = parser.parse_args().resume_training
+EVAL_ONLY = parser.parse_args().eval_only 
+
+if(RESUME_TRAINING and EVAL_ONLY):
+    raise ValueError("Cannot specify both --resume-training and --eval-only.")
+
+RESUME_CHECKPOINT = (
+    TRAIN_RUN_DIR
+    / "weights"
+    / "last.pt"
+)
 
 
 def find_data_yaml(dataset_dir: Path) -> Path:
@@ -144,7 +162,7 @@ def evaluate_split(
         data=str(data_yaml),
         split=split,
         imgsz=IMAGE_SIZE,
-        batch=BATCH_SIZE,
+        batch=EVAL_BATCH_SIZE,
         device=device,
         workers=WORKERS,
         plots=True,
@@ -204,32 +222,87 @@ def main() -> None:
     print(f"Device:           {device_name}")
     print(f"Starting model:   {MODEL_WEIGHTS}")
 
+    if EVAL_ONLY:
+        saved_best = WEIGHTS_DIR / "best.pt"
+
+        if not saved_best.is_file():
+            raise FileNotFoundError(
+                f"Best weights were not found:\n{saved_best}"
+            )
+
+        best_model = YOLO(str(saved_best))
+
+        evaluation_summary = {
+            "best_weights": str(saved_best),
+            "dataset_yaml": str(data_yaml),
+            "device": device_name,
+            "validation": evaluate_split(
+                model=best_model,
+                data_yaml=data_yaml,
+                split="val",
+                output_dir=EVAL_RESULTS_DIR / "val",
+                device=device,
+            ),
+        }
+
+        if dataset_config.get("test"):
+            evaluation_summary["test"] = evaluate_split(
+                model=best_model,
+                data_yaml=data_yaml,
+                split="test",
+                output_dir=EVAL_RESULTS_DIR / "test",
+                device=device,
+            )
+
+        combined_summary_path = (
+            EVAL_RESULTS_DIR / "evaluation_summary.json"
+        )
+
+        with combined_summary_path.open("w", encoding="utf-8") as file:
+            json.dump(evaluation_summary, file, indent=4)
+
+        print("\nEvaluation completed.")
+        print(f"Evaluation summary: {combined_summary_path}")
+        return
+
     # Loading a named pretrained checkpoint automatically downloads it on the
     # first run if it is not already present.
-    model = YOLO(MODEL_WEIGHTS)
+    if RESUME_TRAINING:
+        if not RESUME_CHECKPOINT.is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint was not found:\n{RESUME_CHECKPOINT}"
+            )
 
-    model.train(
-        data=str(data_yaml),
-        epochs=EPOCHS,
-        imgsz=IMAGE_SIZE,
-        batch=BATCH_SIZE,
-        patience=PATIENCE,
-        device=device,
-        workers=WORKERS,
-        seed=SEED,
-        deterministic=True,
-        pretrained=True,
-        amp=torch.cuda.is_available(),
-        cache=False,
-        plots=True,
-        val=True,
-        save=True,
-        save_period=-1,
-        save_dir=str(TRAIN_RUN_DIR),
-        exist_ok=True,
-        verbose=True,
-        single_cls=True,
-    )
+        print(f"Resuming training from:\n{RESUME_CHECKPOINT}")
+
+        model = YOLO(str(RESUME_CHECKPOINT))
+        model.train(resume=True)
+
+    else:
+        model = YOLO(MODEL_WEIGHTS)
+
+        model.train(
+            data=str(data_yaml),
+            epochs=EPOCHS,
+            imgsz=IMAGE_SIZE,
+            batch=TRAIN_BATCH_SIZE,
+            patience=PATIENCE,
+            device=device,
+            workers=WORKERS,
+            seed=SEED,
+            deterministic=True,
+            pretrained=True,
+            amp=torch.cuda.is_available(),
+            cache=False,
+            plots=True,
+            val=True,
+            save=True,
+            save_period=-1,
+            save_dir=str(TRAIN_RUN_DIR),
+            exist_ok=True,
+            verbose=True,
+            single_cls=True,
+        )
 
     if model.trainer is None:
         raise RuntimeError("Ultralytics did not retain the trainer instance.")

@@ -29,6 +29,7 @@ from model_training_and_implementation.src.dino_detector import DINOObjectDetect
 from robot_fov_estimation.src.go2_yolo_det_wrapper import YOLOGo2Detector
 from robot_fov_estimation.src.robot_detector_tracker import (
     RobotDetectorTracker,
+    OSTrackAdapter,
     RobotTrackResult,
     draw_result,
 )
@@ -185,8 +186,10 @@ def create_app(robot_obj_det_weights_path:str, model_path: str) -> FastAPI:
             device=0,
         )
 
+    ostrack = OSTrackAdapter()
     robot_tracker = RobotDetectorTracker(
         detector=yolo_detector,
+        ostrack = ostrack,
         class_names=ROBOT_DETECTOR_CLASS_NAMES,
         verification_interval_seconds=0.15,
         verification_iou_threshold=0.40,

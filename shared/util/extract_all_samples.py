@@ -833,29 +833,50 @@ def get_depth_at_rgb_point(
     return float(np.median(valid_depths))
 
 
-def organize_samples(samples, features_type,obj_detector, keypoint_detector, head_pose_estimator, img_encoder, args):
+
+def organize_samples(
+    samples,
+    features_type,
+    obj_detector,
+    keypoint_detector,
+    head_pose_estimator,
+    img_encoder,
+    args,
+):
     y_true = []
     rows = []
+
     skipped_unreadable = 0
     skipped_no_object = 0
     skipped_no_people = 0
+    skipped_invalid_depth = 0
     errors = 0
 
+    # A radius of 1 produces a conservative 3x3 sampling patch.
+    # This can optionally be overridden through args.depth_patch_radius.
+    depth_patch_radius = int(getattr(args, "depth_patch_radius", 1))
 
+    if depth_patch_radius < 0:
+        raise ValueError("depth_patch_radius must be greater than or equal to 0.")
 
     for local_idx, sample in enumerate(samples):
         image_path = str(sample.rgb_path)
         depth_path = str(sample.depth_path)
+
         image = cv2.imread(image_path)
         depth_image = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+
         objects = []
         people = []
 
-        
-
         if image is None:
             skipped_unreadable += 1
-            print(f"[{local_idx + 1}/{len(samples)}] SKIP unreadable image: {image_path}")
+
+            print(
+                f"[{local_idx + 1}/{len(samples)}] "
+                f"SKIP unreadable image: {image_path}"
+            )
+
             rows.append(
                 {
                     "index": local_idx,
@@ -868,7 +889,12 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
 
         if depth_image is None:
             skipped_unreadable += 1
-            print(f"[{local_idx + 1}/{len(samples)}] SKIP unreadable depth image: {depth_path}")
+
+            print(
+                f"[{local_idx + 1}/{len(samples)}] "
+                f"SKIP unreadable depth image: {depth_path}"
+            )
+
             rows.append(
                 {
                     "index": local_idx,
@@ -881,30 +907,87 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
             continue
 
         try:
-            if(args.crop_around_object):
-                crop_objs = obj_detector.predict(image, class_names=args.crop_object)
-                if len(crop_objs) == 0:
-                    print("SKIP no person detected ")
+            # -------------------------------------------------------------
+            # Optional crop around the requested object/person.
+            # -------------------------------------------------------------
+            if args.crop_around_object:
+                crop_objs = obj_detector.predict(
+                    image,
+                    class_names=args.crop_object,
+                )
+
+                matching_crop_objs = [
+                    detection
+                    for detection in crop_objs
+                    if detection["label"].strip(".")
+                    == args.crop_object.strip(".")
+                ]
+
+                if len(matching_crop_objs) == 0:
+                    skipped_no_object += 1
+
+                    print(
+                        f"[{local_idx + 1}/{len(samples)}] "
+                        f"SKIP no crop object detected: "
+                        f"{args.crop_object}"
+                    )
+
+                    rows.append(
+                        {
+                            "participant_id": sample.participant_id,
+                            "index": local_idx,
+                            "image": image_path,
+                            "depth": depth_path,
+                            "skipped": True,
+                            "skip_reason": "no_crop_object_detected",
+                        }
+                    )
                     continue
 
                 sorted_boxes = sorted(
-                                        [d for d in crop_objs if d["label"].strip(".") == args.crop_object.strip(".")],
-                                        key=lambda d: (
-                                            (d["box_xyxy"][2] - d["box_xyxy"][0]) *
-                                            (d["box_xyxy"][3] - d["box_xyxy"][1])
-                                        ),
-                                        reverse=True,  # largest first
-                                    )
-                box_xyxy = sorted_boxes[0]["box_xyxy"]
-                x1, y1, x2, y2 = map(int, box_xyxy)
+                    matching_crop_objs,
+                    key=lambda detection: (
+                        (
+                            detection["box_xyxy"][2]
+                            - detection["box_xyxy"][0]
+                        )
+                        * (
+                            detection["box_xyxy"][3]
+                            - detection["box_xyxy"][1]
+                        )
+                    ),
+                    reverse=True,
+                )
+
+                x1, y1, x2, y2 = map(
+                    int,
+                    sorted_boxes[0]["box_xyxy"],
+                )
 
                 rgb_height, rgb_width = image.shape[:2]
                 depth_height, depth_width = depth_image.shape[:2]
 
+                # Clamp the RGB crop to the image.
+                x1 = int(np.clip(x1, 0, rgb_width))
+                x2 = int(np.clip(x2, 0, rgb_width))
+                y1 = int(np.clip(y1, 0, rgb_height))
+                y2 = int(np.clip(y2, 0, rgb_height))
+
+                if x2 <= x1 or y2 <= y1:
+                    raise ValueError(
+                        "Object detection produced an invalid RGB crop."
+                    )
+
+                # Map the RGB crop bounds into the depth image.
                 depth_x1 = int(round(x1 * depth_width / rgb_width))
-                depth_y1 = int(round(y1 * depth_height / rgb_height))
                 depth_x2 = int(round(x2 * depth_width / rgb_width))
+                depth_y1 = int(round(y1 * depth_height / rgb_height))
                 depth_y2 = int(round(y2 * depth_height / rgb_height))
+
+                depth_x1 = int(np.clip(depth_x1, 0, depth_width))
+                depth_x2 = int(np.clip(depth_x2, 0, depth_width))
+                depth_y1 = int(np.clip(depth_y1, 0, depth_height))
+                depth_y2 = int(np.clip(depth_y2, 0, depth_height))
 
                 cropped_image = image[y1:y2, x1:x2]
                 cropped_depth = depth_image[
@@ -912,140 +995,258 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     depth_x1:depth_x2,
                 ]
 
-                if cropped_image.size == 0 or cropped_depth.size == 0:
-                    raise ValueError("Object crop produced an empty RGB or depth image.")
+                if cropped_image.size == 0:
+                    raise ValueError(
+                        "Object crop produced an empty RGB image."
+                    )
+
+                if cropped_depth.size == 0:
+                    raise ValueError(
+                        "Object crop produced an empty depth image."
+                    )
 
                 image = cropped_image
                 depth_image = cropped_depth
 
-            # det_hands = obj_detector.predict(image, class_names="hand.")
-            # if len(det_hands) == 0:
-            #                 print("SKIP no hands detected ")
-            #                 skipped_no_people += 1
-            #                 continue
-
-            # sorted_hands = sorted(
-            #                         [d for d in det_hands if d["label"].strip(".") == "hand"],
-            #                         key=lambda d: (
-            #                             (d["box_xyxy"][2] - d["box_xyxy"][0]) *
-            #                             (d["box_xyxy"][3] - d["box_xyxy"][1])
-            #                         ),
-            #                         reverse=True,  # largest first
-            #                     )
-            # biggest_hand_bbox = sorted_hands[0]["box_xyxy"]
-            # x1, y1, x2, y2 = map(int, biggest_hand_bbox)
-            # outstretched_hand_mp = [(x1 + x2) / 2.0, (y1 + y2) / 2.0]
-            
-                
-
+            # -------------------------------------------------------------
+            # Ground-truth label.
+            # -------------------------------------------------------------
             label_name = get_sample_label_name(sample)
             y = label_to_binary(label_name)
-            if(features_type == "keypoints_headpose_dino"):
-                objects = obj_detector.predict(image, class_names=args.dino_classes)
 
-                # New filter: skip samples where no target object was detected.
-                if len(objects) == 0 or len(objects) > 1:
+            # -------------------------------------------------------------
+            # Optional object detection for DINO features.
+            # -------------------------------------------------------------
+            if features_type == "keypoints_headpose_dino":
+                objects = obj_detector.predict(
+                    image,
+                    class_names=args.dino_classes,
+                )
+
+                if len(objects) != 1:
                     skipped_no_object += 1
+
                     print(
                         f"[{local_idx + 1}/{len(samples)}] "
-                        f"SKIP no object detected or too many det:{len(objects)}"
+                        f"SKIP expected exactly one object, "
+                        f"detected={len(objects)} "
                         f"label={label_name:<12} "
                         f"{Path(image_path).name}"
                     )
+
                     rows.append(
                         {
+                            "participant_id": sample.participant_id,
                             "index": local_idx,
                             "image": image_path,
+                            "depth": depth_path,
                             "label_name": label_name,
                             "label_binary": int(y),
                             "skipped": True,
-                            "skip_reason": "no_object_detected",
-                            "num_objects": 0,
+                            "skip_reason": "invalid_object_count",
+                            "num_objects": len(objects),
                         }
                     )
                     continue
-            if (
-                features_type == "keypoints"
-                or features_type == "keypoints_headpose"
-                or features_type == "keypoints_headpose_dino"
-                or features_type == "keypoints_resnet"
-                or features_type == "keypoints_headpose_resnet"
-            ):
+
+            # -------------------------------------------------------------
+            # Person/keypoint detection.
+            # -------------------------------------------------------------
+            keypoint_feature_types = {
+                "keypoints",
+                "keypoints_headpose",
+                "keypoints_headpose_dino",
+                "keypoints_resnet",
+                "keypoints_headpose_resnet",
+            }
+
+            if features_type in keypoint_feature_types:
                 people = keypoint_detector.predict(image)
 
-                # Optional but usually useful: skip if no person/keypoints.
-                # If you want to include these as automatic negatives, remove this block.
-                if len(people) == 0 or len(people) > 1:
+                if len(people) != 1:
                     skipped_no_people += 1
+
                     print(
                         f"[{local_idx + 1}/{len(samples)}] "
-                        f"SKIP no person detected "
+                        f"SKIP expected exactly one person, "
+                        f"detected={len(people)} "
                         f"label={label_name:<12} "
-                        f"objs={len(objects)} "
+                        f"objects={len(objects)} "
                         f"{Path(image_path).name}"
                     )
+
                     rows.append(
                         {
+                            "participant_id": sample.participant_id,
                             "index": local_idx,
                             "image": image_path,
+                            "depth": depth_path,
                             "label_name": label_name,
                             "label_binary": int(y),
                             "skipped": True,
-                            "skip_reason": "no_person_detected",
+                            "skip_reason": "invalid_person_count",
                             "num_objects": len(objects),
-                            "num_people": 0,
+                            "num_people": len(people),
                         }
                     )
                     continue
 
-            if (
-                features_type == "keypoints_headpose"
-                or features_type == "keypoints_headpose_dino"
-                or features_type == "keypoints_headpose_resnet"
-            ):
-                head_pose = head_pose_estimator.predict_first_or_sentinel(
-                    image,
-                    rtmpose_results=people,
+            # -------------------------------------------------------------
+            # Optional head-pose extraction.
+            # -------------------------------------------------------------
+            headpose_feature_types = {
+                "keypoints_headpose",
+                "keypoints_headpose_dino",
+                "keypoints_headpose_resnet",
+            }
+
+            if features_type in headpose_feature_types:
+                head_pose = (
+                    head_pose_estimator.predict_first_or_sentinel(
+                        image,
+                        rtmpose_results=people,
+                    )
                 )
-            
 
-            keypoints = np.asarray(people[0]["keypoints"][:11], dtype=np.float32)
-            left_shoulder = keypoints[5, :2]
-            right_shoulder = keypoints[6, :2]
-            shoulder_midpoint = (left_shoulder + right_shoulder) / 2.0
+            # -------------------------------------------------------------
+            # Extract the upper-body keypoints.
+            #
+            # COCO indices used here:
+            # 5: left shoulder
+            # 6: right shoulder
+            # 7: left elbow
+            # 8: right elbow
+            # 9: left wrist
+            # 10: right wrist
+            # -------------------------------------------------------------
+            keypoints = np.asarray(
+                people[0]["keypoints"][:11],
+                dtype=np.float32,
+            )
 
-            keypoints_depth = []
-            for i in range(5,11):
+            left_shoulder_xy = keypoints[5, :2].copy()
+            right_shoulder_xy = keypoints[6, :2].copy()
+
+            shoulder_midpoint_xy = (
+                left_shoulder_xy + right_shoulder_xy
+            ) / 2.0
+
+            # -------------------------------------------------------------
+            # Depth normalization.
+            #
+            # First sample the depth directly at the shoulder midpoint.
+            # Then express each joint depth relative to that reference.
+            #
+            # A negative value means the joint is closer to the camera than
+            # the shoulder midpoint. A positive value means it is farther.
+            # -------------------------------------------------------------
+            try:
+                shoulder_midpoint_depth = get_depth_at_rgb_point(
+                    depth_image=depth_image,
+                    rgb_image_shape=image.shape,
+                    point_xy=shoulder_midpoint_xy,
+                    patch_radius=depth_patch_radius,
+                )
+            except Exception as exc:
+                skipped_invalid_depth += 1
+
+                depth_error = (
+                    "Could not obtain shoulder-midpoint depth: "
+                    f"{exc}"
+                )
+
+                print(
+                    f"[{local_idx + 1}/{len(samples)}] "
+                    f"SKIP invalid shoulder depth: "
+                    f"{depth_error} "
+                    f"{image_path}"
+                )
+
+                rows.append(
+                    {
+                        "participant_id": sample.participant_id,
+                        "index": local_idx,
+                        "image": image_path,
+                        "depth": depth_path,
+                        "label_name": label_name,
+                        "label_binary": int(y),
+                        "skipped": True,
+                        "skip_reason": "invalid_shoulder_midpoint_depth",
+                        "error": depth_error,
+                    }
+                )
+                continue
+
+            absolute_joint_depths = []
+            relative_joint_depths = []
+            depth_error = None
+
+            for keypoint_index in range(5, 11):
                 try:
-                    kp_depth = get_depth_at_rgb_point(depth_image, image.shape, keypoints[i, :2])
-                    keypoints_depth.append(kp_depth)
-                except Exception as e:
-                    print(f"Error occurred while calculating depth for keypoint {i}: {e}")
-                    skipped_no_people += 1
-                    continue
+                    absolute_depth = get_depth_at_rgb_point(
+                        depth_image=depth_image,
+                        rgb_image_shape=image.shape,
+                        point_xy=keypoints[keypoint_index, :2],
+                        patch_radius=depth_patch_radius,
+                    )
 
-            # hand_depth = get_depth_at_rgb_point(
-            #     depth_image,
-            #     image.shape,
-            #     outstretched_hand_mp,
-            # )
-            # shoulder_depth = get_depth_at_rgb_point(
-            #     depth_image,
-            #     image.shape,
-            #     shoulder_midpoint,
-            # )
+                    relative_depth = (
+                        absolute_depth - shoulder_midpoint_depth
+                    )
 
-            # Analogous to the old hand-minus-shoulder 2D vector:
-            # positive means the hand is farther from the camera than the shoulders,
-            # while negative means the hand is closer.
-            #hand_to_shoulder_depth_difference = hand_depth - shoulder_depth
+                    absolute_joint_depths.append(
+                        float(absolute_depth)
+                    )
+                    relative_joint_depths.append(
+                        float(relative_depth)
+                    )
 
-            if(args.normalize_keypoints):
-                keypoints[:, :2] = keypoints[:, :2] - shoulder_midpoint
+                except Exception as exc:
+                    depth_error = (
+                        f"Could not obtain depth for keypoint "
+                        f"{keypoint_index}: {exc}"
+                    )
+                    break
 
+            if depth_error is not None:
+                skipped_invalid_depth += 1
 
-                
-            if(features_type == "keypoints"):
+                print(
+                    f"[{local_idx + 1}/{len(samples)}] "
+                    f"SKIP invalid keypoint depth: "
+                    f"{depth_error} "
+                    f"{image_path}"
+                )
+
+                rows.append(
+                    {
+                        "participant_id": sample.participant_id,
+                        "index": local_idx,
+                        "image": image_path,
+                        "depth": depth_path,
+                        "label_name": label_name,
+                        "label_binary": int(y),
+                        "skipped": True,
+                        "skip_reason": "invalid_keypoint_depth",
+                        "error": depth_error,
+                    }
+                )
+                continue
+
+            # -------------------------------------------------------------
+            # Normalize 2D keypoints around the shoulder midpoint.
+            # -------------------------------------------------------------
+            if args.normalize_keypoints:
+                keypoints[:, :2] = (
+                    keypoints[:, :2] - shoulder_midpoint_xy
+                )
+
+            # -------------------------------------------------------------
+            # Build the non-depth portion of the feature vector.
+            # -------------------------------------------------------------
+            if features_type == "keypoints":
+                feature_vector = flatten_feature_vector(keypoints)
+
                 row = {
                     "participant_id": sample.participant_id,
                     "index": local_idx,
@@ -1053,10 +1254,18 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     "label_name": label_name,
                     "label_binary": int(y),
                     "num_people": len(people),
-                    "feature_vector": flatten_feature_vector(keypoints),
+                    "feature_vector": feature_vector,
                     "skipped": False,
                 }
-            elif(features_type == "keypoints_headpose"):
+
+            elif features_type == "keypoints_headpose":
+                feature_vector = (
+                    flatten_feature_vector(keypoints)
+                    + head_pose.flatten().astype(
+                        np.float32
+                    ).tolist()
+                )
+
                 row = {
                     "participant_id": sample.participant_id,
                     "index": local_idx,
@@ -1064,18 +1273,28 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     "label_name": label_name,
                     "label_binary": int(y),
                     "num_people": len(people),
-                    "feature_vector": flatten_feature_vector(keypoints)
-                    + head_pose.flatten().astype(np.float32).tolist(),
+                    "feature_vector": feature_vector,
                     "skipped": False,
                 }
+
             elif features_type == "keypoints_headpose_dino":
-                box_xyxy = objects[0]["box_xyxy"]
-                x1, y1, x2, y2 = map(float, box_xyxy)
+                x1, y1, x2, y2 = map(
+                    float,
+                    objects[0]["box_xyxy"],
+                )
 
                 object_centroid = [
                     (x1 + x2) / 2.0,
                     (y1 + y2) / 2.0,
                 ]
+
+                feature_vector = (
+                    flatten_feature_vector(keypoints)
+                    + head_pose.flatten().astype(
+                        np.float32
+                    ).tolist()
+                    + object_centroid
+                )
 
                 row = {
                     "participant_id": sample.participant_id,
@@ -1087,15 +1306,22 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     "num_people": len(people),
                     "head_pose": head_pose.tolist(),
                     "object_centroid": object_centroid,
-                    "feature_vector": (
-                        flatten_feature_vector(keypoints)
-                        + head_pose.flatten().astype(np.float32).tolist()
-                        + object_centroid
-                    ),
+                    "feature_vector": feature_vector,
                     "skipped": False,
                 }
+
             elif features_type == "keypoints_resnet":
-                resnet_embedding = img_encoder.predict(image)["embedding"]
+                resnet_embedding = img_encoder.predict(
+                    image
+                )["embedding"]
+
+                feature_vector = (
+                    flatten_feature_vector(keypoints)
+                    + resnet_embedding.flatten().astype(
+                        np.float32
+                    ).tolist()
+                )
+
                 row = {
                     "participant_id": sample.participant_id,
                     "index": local_idx,
@@ -1103,14 +1329,25 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     "label_name": label_name,
                     "label_binary": int(y),
                     "num_people": len(people),
-                    "feature_vector": (
-                        flatten_feature_vector(keypoints)
-                        + resnet_embedding.flatten().astype(np.float32).tolist()
-                    ),
+                    "feature_vector": feature_vector,
                     "skipped": False,
                 }
+
             elif features_type == "keypoints_headpose_resnet":
-                resnet_embedding = img_encoder.predict(image)["embedding"]
+                resnet_embedding = img_encoder.predict(
+                    image
+                )["embedding"]
+
+                feature_vector = (
+                    flatten_feature_vector(keypoints)
+                    + head_pose.flatten().astype(
+                        np.float32
+                    ).tolist()
+                    + resnet_embedding.flatten().astype(
+                        np.float32
+                    ).tolist()
+                )
+
                 row = {
                     "participant_id": sample.participant_id,
                     "index": local_idx,
@@ -1118,44 +1355,83 @@ def organize_samples(samples, features_type,obj_detector, keypoint_detector, hea
                     "label_name": label_name,
                     "label_binary": int(y),
                     "num_people": len(people),
-                    "feature_vector": (
-                        flatten_feature_vector(keypoints)
-                        + head_pose.flatten().astype(np.float32).tolist()
-                        + resnet_embedding.flatten().astype(np.float32).tolist()
-                    ),
+                    "feature_vector": feature_vector,
                     "skipped": False,
                 }
-            if(sample.joints_path is not None):
+
+            else:
+                raise ValueError(
+                    f"Unsupported features_type: {features_type}"
+                )
+
+            if sample.joints_path is not None:
                 row["quest_joints_pth"] = sample.joints_path
 
-            
-            # row["hand_depth"] = hand_depth
-            # row["shoulder_depth"] = shoulder_depth
-            # row["hand_to_shoulder_depth_difference"] = hand_to_shoulder_depth_difference
-            # row["feature_vector"] = row["feature_vector"] + [
-            #     hand_to_shoulder_depth_difference
-            # ]
-            row["joint_depths"] = keypoints_depth
-            row["feature_vector"] = row["feature_vector"] + keypoints_depth
-            
+            # Retain the raw depth information for inspection/debugging.
+            row["shoulder_midpoint_xy"] = (
+                shoulder_midpoint_xy.astype(
+                    np.float32
+                ).tolist()
+            )
+            row["shoulder_midpoint_depth"] = float(
+                shoulder_midpoint_depth
+            )
+            row["absolute_joint_depths"] = absolute_joint_depths
+            row["relative_joint_depths"] = relative_joint_depths
+            row["depth_patch_radius"] = depth_patch_radius
+
+            # Only shoulder-relative depth values are supplied to the model.
+            row["feature_vector"] = (
+                row["feature_vector"]
+                + relative_joint_depths
+            )
+
             rows.append(row)
             y_true.append(y)
-            print("Appended new row for sample:", local_idx)
-            print("Skipped unreadable:", skipped_unreadable, "skipped no object:", skipped_no_object, "skipped no people:", skipped_no_people, "errors:", errors)
 
-        except Exception as e:
+            print(
+                f"Appended new row for sample: {local_idx}"
+            )
+            print(
+                "Skipped unreadable:",
+                skipped_unreadable,
+                "skipped no object:",
+                skipped_no_object,
+                "skipped no people:",
+                skipped_no_people,
+                "skipped invalid depth:",
+                skipped_invalid_depth,
+                "errors:",
+                errors,
+            )
+
+        except Exception as exc:
             errors += 1
-            print(f"[{local_idx + 1}/{len(samples)}] ERROR {image_path}: {e}")
+
+            print(
+                f"[{local_idx + 1}/{len(samples)}] "
+                f"ERROR {image_path}: {exc}"
+            )
+
             rows.append(
                 {
+                    "participant_id": sample.participant_id,
                     "index": local_idx,
                     "image": image_path,
+                    "depth": depth_path,
                     "skipped": True,
                     "skip_reason": "error",
-                    "error": str(e),
+                    "error": str(exc),
                 }
             )
-    return y_true, rows, skipped_unreadable, skipped_no_object, skipped_no_people
+
+    return (
+        y_true,
+        rows,
+        skipped_unreadable,
+        skipped_no_object,
+        skipped_no_people,
+    )
 
 
 

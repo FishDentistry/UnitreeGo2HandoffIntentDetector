@@ -1,3 +1,4 @@
+#python -m quest_hand_intent_model_est.model_training.train_quest_hand_int_est_mlp --teacher-features-type keypoints --student-features-type keypoints_projections
 import numpy as np
 from shared.util.extract_all_samples import discover_samples, organize_samples
 from pathlib import Path
@@ -20,10 +21,11 @@ from model_training_and_implementation.src.resnet_encoder import ResNet18ImageEn
 
 
 from quest_hand_intent_model_est.src.quest_hand_intent_est_mlp import QuestHandIntentEstimatorMLP
-from quest_hand_intent_model_est.src.quest_joint_features import extract_quest_joint_features, QUEST_JOINT_ORDER
+from quest_hand_intent_model_est.src.quest_joint_features import extract_quest_joint_features, construct_pose_img_from_joint_feature_vector, QUEST_JOINT_ORDER
 
 
-FEATURES_TYPE = ["keypoints","keypoints_headpose","keypoints_headpose_dino","keypoints_resnet","keypoints_headpose_resnet"]
+TEACHER_FEATURES_TYPE = ["keypoints","keypoints_headpose","keypoints_headpose_dino","keypoints_resnet","keypoints_headpose_resnet"]
+STUDENT_FEATURES_TYPE = ["keypoints","keypoints_projections","keypoints_resnet"]
 
 
 MODEL_IMPL_ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +61,8 @@ def sanitize_path_component(value):
 def build_model_variation_name(args):
     """Build a descriptive name for the feature/model configuration."""
     parts = [
-        f"features-{args.features_type}",
+        f"teacher_features-{args.teacher_features_type}",
+        f"student_features-{args.student_features_type}",
         f"crop-{args.crop_around_object}",
         f"rotations-{args.include_quest_joint_rotations}",
     ]
@@ -239,38 +242,9 @@ def get_model_input_dim(model):
     raise ValueError("Could not find a Linear layer in the model.")
 
 
-def construct_quest_joint_feature_vecs(rows, include_rotations=False):
-    feature_vectors = []
-    usable_rows = []
-
-    for row in rows:
-        json_path = row.get("quest_joints_pth")
-
-        if json_path is None:
-            print("Skipping row: missing quest_joints_pth")
-            continue
-
-        try:
-            feature_vector = extract_quest_joint_features(
-                json_path,
-                include_rotations=include_rotations,
-            )
-
-            feature_vectors.append(feature_vector)
-            usable_rows.append(row)
-
-        except Exception as error:
-            print(f"Skipping {json_path}: {error}")
-
-    if not feature_vectors:
-        raise ValueError("No Quest joint feature vectors were constructed.")
-
-    X = np.stack(feature_vectors).astype(np.float32)
-
-    return X, usable_rows
 
 
-def construct_quest_training_data(rows, old_model, device="auto", include_rotations=False):
+def construct_quest_training_data(rows, old_model, device="auto", include_rotations=False, student_features_type="keypoints"):
     """
     Construct aligned Quest inputs and teacher-model targets.
 
@@ -285,6 +259,8 @@ def construct_quest_training_data(rows, old_model, device="auto", include_rotati
         )
     else:
         resolved_device = torch.device(device)
+
+    resnet_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
 
     old_model = old_model.to(resolved_device)
     old_model.eval()
@@ -310,6 +286,16 @@ def construct_quest_training_data(rows, old_model, device="auto", include_rotati
                 extract_quest_joint_features(json_path, include_rotations=include_rotations),
                 dtype=np.float32,
             )
+
+            if(student_features_type == "keypoints_projections"):
+                proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(quest_features)
+                quest_features = np.concatenate([quest_features, proj_joints], axis=0)
+            elif(student_features_type == "keypoints_resnet"):
+                proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(quest_features)
+                resnet_embedding = resnet_encoder.predict(pose_img)["embedding"]
+                quest_features = np.concatenate([quest_features, resnet_embedding.flatten().astype(np.float32)], axis=0)
+                               
+
             teacher_features = np.asarray(
                 old_features,
                 dtype=np.float32,
@@ -358,6 +344,7 @@ def construct_quest_training_data(rows, old_model, device="auto", include_rotati
 def train_quest_student_mlp(
     rows,
     teacher_model,
+    student_features_type:str = "keypoints",
     learning_rate: float = 1e-3,
     batch_size: int = 32,
     epochs: int = 30,
@@ -386,6 +373,7 @@ def train_quest_student_mlp(
         old_model=teacher_model,
         device=str(resolved_device),
         include_rotations=include_rotations,
+        student_features_type=student_features_type,
     )
 
     if X.ndim != 2:
@@ -592,6 +580,7 @@ def evaluate_quest_student_mlp(
     teacher_model,
     test_rows,
     device: str,
+    student_features_type:str = "keypoints",
     threshold: float = 0.5,
     include_rotations: bool = False,
 ):
@@ -609,6 +598,7 @@ def evaluate_quest_student_mlp(
         old_model=teacher_model,
         device=str(resolved_device),
         include_rotations=include_rotations,
+        student_features_type=student_features_type
     )
 
     expected_input_dim = get_model_input_dim(model)
@@ -736,6 +726,7 @@ def leave_one_participant_out_evaluation(
     device: str = "auto",
     threshold: float = 0.5,
     include_rotations: bool = False,
+    student_features_type: str = "keypoints",
 ):
     """
     Perform leave-one-participant-out evaluation of the Quest student.
@@ -812,6 +803,7 @@ def leave_one_participant_out_evaluation(
             device=device,
             threshold=threshold,
             include_rotations=include_rotations,
+            student_features_type = student_features_type,
             output_path=None,
         )
 
@@ -822,6 +814,7 @@ def leave_one_participant_out_evaluation(
             device=train_summary["device"],
             threshold=threshold,
             include_rotations=include_rotations,
+            student_features_type = student_features_type
         )
 
         fold_evaluation["fold_index"] = int(fold_index)
@@ -953,7 +946,8 @@ def main():
         default=False,
     )
     parser.add_argument("--confidence", type=float, default=0.15)
-    parser.add_argument("--features-type", type=str, choices=FEATURES_TYPE, default="keypoints")
+    parser.add_argument("--teacher-features-type", type=str, choices=TEACHER_FEATURES_TYPE, default="keypoints")
+    parser.add_argument("--student-features-type", type=str, choices=STUDENT_FEATURES_TYPE, default="keypoints")
     parser.add_argument("--participant", type=str, default=None, help="Filter to one participant ID, e.g. 1 or P01")
     parser.add_argument("--label", type=str, default=None, help="Filter to label_name, e.g. handoff or not_handoff")
     parser.add_argument("--condition", type=str, default=None, help="Filter to one condition")
@@ -1030,7 +1024,7 @@ def main():
 
     resnet_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
 
-    HAND_INTENT_WEIGHTS_PATH = REPO_ROOT / "model_training_and_implementation" / "outputs" / "hand_intent_mlp_weights" / ("features-"+str(args.features_type)+"__crop-"+str(args.crop_around_object)) / "MLP.pth"
+    HAND_INTENT_WEIGHTS_PATH = REPO_ROOT / "model_training_and_implementation" / "outputs" / "hand_intent_mlp_weights" / ("features-"+str(args.teacher_features_type)+"__crop-"+str(args.crop_around_object)) / "MLP.pth"
 
     checkpoint = torch.load(
     HAND_INTENT_WEIGHTS_PATH,
@@ -1048,7 +1042,7 @@ def main():
 
     y_true, rows, skipped_unreadable, skipped_no_object, skipped_no_people = organize_samples(
         samples=samples,
-        features_type=args.features_type,
+        features_type=args.teacher_features_type,
         obj_detector=object_detector,
         keypoint_detector=keypoint_detector,
         head_pose_estimator=head_pose_estimator,
@@ -1066,6 +1060,7 @@ def main():
         device="auto",
         threshold=args.decision_threshold,
         include_rotations=args.include_quest_joint_rotations,
+        student_features_type=args.student_features_type
     )
 
     print("\nQuest student LOPO evaluation complete")
@@ -1159,6 +1154,7 @@ def main():
         device="auto",
         threshold=args.decision_threshold,
         include_rotations=args.include_quest_joint_rotations,
+        student_features_type=args.student_features_type,
         output_path=final_output_path,
     )
 
