@@ -15,7 +15,8 @@ from quest_hand_intent_model_est.src.quest_hand_int_inf_wrapper import (
     QuestHandIntentEstInference,
 )
 from quest_hand_intent_model_est.src.quest_joint_features import (
-    extract_quest_joint_features_json, feature_vector_to_joint_poses
+    extract_quest_joint_features_json, feature_vector_to_joint_poses,
+    construct_pose_img_from_joint_feature_vector
 )
 from quest_hand_intent_model_est.src.find_minimal_perturbation import find_minimal_perturbation
 from quest_hand_intent_model_est.src.text_guidance_from_pert import generate_text_guidance_from_perturbation
@@ -26,6 +27,7 @@ from quest_hand_intent_model_est.src.posefix_guidance import (
 from shared.util.quest_joints_network_dat_str import QuestJointsPacket
 
 from model_training_and_implementation.src.dino_detector import DINOObjectDetector
+from model_training_and_implementation.src.resnet_encoder import ResNet18ImageEncoder
 from robot_fov_estimation.src.go2_yolo_det_wrapper import YOLOGo2Detector
 from robot_fov_estimation.src.robot_detector_tracker import (
     RobotDetectorTracker,
@@ -40,7 +42,7 @@ ROBOT_DETECTOR_CLASS_NAMES = [
     "robot dog"
 ]
 
-
+QUEST_MODEL_FEATURES_TYPE = "keypoints_projections"  # or "keypoints_projections"
 
 
 def format_perturbation_response(
@@ -169,6 +171,7 @@ def create_app(robot_obj_det_weights_path:str, model_path: str) -> FastAPI:
     # request. Do not create DINO or CSRT separately inside the endpoint.
     #
     dino_detector = DINOObjectDetector(confidence=0.05)
+    resnet_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
 
     if(robot_obj_det_weights_path is not None):
         yolo_detector = YOLOGo2Detector(
@@ -353,9 +356,18 @@ def create_app(robot_obj_det_weights_path:str, model_path: str) -> FastAPI:
             payload,
             include_rotations=model.include_rotations,
         )
-
+        proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(joint_feat_vec)
+        quest_features = []
+        if(QUEST_MODEL_FEATURES_TYPE == "keypoints_projections"):
+            quest_features = np.concatenate([joint_feat_vec, proj_joints], axis=0)
+        elif(QUEST_MODEL_FEATURES_TYPE == "keypoints_resnet"):
+            resnet_embedding = resnet_encoder.predict(pose_img)["embedding"]
+            quest_features = np.concatenate([joint_feat_vec, resnet_embedding.flatten().astype(np.float32)], axis=0)
+        else:
+            raise ValueError(f"Invalid QUEST_MODEL_FEATURES_TYPE: {QUEST_MODEL_FEATURES_TYPE}")
+        
         original_prediction = model.predict_features(
-            joint_feat_vec
+            quest_features
         )
 
         target_intent = True
@@ -367,21 +379,22 @@ def create_app(robot_obj_det_weights_path:str, model_path: str) -> FastAPI:
                 "joint_rotation_perturbations": {},
                 "text_guidance": "",
             }
-
+        
         perturbed_features = find_minimal_perturbation(
             model=model,
-            joint_feat_vec=joint_feat_vec,
+            joint_feat_vec=quest_features,
             target_intent=True,
             classification_weight=1000.0,
             reachability_weight=1000.0,
             probability_margin=0.05,
             max_iterations=500,
         )
+        perturbed_joints = perturbed_features[:63]
         
-
+        joint_feat_vec = joint_feat_vec[:-3]
         response = format_perturbation_response(
             original_joints=joint_feat_vec,
-            perturbed_joints=perturbed_features,
+            perturbed_joints=perturbed_joints,
             perturbations_needed=True,
             shoulder_midpoint=shoulder_midpoint
         )

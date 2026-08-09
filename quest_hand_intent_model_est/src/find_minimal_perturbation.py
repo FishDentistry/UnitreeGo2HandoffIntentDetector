@@ -20,6 +20,7 @@ from quest_hand_intent_model_est.src.quest_joint_features import (
     SKELETON_EDGES,
     extract_quest_joint_features,
     feature_vector_to_joint_poses,
+    construct_pose_img_from_joint_feature_vector
 )
 from shared.util.extract_all_samples import (
     Sample,
@@ -28,6 +29,8 @@ from shared.util.extract_all_samples import (
     label_to_binary,
 )
 from shared.util.quest_joints_viz import visualize_joint_features
+from model_training_and_implementation.src.resnet_encoder import ResNet18ImageEncoder
+
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -37,10 +40,43 @@ CONFIG_DIR = REPO_ROOT / "quest_hand_intent_model_est" / "configs"
 HANDOFF_CONFIG_PATH = CONFIG_DIR / "handoff_config.yaml"
 COUNTERFACTUAL_CONFIG_PATH = CONFIG_DIR / "counterfactual_config.yaml"
 
+WEIGHT_SEARCH_FEATURES_TYPE = "keypoints_resnet"
+RESNET_ENCODER: ResNet18ImageEncoder | None = None
+
+
+def get_resnet_encoder() -> ResNet18ImageEncoder:
+    """Create the ResNet encoder only when the ResNet feature mode is used."""
+    global RESNET_ENCODER
+    if RESNET_ENCODER is None:
+        RESNET_ENCODER = ResNet18ImageEncoder(
+            pretrained=True,
+            device="cuda",
+            l2_normalize=True,
+        )
+    return RESNET_ENCODER
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 VISUALIZATION_DIR = SCRIPT_DIR / "visualizations"
 OUTPUT_DIR = SCRIPT_DIR.parent / "outputs"
 VISUALIZATION_DIR = OUTPUT_DIR / "visualizations"
+
+# Classifier feature layout:
+#
+#   [63 joint XYZ values | 3 head roll/pitch/yaw values | derived features]
+#
+# Only the 63 joint XYZ values are modified by counterfactual optimization.
+# The head-orientation values remain fixed at their observed values. The
+# derived block (either chest-plane projections or a ResNet embedding of the
+# rendered projection) is regenerated from each counterfactual joint pose.
+JOINT_POSITION_DIMS = 3
+JOINT_POSITION_FEATURE_COUNT = 63
+HEAD_ORIENTATION_FEATURE_COUNT = 3
+BASE_POSE_FEATURE_COUNT = (
+    JOINT_POSITION_FEATURE_COUNT + HEAD_ORIENTATION_FEATURE_COUNT
+)
+PROJECTED_DIMS_PER_JOINT = 2
+PROJECTED_FEATURE_COUNT = 21 * PROJECTED_DIMS_PER_JOINT
+RESNET_SPSA_EPSILON = 1e-3
 
 MODIFIABLE_JOINT_NAMES = {
     "left_hand",
@@ -390,12 +426,25 @@ def get_joint_samples(
     skipped_no_object = 0
     skipped_no_people = 0
     errors = 0
-
     for local_idx, sample in enumerate(samples):
         try:
             label_name = get_sample_label_name(sample)
             y = label_to_binary(label_name)
-
+            joint_head_feats = extract_quest_joint_features(
+                    sample.joints_path,
+                    include_rotations=include_rotation,
+                )
+            proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(joint_head_feats)
+            full_features =[]
+            if(WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_projections"):
+                full_features = np.concatenate([joint_head_feats, proj_joints], axis=0)
+            elif(WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_resnet"):
+                resnet_embedding = get_resnet_encoder().predict(
+                    pose_img
+                )["embedding"]
+                full_features = np.concatenate([joint_head_feats, resnet_embedding.flatten().astype(np.float32)], axis=0)
+            else:
+                raise ValueError(f"Invalid WEIGHT_SEARCH_FEATURES_TYPE: {WEIGHT_SEARCH_FEATURES_TYPE}")
             row = {
                 "participant_id": sample.participant_id,
                 "index": local_idx,
@@ -403,10 +452,7 @@ def get_joint_samples(
                 "label_binary": int(y),
                 "condition": sample.condition,
                 "hand": sample.hand,
-                "joint_features": extract_quest_joint_features(
-                    sample.joints_path,
-                    include_rotations=include_rotation,
-                ),
+                "joint_features": full_features,
                 "skipped": False,
             }
 
@@ -902,12 +948,191 @@ def solve_fabrik_chain(
 
     return torch.stack(points)
 
+def project_joint_positions_to_chest_plane_torch(
+    joint_position_features: torch.Tensor,
+    *,
+    joint_indices: dict[str, int],
+    epsilon: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Differentiably project the 21 XYZ joint positions onto the same
+    chest/shoulder plane used by construct_pose_img_from_joint_feature_vector.
+
+    Parameters
+    ----------
+    joint_position_features:
+        Tensor with shape (B, 63), containing 21 contiguous XYZ positions.
+    joint_indices:
+        Mapping from joint name to its index in the 21-joint ordering.
+
+    Returns
+    -------
+    torch.Tensor
+        Flattened projected coordinates with shape (B, 42), ordered as
+        [joint0_u, joint0_v, joint1_u, joint1_v, ...].
+
+    Notes
+    -----
+    Only the continuous projection math is reproduced here. Pixel rounding
+    and OpenCV drawing from the pose-image helper are intentionally omitted,
+    because keypoints_projections uses only the continuous projected joints.
+    """
+    if joint_position_features.ndim != 2:
+        raise ValueError(
+            "joint_position_features must have shape (B, 63), "
+            f"received {tuple(joint_position_features.shape)}."
+        )
+
+    if int(joint_position_features.shape[1]) != JOINT_POSITION_FEATURE_COUNT:
+        raise ValueError(
+            f"Expected {JOINT_POSITION_FEATURE_COUNT} joint-position values, "
+            f"received {int(joint_position_features.shape[1])}."
+        )
+
+    required = {"chest", "left_shoulder", "right_shoulder"}
+    missing = sorted(required.difference(joint_indices))
+    if missing:
+        raise ValueError(
+            "Chest-plane projection requires these joints: "
+            + ", ".join(missing)
+        )
+
+    positions = joint_position_features.reshape(
+        joint_position_features.shape[0],
+        -1,
+        JOINT_POSITION_DIMS,
+    )
+
+    chest = positions[:, joint_indices["chest"], :]
+    right_shoulder = positions[:, joint_indices["right_shoulder"], :]
+    left_shoulder = positions[:, joint_indices["left_shoulder"], :]
+
+    normal_raw = torch.linalg.cross(
+        right_shoulder - chest,
+        left_shoulder - chest,
+        dim=1,
+    )
+    normal_norm = torch.linalg.vector_norm(
+        normal_raw,
+        dim=1,
+        keepdim=True,
+    )
+
+    plane_normal = normal_raw / normal_norm.clamp_min(epsilon)
+
+    u_raw = left_shoulder - right_shoulder
+    u_norm = torch.linalg.vector_norm(
+        u_raw,
+        dim=1,
+        keepdim=True,
+    )
+
+    u = u_raw / u_norm.clamp_min(epsilon)
+
+    v_raw = torch.linalg.cross(
+        plane_normal,
+        u,
+        dim=1,
+    )
+    v_norm = torch.linalg.vector_norm(
+        v_raw,
+        dim=1,
+        keepdim=True,
+    )
+
+    v = v_raw / v_norm.clamp_min(epsilon)
+
+    # Match construct_pose_img_from_joint_feature_vector: keep positive v
+    # approximately aligned with world +Y. The sign decision depends only on
+    # the fixed chest/shoulder frame in the current counterfactual setup.
+    world_up = torch.tensor(
+        [0.0, 1.0, 0.0],
+        dtype=positions.dtype,
+        device=positions.device,
+    ).view(1, 3)
+    v_dot_up = (v * world_up).sum(dim=1, keepdim=True)
+    v = torch.where(v_dot_up < 0.0, -v, v)
+
+    relative_positions = positions - chest.unsqueeze(1)
+    projected_u = (relative_positions * u.unsqueeze(1)).sum(dim=2)
+    projected_v = (relative_positions * v.unsqueeze(1)).sum(dim=2)
+
+    projected = torch.stack(
+        (projected_u, projected_v),
+        dim=2,
+    )
+
+    return projected.reshape(projected.shape[0], -1)
+
+
+def regenerate_resnet_candidate_features(
+    candidate_joint_position_features: torch.Tensor,
+    fixed_head_orientation_features: torch.Tensor,
+    *,
+    model: QuestHandIntentEstInference,
+) -> torch.Tensor:
+    """
+    Regenerate the nondifferentiable pose image and its ResNet embedding for
+    a candidate pose, then return the complete classifier feature tensor.
+
+    This path intentionally detaches the candidate joints because the current
+    pose-image renderer uses NumPy/OpenCV and is not differentiable. The
+    ResNet counterfactual optimizer therefore uses SPSA for the six hand
+    variables instead of autograd through this function.
+    """
+    candidate_joint_array = (
+        candidate_joint_position_features[0]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+    fixed_head_orientation_array = (
+        fixed_head_orientation_features[0]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    # Match get_joint_samples(): the pose-image helper receives the joint XYZ
+    # block followed by head roll/pitch/yaw. The helper ignores the final
+    # three head-orientation values when constructing the projection image.
+    candidate_joint_head_array = np.concatenate(
+        [candidate_joint_array, fixed_head_orientation_array],
+        axis=0,
+    ).astype(np.float32)
+
+    _, pose_img = construct_pose_img_from_joint_feature_vector(
+        candidate_joint_head_array
+    )
+    resnet_embedding = get_resnet_encoder().predict(
+        pose_img
+    )["embedding"]
+
+    full_features = np.concatenate(
+        [
+            candidate_joint_array,
+            fixed_head_orientation_array,
+            np.asarray(
+                resnet_embedding,
+                dtype=np.float32,
+            ).reshape(-1),
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    return model.make_feature_tensor(
+        full_features,
+        require_single=True,
+    )
+
+
 def reconstruct_arms_from_hand_perturbation(
     *,
-    original_features: torch.Tensor,
+    original_joint_features: torch.Tensor,
     hand_perturbation: torch.Tensor,
     joint_indices: dict[str, int],
-    features_per_joint: int,
     fabrik_iterations: int = 4,
     latency_tracker: LatencyTracker | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -919,8 +1144,12 @@ def reconstruct_arms_from_hand_perturbation(
          right_dx, right_dy, right_dz]
 
     Returns:
-        reconstructed full feature vector
+        reconstructed 63-value joint-position tensor
         reachability loss
+
+    Derived projection/ResNet features are not stored here. They are rebuilt
+    from the reconstructed joints by find_minimal_perturbation for every
+    classifier candidate.
     """
     if hand_perturbation.shape != (1, 6):
         raise ValueError(
@@ -928,18 +1157,21 @@ def reconstruct_arms_from_hand_perturbation(
             f"received {hand_perturbation.shape}."
         )
 
+    if original_joint_features.shape != (1, JOINT_POSITION_FEATURE_COUNT):
+        raise ValueError(
+            "original_joint_features must have shape "
+            f"(1, {JOINT_POSITION_FEATURE_COUNT}), received "
+            f"{tuple(original_joint_features.shape)}."
+        )
+
     def get_position(
         features: torch.Tensor,
         joint_name: str,
     ) -> torch.Tensor:
-        start = (
-            joint_indices[joint_name]
-            * features_per_joint
-        )
-
+        start = joint_indices[joint_name] * JOINT_POSITION_DIMS
         return features[
             0,
-            start : start + 3,
+            start:start + JOINT_POSITION_DIMS,
         ]
 
     def set_position(
@@ -947,35 +1179,23 @@ def reconstruct_arms_from_hand_perturbation(
         joint_name: str,
         position: torch.Tensor,
     ) -> None:
-        start = (
-            joint_indices[joint_name]
-            * features_per_joint
-        )
-
+        start = joint_indices[joint_name] * JOINT_POSITION_DIMS
         features[
             0,
-            start : start + 3,
+            start:start + JOINT_POSITION_DIMS,
         ] = position
 
-    candidate_features = (
-        original_features.clone()
-    )
+    candidate_joint_features = original_joint_features.clone()
 
     hand_deltas = {
-        "left": hand_perturbation[
-            0,
-            0:3,
-        ],
-        "right": hand_perturbation[
-            0,
-            3:6,
-        ],
+        "left": hand_perturbation[0, 0:3],
+        "right": hand_perturbation[0, 3:6],
     }
 
     reachability_loss = torch.zeros(
         (),
-        dtype=original_features.dtype,
-        device=original_features.device,
+        dtype=original_joint_features.dtype,
+        device=original_joint_features.device,
     )
 
     for side in ("left", "right"):
@@ -984,63 +1204,38 @@ def reconstruct_arms_from_hand_perturbation(
         original_chain = torch.stack(
             [
                 get_position(
-                    original_features,
+                    original_joint_features,
                     joint_name,
                 )
                 for joint_name in chain_names
             ]
         )
 
-        original_hand_position = (
-            original_chain[-1]
-        )
-
+        original_hand_position = original_chain[-1]
         requested_hand_target = (
-            original_hand_position
-            + hand_deltas[side]
+            original_hand_position + hand_deltas[side]
         )
 
-        segment_lengths = (
-            torch.linalg.vector_norm(
-                original_chain[1:]
-                - original_chain[:-1],
-                dim=1,
-            )
+        segment_lengths = torch.linalg.vector_norm(
+            original_chain[1:] - original_chain[:-1],
+            dim=1,
         )
-
-        maximum_reach = (
-            segment_lengths.sum()
-        )
-
-        longest_segment = (
-            segment_lengths.max()
-        )
-
+        maximum_reach = segment_lengths.sum()
+        longest_segment = segment_lengths.max()
         minimum_reach = torch.relu(
             longest_segment
-            - (
-                maximum_reach
-                - longest_segment
-            )
+            - (maximum_reach - longest_segment)
         )
 
-        requested_distance = (
-            torch.linalg.vector_norm(
-                requested_hand_target
-                - original_chain[0]
-            )
+        requested_distance = torch.linalg.vector_norm(
+            requested_hand_target - original_chain[0]
         )
-
         too_far = torch.relu(
-            requested_distance
-            - maximum_reach
+            requested_distance - maximum_reach
         )
-
         too_close = torch.relu(
-            minimum_reach
-            - requested_distance
+            minimum_reach - requested_distance
         )
-
         reachability_loss = (
             reachability_loss
             + too_far.square()
@@ -1050,66 +1245,48 @@ def reconstruct_arms_from_hand_perturbation(
         with measure_latency(
             latency_tracker,
             "fabrik_solve",
-            device=original_features.device,
+            device=original_joint_features.device,
         ):
             solved_chain = solve_fabrik_chain(
                 original_points=original_chain,
-                target_position=(
-                    requested_hand_target
-                ),
+                target_position=requested_hand_target,
                 iterations=fabrik_iterations,
             )
 
-        # The root remains unchanged. Replace the other
-        # positions with the FABRIK solution.
+        # The root stays fixed. Replace the remaining chain positions with
+        # the FABRIK solution.
         for joint_name, solved_position in zip(
             chain_names[1:],
             solved_chain[1:],
         ):
             set_position(
-                candidate_features,
+                candidate_joint_features,
                 joint_name,
                 solved_position,
             )
 
-        solved_hand_position = (
-            solved_chain[-1]
-        )
-
+        solved_hand_position = solved_chain[-1]
         actual_hand_displacement = (
-            solved_hand_position
-            - original_hand_position
+            solved_hand_position - original_hand_position
         )
 
-        # Palm and wrist twist retain their position
-        # relative to the hand.
-        for attached_joint in (
-            HAND_ATTACHED_JOINTS[side]
-        ):
-            if (
-                attached_joint
-                not in joint_indices
-            ):
+        # Palm and wrist twist retain their position relative to the hand.
+        for attached_joint in HAND_ATTACHED_JOINTS[side]:
+            if attached_joint not in joint_indices:
                 continue
 
-            original_attached_position = (
-                get_position(
-                    original_features,
-                    attached_joint,
-                )
+            original_attached_position = get_position(
+                original_joint_features,
+                attached_joint,
             )
-
             set_position(
-                candidate_features,
+                candidate_joint_features,
                 attached_joint,
                 original_attached_position
                 + actual_hand_displacement,
             )
 
-    return (
-        candidate_features,
-        reachability_loss,
-    )
+    return candidate_joint_features, reachability_loss
 
 
 def find_minimal_perturbation(
@@ -1126,33 +1303,39 @@ def find_minimal_perturbation(
     latency_tracker: LatencyTracker | None = None,
 ) -> np.ndarray:
     """
-    Find minimal left- and right-hand position changes that produce
-    the requested classification.
+    Find minimal left- and right-hand position changes that produce the
+    requested classification while regenerating all joint-derived features.
 
     Only six independent values are optimized:
 
         left-hand  XYZ displacement
         right-hand XYZ displacement
 
-    For every proposed pair of hand displacements, complete left and
-    right arm poses are reconstructed using FABRIK before being passed
-    to the classifier.
+    For every proposed pair of hand displacements, complete left and right
+    arm poses are reconstructed with FABRIK. The classifier input is then
+    regenerated from that reconstructed pose:
 
-    The scapula or shoulder at the start of each configured ARM_CHAINS
-    entry remains fixed. Intermediate arm joints are repositioned while
-    preserving their original segment lengths. Palm and wrist-twist
-    joints move rigidly with their corresponding hand.
+        keypoints_projections:
+            joints + fixed head RPY -> differentiable chest-plane projection
+            -> classifier
+
+        keypoints_resnet:
+            joints + fixed head RPY -> pose image -> ResNet embedding
+            -> classifier
+
+    The projections path remains fully differentiable and therefore uses
+    ordinary autograd + Adam. The ResNet path contains NumPy/OpenCV raster
+    operations, so it uses a two-evaluation SPSA gradient estimate for the six
+    hand variables rather than expensive per-dimension finite differences.
     """
     if max_iterations <= 0:
         raise ValueError(
-            f"max_iterations must be positive, "
-            f"got {max_iterations}."
+            f"max_iterations must be positive, got {max_iterations}."
         )
 
     if step_size <= 0.0:
         raise ValueError(
-            f"step_size must be positive, "
-            f"got {step_size}."
+            f"step_size must be positive, got {step_size}."
         )
 
     if classification_weight < 0.0:
@@ -1170,6 +1353,15 @@ def find_minimal_perturbation(
             "probability_margin must be nonnegative."
         )
 
+    if WEIGHT_SEARCH_FEATURES_TYPE not in (
+        "keypoints_projections",
+        "keypoints_resnet",
+    ):
+        raise ValueError(
+            "Unsupported WEIGHT_SEARCH_FEATURES_TYPE: "
+            f"{WEIGHT_SEARCH_FEATURES_TYPE!r}."
+        )
+
     feature_array = np.asarray(
         joint_feat_vec,
         dtype=np.float32,
@@ -1177,24 +1369,248 @@ def find_minimal_perturbation(
 
     if feature_array.ndim != 1:
         raise ValueError(
-            "joint_feat_vec must be a single 1D feature "
-            f"vector, but received shape "
-            f"{feature_array.shape}."
+            "joint_feat_vec must be a single 1D feature vector, "
+            f"but received shape {feature_array.shape}."
         )
 
-    if model.features_per_joint < 3:
+    if feature_array.shape[0] < BASE_POSE_FEATURE_COUNT:
         raise ValueError(
-            "The model must contain at least three "
-            "position features per joint."
+            "joint_feat_vec must contain at least 63 joint-position values "
+            "followed by 3 head roll/pitch/yaw values, "
+            f"but received only {feature_array.shape[0]} total values."
+        )
+
+    expected_joint_position_count = (
+        len(model.joint_order) * JOINT_POSITION_DIMS
+    )
+    if expected_joint_position_count != JOINT_POSITION_FEATURE_COUNT:
+        raise ValueError(
+            f"Expected the first {JOINT_POSITION_FEATURE_COUNT} values "
+            "to contain exactly one XYZ position for every joint in "
+            f"model.joint_order, but model.joint_order contains "
+            f"{len(model.joint_order)} joints "
+            f"({expected_joint_position_count} XYZ values)."
+        )
+
+    if int(model.input_dim) != int(feature_array.shape[0]):
+        raise ValueError(
+            f"Model expects {model.input_dim} input features, but the supplied "
+            f"feature vector contains {feature_array.shape[0]}."
         )
 
     original_features = model.make_feature_tensor(
         feature_array,
         require_single=True,
     ).detach()
+    original_joint_features = original_features[
+        :, :JOINT_POSITION_FEATURE_COUNT
+    ]
+    fixed_head_orientation_features = original_features[
+        :,
+        JOINT_POSITION_FEATURE_COUNT:BASE_POSE_FEATURE_COUNT,
+    ]
+
+    if fixed_head_orientation_features.shape != (
+        1,
+        HEAD_ORIENTATION_FEATURE_COUNT,
+    ):
+        raise ValueError(
+            "Expected exactly three head-orientation features immediately "
+            "after the 63 joint XYZ values."
+        )
 
     threshold = float(model.threshold)
     target_intent = bool(target_intent)
+
+    joint_indices = {
+        joint_name: joint_index
+        for joint_index, joint_name in enumerate(model.joint_order)
+    }
+
+    required_joint_names: set[str] = set()
+    for chain_names in ARM_CHAINS.values():
+        required_joint_names.update(chain_names)
+    required_joint_names.update(
+        {"chest", "left_shoulder", "right_shoulder"}
+    )
+
+    missing_joints = sorted(
+        required_joint_names.difference(joint_indices)
+    )
+    if missing_joints:
+        raise ValueError(
+            "The following required joints are absent from the model's "
+            "joint order: " + ", ".join(missing_joints)
+        )
+
+    def build_projection_features(
+        candidate_joint_features: torch.Tensor,
+        *,
+        track_latency: bool = True,
+    ) -> torch.Tensor:
+        tracker = latency_tracker if track_latency else None
+        with measure_latency(
+            tracker,
+            "projection_regeneration",
+            device=model.device,
+        ):
+            projected_features = (
+                project_joint_positions_to_chest_plane_torch(
+                    candidate_joint_features,
+                    joint_indices=joint_indices,
+                )
+            )
+
+        candidate_features = torch.cat(
+            (
+                candidate_joint_features,
+                fixed_head_orientation_features,
+                projected_features,
+            ),
+            dim=1,
+        )
+
+        if int(candidate_features.shape[1]) != model.input_dim:
+            raise ValueError(
+                "Regenerated keypoints_projections candidate contains "
+                f"{int(candidate_features.shape[1])} features, but the model "
+                f"expects {model.input_dim}. Expected a 63-value joint block, "
+                f"3 head roll/pitch/yaw values, plus a "
+                f"{PROJECTED_FEATURE_COUNT}-value projection block."
+            )
+
+        return candidate_features
+
+    def build_resnet_features(
+        candidate_joint_features: torch.Tensor,
+        *,
+        track_latency: bool = True,
+    ) -> torch.Tensor:
+        tracker = latency_tracker if track_latency else None
+        with measure_latency(
+            tracker,
+            "resnet_feature_regeneration",
+            device=model.device,
+        ):
+            candidate_features = regenerate_resnet_candidate_features(
+                candidate_joint_features,
+                fixed_head_orientation_features,
+                model=model,
+            )
+
+        return candidate_features
+
+    def reconstruct_joints(
+        perturbation: torch.Tensor,
+        *,
+        track_latency: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tracker = latency_tracker if track_latency else None
+        with measure_latency(
+            tracker,
+            "arm_reconstruction",
+            device=model.device,
+        ):
+            return reconstruct_arms_from_hand_perturbation(
+                original_joint_features=original_joint_features,
+                hand_perturbation=perturbation,
+                joint_indices=joint_indices,
+                fabrik_iterations=10,
+                latency_tracker=tracker,
+            )
+
+    def reconstruct_candidate(
+        perturbation: torch.Tensor,
+        *,
+        track_latency: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        candidate_joint_features, reachability_loss = reconstruct_joints(
+            perturbation,
+            track_latency=track_latency,
+        )
+
+        if WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_projections":
+            candidate_features = build_projection_features(
+                candidate_joint_features,
+                track_latency=track_latency,
+            )
+        else:
+            candidate_features = build_resnet_features(
+                candidate_joint_features,
+                track_latency=track_latency,
+            )
+
+        return (
+            candidate_features,
+            candidate_joint_features,
+            reachability_loss,
+        )
+
+    def classify_candidate(
+        candidate_features: torch.Tensor,
+        *,
+        track_latency: bool = True,
+    ) -> torch.Tensor:
+        tracker = latency_tracker if track_latency else None
+        with measure_latency(
+            tracker,
+            "classifier_forward",
+            device=model.device,
+        ):
+            # candidate_features is already a validated float tensor on the
+            # correct device. Calling the frozen MLP directly avoids the
+            # wrapper's repeated shape/finite-value validation and GPU sync
+            # on every optimization candidate while preserving gradients.
+            return model.model(
+                candidate_features
+            ).reshape(-1)[0]
+
+    # Verify that the differentiable projection reproduces the exact feature
+    # representation already present in the original sample. This catches
+    # ordering/layout mismatches before optimization begins.
+    if WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_projections":
+        expected_input_dim = (
+            BASE_POSE_FEATURE_COUNT
+            + PROJECTED_FEATURE_COUNT
+        )
+        if model.input_dim != expected_input_dim:
+            raise ValueError(
+                "keypoints_projections expects model input dimension "
+                f"{expected_input_dim} (63 joint XYZ + 3 head RPY + "
+                "42 projected values), "
+                f"but this model expects {model.input_dim}."
+            )
+
+        with torch.inference_mode():
+            regenerated_original_projection = (
+                project_joint_positions_to_chest_plane_torch(
+                    original_joint_features,
+                    joint_indices=joint_indices,
+                )
+            )
+            supplied_original_projection = original_features[
+                :, BASE_POSE_FEATURE_COUNT:
+            ]
+
+            if not torch.allclose(
+                regenerated_original_projection,
+                supplied_original_projection,
+                rtol=1e-4,
+                atol=1e-5,
+            ):
+                max_abs_difference = float(
+                    (
+                        regenerated_original_projection
+                        - supplied_original_projection
+                    ).abs().max().item()
+                )
+                raise ValueError(
+                    "Differentiable chest-plane projection does not match the "
+                    "projection features supplied with the original sample. "
+                    "This indicates a feature-ordering or projection-definition "
+                    "mismatch. Maximum absolute difference="
+                    f"{max_abs_difference:.6g}."
+                )
 
     with measure_latency(
         latency_tracker,
@@ -1208,8 +1624,8 @@ def find_minimal_perturbation(
                 )[0].item()
             )
 
-    # No counterfactual is required when the original sample already
-    # belongs to the requested target class.
+    # No counterfactual is required if the original sample already belongs to
+    # the requested target class.
     if probability_meets_target_class(
         original_probability,
         target_intent,
@@ -1217,66 +1633,8 @@ def find_minimal_perturbation(
     ):
         return feature_array.copy()
 
-    joint_indices = {
-        joint_name: joint_index
-        for joint_index, joint_name
-        in enumerate(model.joint_order)
-    }
-
-    required_joint_names: set[str] = set()
-
-    for chain_names in ARM_CHAINS.values():
-        required_joint_names.update(chain_names)
-
-    missing_joints = sorted(
-        required_joint_names.difference(
-            joint_indices
-        )
-    )
-
-    if missing_joints:
-        raise ValueError(
-            "The following arm-chain joints are absent "
-            "from the model's joint order: "
-            + ", ".join(missing_joints)
-        )
-
-    def reconstruct_candidate(
-        perturbation: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        with measure_latency(
-            latency_tracker,
-            "arm_reconstruction",
-            device=model.device,
-        ):
-            return reconstruct_arms_from_hand_perturbation(
-                original_features=original_features,
-                hand_perturbation=perturbation,
-                joint_indices=joint_indices,
-                features_per_joint=(
-                    model.features_per_joint
-                ),
-                fabrik_iterations=10,
-                latency_tracker=latency_tracker,
-            )
-
-    def classify_candidate(
-        candidate_features: torch.Tensor,
-    ) -> torch.Tensor:
-        with measure_latency(
-            latency_tracker,
-            "classifier_forward",
-            device=model.device,
-        ):
-            return model.forward_feature_probabilities(
-                candidate_features
-            )[0]
-
-
     # Six optimization variables:
-    #
-    # [left_dx, left_dy, left_dz,
-    #  right_dx, right_dy, right_dz]
+    # [left_dx, left_dy, left_dz, right_dx, right_dy, right_dz]
     hand_perturbation = torch.zeros(
         (1, 6),
         dtype=original_features.dtype,
@@ -1300,12 +1658,70 @@ def find_minimal_perturbation(
             0.0,
         )
 
-    best_hand_perturbation: (
-        torch.Tensor | None
-    ) = None
+    def objective_from_probability(
+        probability: torch.Tensor,
+        perturbation: torch.Tensor,
+        reachability_loss: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Counterfactual objective.
 
+        Use binary cross-entropy rather than a squared hinge directly on the
+        sigmoid probability.  For a sigmoid classifier, BCE supplies a much
+        healthier gradient when the current prediction is very confident; a
+        squared probability-space penalty contains an extra p*(1-p) factor and
+        can effectively stall near probabilities of 0 or 1.
+
+        Success is still determined separately using model.threshold, so BCE
+        is only the optimization surrogate used to reach the opposite class.
+        """
+        distance_squared = perturbation.square().sum()
+
+        classification_target = torch.ones_like(probability) if target_intent else torch.zeros_like(probability)
+        classification_loss = F.binary_cross_entropy(
+            probability,
+            classification_target,
+        )
+
+        loss = (
+            distance_squared
+            + classification_weight * classification_loss
+            + reachability_weight * reachability_loss
+        )
+        return loss, distance_squared
+
+    def evaluate_resnet_objective_no_grad(
+        perturbation: torch.Tensor,
+    ) -> tuple[float, float, torch.Tensor]:
+        with torch.inference_mode():
+            (
+                candidate_features,
+                _,
+                reachability_loss,
+            ) = reconstruct_candidate(
+                perturbation,
+                track_latency=False,
+            )
+            probability = classify_candidate(
+                candidate_features,
+                track_latency=False,
+            )
+            loss, distance_squared = objective_from_probability(
+                probability,
+                perturbation,
+                reachability_loss,
+            )
+
+        return (
+            float(loss.item()),
+            float(probability.item()),
+            distance_squared.detach(),
+        )
+
+    best_hand_perturbation: torch.Tensor | None = None
     best_distance_squared = float("inf")
     last_probability = original_probability
+    best_probability_toward_target = original_probability
 
     with measure_latency(
         latency_tracker,
@@ -1313,126 +1729,147 @@ def find_minimal_perturbation(
         device=model.device,
     ):
         for _ in range(max_iterations):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            # Convert the six hand variables into a complete pose.
-            (
-                candidate_features,
-                reachability_loss,
-            ) = reconstruct_candidate(
-                hand_perturbation
-            )
-
-            probability = classify_candidate(
-                candidate_features
-            )
-
-            # Only independent hand motion contributes directly to the
-            # perturbation-distance objective.
-            distance_squared = (
-                hand_perturbation
-                .square()
-                .sum()
-            )
-
-            if target_intent:
-                classification_violation = torch.relu(
-                    target_probability - probability
+            if WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_projections":
+                (
+                    candidate_features,
+                    _,
+                    reachability_loss,
+                ) = reconstruct_candidate(
+                    hand_perturbation
                 )
-            else:
-                classification_violation = torch.relu(
-                    probability - target_probability
+                probability = classify_candidate(
+                    candidate_features
+                )
+                loss, distance_squared = objective_from_probability(
+                    probability,
+                    hand_perturbation,
+                    reachability_loss,
                 )
 
-            classification_loss = (
-                classification_violation.square()
-            )
-
-            # FABRIK should preserve the configured arm-chain lengths.
-            # This loss still checks the full configured skeleton and
-            # catches relationships not directly enforced by FABRIK.
-            # bone_loss = calculate_bone_loss(
-            #     candidate_features
-            # )
-
-            loss = (
-                distance_squared
-                + classification_weight
-                * classification_loss
-                + reachability_weight
-                * reachability_loss
-            )
-
-            # Save the exact six-value perturbation whose probability and
-            # distance were evaluated above. This happens before the Adam
-            # step so the recorded metrics and perturbation correspond.
-            with torch.no_grad():
                 evaluated_probability = float(
-                    probability.item()
+                    probability.detach().item()
                 )
+                evaluated_distance_squared = float(
+                    distance_squared.detach().item()
+                )
+
+                last_probability = evaluated_probability
+                if target_intent:
+                    best_probability_toward_target = max(
+                        best_probability_toward_target,
+                        evaluated_probability,
+                    )
+                else:
+                    best_probability_toward_target = min(
+                        best_probability_toward_target,
+                        evaluated_probability,
+                    )
+
+                if probability_meets_target_class(
+                    evaluated_probability,
+                    target_intent,
+                    threshold,
+                ):
+                    best_distance_squared = evaluated_distance_squared
+                    best_hand_perturbation = (
+                        hand_perturbation.detach().clone()
+                    )
+                    break
+
+                with measure_latency(
+                    latency_tracker,
+                    "optimizer_step",
+                    device=model.device,
+                ):
+                    loss.backward()
+                    if hand_perturbation.grad is None:
+                        raise RuntimeError(
+                            "Counterfactual gradient is missing for the hand perturbation."
+                        )
+                    if not bool(torch.isfinite(hand_perturbation.grad).all()):
+                        raise RuntimeError(
+                            "Counterfactual gradient contains NaN or infinite values."
+                        )
+                    optimizer.step()
+
+            else:
+                # The pose-image rasterizer uses NumPy/OpenCV, so gradients
+                # cannot flow from the ResNet branch to the six hand variables.
+                # SPSA estimates the full objective gradient with only two
+                # regenerated candidate evaluations, independent of dimension.
+                (
+                    current_loss,
+                    evaluated_probability,
+                    distance_squared,
+                ) = evaluate_resnet_objective_no_grad(
+                    hand_perturbation.detach()
+                )
+                del current_loss
 
                 evaluated_distance_squared = float(
                     distance_squared.item()
                 )
+                last_probability = evaluated_probability
 
-                last_probability = (
-                    evaluated_probability
-                )
-
-                is_successful = (
-                    probability_meets_target_class(
-                        evaluated_probability,
-                        target_intent,
-                        threshold,
-                    )
-                )
-
-                if (
-                    is_successful
-                    and evaluated_distance_squared
-                    < best_distance_squared
+                if probability_meets_target_class(
+                    evaluated_probability,
+                    target_intent,
+                    threshold,
                 ):
-                    best_distance_squared = (
-                        evaluated_distance_squared
-                    )
-
+                    best_distance_squared = evaluated_distance_squared
                     best_hand_perturbation = (
-                        hand_perturbation
-                        .detach()
-                        .clone()
+                        hand_perturbation.detach().clone()
                     )
                     break
 
-            with measure_latency(
-                latency_tracker,
-                "optimizer_step",
-                device=model.device,
-            ):
-                loss.backward()
-                optimizer.step()
+                delta = torch.empty_like(
+                    hand_perturbation
+                ).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+
+                plus = (
+                    hand_perturbation.detach()
+                    + RESNET_SPSA_EPSILON * delta
+                )
+                minus = (
+                    hand_perturbation.detach()
+                    - RESNET_SPSA_EPSILON * delta
+                )
+
+                plus_loss, _, _ = evaluate_resnet_objective_no_grad(plus)
+                minus_loss, _, _ = evaluate_resnet_objective_no_grad(minus)
+
+                gradient_scale = (
+                    plus_loss - minus_loss
+                ) / (2.0 * RESNET_SPSA_EPSILON)
+
+                hand_perturbation.grad = (
+                    gradient_scale * delta
+                ).detach()
+
+                with measure_latency(
+                    latency_tracker,
+                    "optimizer_step",
+                    device=model.device,
+                ):
+                    optimizer.step()
 
     if best_hand_perturbation is None:
         raise RuntimeError(
-            "Could not find a successful hand-based "
-            "perturbation after "
+            "Could not find a successful hand-based perturbation after "
             f"{max_iterations} iterations. "
-            f"Original probability="
-            f"{original_probability:.6f}, "
-            f"last probability="
-            f"{last_probability:.6f}, "
+            f"Original probability={original_probability:.6f}, "
+            f"last probability={last_probability:.6f}, "
             f"threshold={threshold:.6f}, "
             f"target_intent={target_intent}, "
-            f"classification_weight="
-            f"{classification_weight}, "
-            f"reachability_weight="
-            f"{reachability_weight}."
+            f"classification_weight={classification_weight}, "
+            f"reachability_weight={reachability_weight}."
         )
 
-    # Reduce the successful hand movement along the line between zero
-    # movement and the best successful movement.
-    #
-    # This finds an approximate smallest successful scale without
-    # restarting gradient optimization.
+    # Reduce the successful movement along the line from zero to the first
+    # successful perturbation. Every binary-search candidate regenerates the
+    # derived projection/ResNet features before classification.
     low = 0.0
     high = 1.0
 
@@ -1443,22 +1880,14 @@ def find_minimal_perturbation(
     ):
         with torch.inference_mode():
             for _ in range(bin_search_iterations):
-                scale = (
-                    low + high
-                ) / 2.0
-
+                scale = (low + high) / 2.0
                 scaled_hand_perturbation = (
-                    scale
-                    * best_hand_perturbation
+                    scale * best_hand_perturbation
                 )
 
-                (
-                    candidate_features,
-                    _,
-                ) = reconstruct_candidate(
+                candidate_features, _, _ = reconstruct_candidate(
                     scaled_hand_perturbation
                 )
-
                 probability = float(
                     classify_candidate(
                         candidate_features
@@ -1475,38 +1904,25 @@ def find_minimal_perturbation(
                     low = scale
 
             final_hand_perturbation = (
-                high
-                * best_hand_perturbation
+                high * best_hand_perturbation
             )
-
-            (
-                final_features,
-                _,
-            ) = reconstruct_candidate(
+            final_features, _, _ = reconstruct_candidate(
                 final_hand_perturbation
             )
-
             final_probability = float(
                 classify_candidate(
                     final_features
                 ).item()
             )
 
-            # Numerical precision or non-monotonic behavior along the
-            # binary-search line can rarely make the reduced result fail.
-            # In that case, return the known successful perturbation.
             if not probability_meets_target_class(
                 final_probability,
                 target_intent,
                 threshold,
             ):
-                (
-                    final_features,
-                    _,
-                ) = reconstruct_candidate(
+                final_features, _, _ = reconstruct_candidate(
                     best_hand_perturbation
                 )
-
                 fallback_probability = float(
                     classify_candidate(
                         final_features
@@ -1519,11 +1935,10 @@ def find_minimal_perturbation(
                     threshold,
                 ):
                     raise RuntimeError(
-                        "The stored successful hand "
-                        "perturbation no longer satisfies "
-                        "the target classification. "
-                        f"Probability="
-                        f"{fallback_probability:.6f}, "
+                        "The stored successful hand perturbation no longer "
+                        "satisfies the target classification after regenerating "
+                        "derived features. "
+                        f"Probability={fallback_probability:.6f}, "
                         f"threshold={threshold:.6f}, "
                         f"target_intent={target_intent}."
                     )
@@ -1762,12 +2177,16 @@ def evaluate_counterfactual_weights(
             ):
                 original_joints = (
                     feature_vector_to_joint_poses(
-                        original_features
+                        original_features[
+                            :JOINT_POSITION_FEATURE_COUNT
+                        ]
                     )
                 )
                 perturbed_joints = (
                     feature_vector_to_joint_poses(
-                        perturbed_features
+                        perturbed_features[
+                            :JOINT_POSITION_FEATURE_COUNT
+                        ]
                     )
                 )
 
@@ -1790,8 +2209,12 @@ def evaluate_counterfactual_weights(
 
             perturbation_distance = float(
                 np.linalg.norm(
-                    perturbed_features
-                    - original_features
+                    perturbed_features[
+                        :JOINT_POSITION_FEATURE_COUNT
+                    ]
+                    - original_features[
+                        :JOINT_POSITION_FEATURE_COUNT
+                    ]
                 )
             )
             probability_change = abs(
@@ -2550,9 +2973,13 @@ def visualize_counterfactual_samples(
         )
         condition = row["condition"]
         visualize_joint_features(
-            feature_vector=original_features,
-            comparison_feature_vector=perturbed_features,
-            features_per_joint=model.features_per_joint,
+            feature_vector=(
+                original_features[:JOINT_POSITION_FEATURE_COUNT]
+            ),
+            comparison_feature_vector=(
+                perturbed_features[:JOINT_POSITION_FEATURE_COUNT]
+            ),
+            features_per_joint=JOINT_POSITION_DIMS,
             title=(
                 f"Sample {sample_index}: original with sample condition {condition} and "
                 f"counterfactual Quest poses "

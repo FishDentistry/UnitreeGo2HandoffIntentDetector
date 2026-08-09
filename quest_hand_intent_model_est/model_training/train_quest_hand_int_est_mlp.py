@@ -63,6 +63,7 @@ def build_model_variation_name(args):
     parts = [
         f"teacher_features-{args.teacher_features_type}",
         f"student_features-{args.student_features_type}",
+        f"logit_weight-{args.mlp_logit_loss_weight}",
         f"crop-{args.crop_around_object}",
         f"rotations-{args.include_quest_joint_rotations}",
     ]
@@ -346,6 +347,7 @@ def train_quest_student_mlp(
     teacher_model,
     student_features_type:str = "keypoints",
     learning_rate: float = 1e-3,
+    logit_loss_weight: float = 1.0,
     batch_size: int = 32,
     epochs: int = 30,
     random_state: int = 0,
@@ -410,17 +412,26 @@ def train_quest_student_mlp(
         lr=float(learning_rate),
     )
 
-    # This assumes the student model returns a sigmoid probability.
-    # Soft teacher probabilities are valid targets for BCELoss.
-    criterion = torch.nn.BCELoss()
+    # The student and teacher both return sigmoid probabilities. Keep the
+    # original soft-target BCE loss, and additionally match the corresponding
+    # logits. torch.logit(sigmoid(z)) recovers z (up to the small clamp used
+    # below for numerical stability), so this adds logit-level distillation
+    # without changing either model architecture.
+    probability_criterion = torch.nn.BCELoss()
+    logit_criterion = torch.nn.SmoothL1Loss()
+    logit_epsilon = 1e-6
 
     loss_history = []
+    probability_loss_history = []
+    logit_loss_history = []
     train_start = time.perf_counter()
 
     student_model.train()
 
     for epoch in range(int(epochs)):
         running_loss = 0.0
+        running_probability_loss = 0.0
+        running_logit_loss = 0.0
         sample_count = 0
 
         for xb, yb in loader:
@@ -430,21 +441,59 @@ def train_quest_student_mlp(
             optimizer.zero_grad()
 
             student_probabilities = student_model(xb).reshape(-1, 1)
-            loss = criterion(student_probabilities, yb)
+
+            probability_loss = probability_criterion(
+                student_probabilities,
+                yb,
+            )
+
+            teacher_logits = torch.logit(
+                yb.clamp(logit_epsilon, 1.0 - logit_epsilon)
+            )
+            student_logits = torch.logit(
+                student_probabilities.clamp(
+                    logit_epsilon,
+                    1.0 - logit_epsilon,
+                )
+            )
+            logit_loss = logit_criterion(
+                student_logits,
+                teacher_logits,
+            )
+
+            loss = (
+                probability_loss
+                + float(logit_loss_weight) * logit_loss
+            )
 
             loss.backward()
             optimizer.step()
 
             current_batch_size = int(xb.shape[0])
             running_loss += float(loss.item()) * current_batch_size
+            running_probability_loss += (
+                float(probability_loss.item()) * current_batch_size
+            )
+            running_logit_loss += (
+                float(logit_loss.item()) * current_batch_size
+            )
             sample_count += current_batch_size
 
         epoch_loss = running_loss / max(sample_count, 1)
+        epoch_probability_loss = (
+            running_probability_loss / max(sample_count, 1)
+        )
+        epoch_logit_loss = running_logit_loss / max(sample_count, 1)
+
         loss_history.append(epoch_loss)
+        probability_loss_history.append(epoch_probability_loss)
+        logit_loss_history.append(epoch_logit_loss)
 
         print(
             f"Epoch {epoch + 1}/{epochs}: "
-            f"distillation_loss={epoch_loss:.6f}"
+            f"distillation_loss={epoch_loss:.6f}, "
+            f"probability_bce={epoch_probability_loss:.6f}, "
+            f"logit_loss={epoch_logit_loss:.6f}"
         )
 
     train_seconds = float(time.perf_counter() - train_start)
@@ -481,6 +530,7 @@ def train_quest_student_mlp(
         "epochs": int(epochs),
         "batch_size": int(batch_size),
         "learning_rate": float(learning_rate),
+        "logit_loss_weight": float(logit_loss_weight),
         "random_state": int(random_state),
         "device": str(resolved_device),
         "num_batches_per_epoch": int(len(loader)),
@@ -491,6 +541,8 @@ def train_quest_student_mlp(
             else None
         ),
         "loss_history": loss_history,
+        "probability_loss_history": probability_loss_history,
+        "logit_loss_history": logit_loss_history,
         "teacher_student_agreement": teacher_student_agreement,
         "probability_mae": probability_mae,
         "threshold": float(threshold),
@@ -517,7 +569,8 @@ def train_quest_student_mlp(
                 "shoulder_centered": True,
                 "include_rotations": bool(include_rotations),
                 "features_per_joint": 7 if include_rotations else 3,
-                "target_type": "teacher_probability",
+                "target_type": "teacher_probability_and_logit",
+                "logit_loss_weight": float(logit_loss_weight),
                 "learning_rate": float(learning_rate),
                 "batch_size": int(batch_size),
                 "epochs": int(epochs),
@@ -720,6 +773,7 @@ def leave_one_participant_out_evaluation(
     rows,
     teacher_model,
     learning_rate: float = 1e-3,
+    logit_loss_weight: float = 1.0,
     batch_size: int = 32,
     epochs: int = 30,
     random_state: int = 0,
@@ -797,6 +851,7 @@ def leave_one_participant_out_evaluation(
             rows=train_rows,
             teacher_model=teacher_model,
             learning_rate=learning_rate,
+            logit_loss_weight=logit_loss_weight,
             batch_size=batch_size,
             epochs=epochs,
             random_state=random_state + fold_index,
@@ -957,6 +1012,15 @@ def main():
     parser.add_argument("--mlp-epochs", type=int, default=30)
     parser.add_argument("--mlp-batch-size", type=int, default=32)
     parser.add_argument("--mlp-learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--mlp-logit-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight applied to the SmoothL1 teacher-student logit matching "
+            "loss. Set to 0.0 to recover the original BCE-only training."
+        ),
+    )
     parser.add_argument("--mlp-random-state", type=int, default=0)
     parser.add_argument("--mlp-output-path", type=str, default=None)
     parser.add_argument("--decision-threshold", type=float, default=0.5)
@@ -1054,6 +1118,7 @@ def main():
         rows=rows,
         teacher_model=model,
         learning_rate=args.mlp_learning_rate,
+        logit_loss_weight=args.mlp_logit_loss_weight,
         batch_size=args.mlp_batch_size,
         epochs=args.mlp_epochs,
         random_state=args.mlp_random_state,
@@ -1148,6 +1213,7 @@ def main():
         rows=rows,
         teacher_model=model,
         learning_rate=args.mlp_learning_rate,
+        logit_loss_weight=args.mlp_logit_loss_weight,
         batch_size=args.mlp_batch_size,
         epochs=args.mlp_epochs,
         random_state=args.mlp_random_state,

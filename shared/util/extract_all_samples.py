@@ -909,104 +909,162 @@ def organize_samples(
         try:
             # -------------------------------------------------------------
             # Optional crop around the requested object/person.
+            #
+            # If cached RGB/depth crops already exist in the sample
+            # directory, use those instead of rerunning object detection.
+            # Otherwise compute the crop normally and save it.
             # -------------------------------------------------------------
             if args.crop_around_object:
-                crop_objs = obj_detector.predict(
-                    image,
-                    class_names=args.crop_object,
+                crop_path = sample.rgb_path.parent / "crop.png"
+                crop_depth_path = (
+                    sample.rgb_path.parent / "crop_depth_z16.png"
                 )
 
-                matching_crop_objs = [
-                    detection
-                    for detection in crop_objs
-                    if detection["label"].strip(".")
-                    == args.crop_object.strip(".")
-                ]
+                cached_image = None
+                cached_depth = None
 
-                if len(matching_crop_objs) == 0:
-                    skipped_no_object += 1
+                if crop_path.is_file():
+                    cached_image = cv2.imread(str(crop_path))
 
-                    print(
-                        f"[{local_idx + 1}/{len(samples)}] "
-                        f"SKIP no crop object detected: "
-                        f"{args.crop_object}"
+                if crop_depth_path.is_file():
+                    cached_depth = cv2.imread(
+                        str(crop_depth_path),
+                        cv2.IMREAD_UNCHANGED,
                     )
 
-                    rows.append(
-                        {
-                            "participant_id": sample.participant_id,
-                            "index": local_idx,
-                            "image": image_path,
-                            "depth": depth_path,
-                            "skipped": True,
-                            "skip_reason": "no_crop_object_detected",
-                        }
-                    )
-                    continue
+                if cached_image is not None and cached_depth is not None:
+                    image = cached_image
+                    depth_image = cached_depth
 
-                sorted_boxes = sorted(
-                    matching_crop_objs,
-                    key=lambda detection: (
-                        (
-                            detection["box_xyxy"][2]
-                            - detection["box_xyxy"][0]
+                else:
+                    crop_objs = obj_detector.predict(
+                        image,
+                        class_names=args.crop_object,
+                    )
+
+                    matching_crop_objs = [
+                        detection
+                        for detection in crop_objs
+                        if detection["label"].strip(".")
+                        == args.crop_object.strip(".")
+                    ]
+
+                    if len(matching_crop_objs) == 0:
+                        skipped_no_object += 1
+
+                        print(
+                            f"[{local_idx + 1}/{len(samples)}] "
+                            f"SKIP no crop object detected: "
+                            f"{args.crop_object}"
                         )
-                        * (
-                            detection["box_xyxy"][3]
-                            - detection["box_xyxy"][1]
+
+                        rows.append(
+                            {
+                                "participant_id": sample.participant_id,
+                                "index": local_idx,
+                                "image": image_path,
+                                "depth": depth_path,
+                                "skipped": True,
+                                "skip_reason": "no_crop_object_detected",
+                            }
                         )
-                    ),
-                    reverse=True,
-                )
+                        continue
 
-                x1, y1, x2, y2 = map(
-                    int,
-                    sorted_boxes[0]["box_xyxy"],
-                )
-
-                rgb_height, rgb_width = image.shape[:2]
-                depth_height, depth_width = depth_image.shape[:2]
-
-                # Clamp the RGB crop to the image.
-                x1 = int(np.clip(x1, 0, rgb_width))
-                x2 = int(np.clip(x2, 0, rgb_width))
-                y1 = int(np.clip(y1, 0, rgb_height))
-                y2 = int(np.clip(y2, 0, rgb_height))
-
-                if x2 <= x1 or y2 <= y1:
-                    raise ValueError(
-                        "Object detection produced an invalid RGB crop."
+                    sorted_boxes = sorted(
+                        matching_crop_objs,
+                        key=lambda detection: (
+                            (
+                                detection["box_xyxy"][2]
+                                - detection["box_xyxy"][0]
+                            )
+                            * (
+                                detection["box_xyxy"][3]
+                                - detection["box_xyxy"][1]
+                            )
+                        ),
+                        reverse=True,
                     )
 
-                # Map the RGB crop bounds into the depth image.
-                depth_x1 = int(round(x1 * depth_width / rgb_width))
-                depth_x2 = int(round(x2 * depth_width / rgb_width))
-                depth_y1 = int(round(y1 * depth_height / rgb_height))
-                depth_y2 = int(round(y2 * depth_height / rgb_height))
-
-                depth_x1 = int(np.clip(depth_x1, 0, depth_width))
-                depth_x2 = int(np.clip(depth_x2, 0, depth_width))
-                depth_y1 = int(np.clip(depth_y1, 0, depth_height))
-                depth_y2 = int(np.clip(depth_y2, 0, depth_height))
-
-                cropped_image = image[y1:y2, x1:x2]
-                cropped_depth = depth_image[
-                    depth_y1:depth_y2,
-                    depth_x1:depth_x2,
-                ]
-
-                if cropped_image.size == 0:
-                    raise ValueError(
-                        "Object crop produced an empty RGB image."
+                    x1, y1, x2, y2 = map(
+                        int,
+                        sorted_boxes[0]["box_xyxy"],
                     )
 
-                if cropped_depth.size == 0:
-                    raise ValueError(
-                        "Object crop produced an empty depth image."
+                    rgb_height, rgb_width = image.shape[:2]
+                    depth_height, depth_width = depth_image.shape[:2]
+
+                    # Clamp the RGB crop to the image.
+                    x1 = int(np.clip(x1, 0, rgb_width))
+                    x2 = int(np.clip(x2, 0, rgb_width))
+                    y1 = int(np.clip(y1, 0, rgb_height))
+                    y2 = int(np.clip(y2, 0, rgb_height))
+
+                    if x2 <= x1 or y2 <= y1:
+                        raise ValueError(
+                            "Object detection produced an invalid RGB crop."
+                        )
+
+                    # Map the RGB crop bounds into the depth image.
+                    depth_x1 = int(round(x1 * depth_width / rgb_width))
+                    depth_x2 = int(round(x2 * depth_width / rgb_width))
+                    depth_y1 = int(round(y1 * depth_height / rgb_height))
+                    depth_y2 = int(round(y2 * depth_height / rgb_height))
+
+                    depth_x1 = int(
+                        np.clip(depth_x1, 0, depth_width)
+                    )
+                    depth_x2 = int(
+                        np.clip(depth_x2, 0, depth_width)
+                    )
+                    depth_y1 = int(
+                        np.clip(depth_y1, 0, depth_height)
+                    )
+                    depth_y2 = int(
+                        np.clip(depth_y2, 0, depth_height)
                     )
 
-                image = cropped_image
-                depth_image = cropped_depth
+                    cropped_image = image[
+                        y1:y2,
+                        x1:x2,
+                    ]
+
+                    cropped_depth = depth_image[
+                        depth_y1:depth_y2,
+                        depth_x1:depth_x2,
+                    ]
+
+                    if cropped_image.size == 0:
+                        raise ValueError(
+                            "Object crop produced an empty RGB image."
+                        )
+
+                    if cropped_depth.size == 0:
+                        raise ValueError(
+                            "Object crop produced an empty depth image."
+                        )
+
+                    # Save crops so future calls do not need to
+                    # rerun the crop detector.
+                    if not cv2.imwrite(
+                        str(crop_path),
+                        cropped_image,
+                    ):
+                        raise IOError(
+                            f"Could not save cached RGB crop: "
+                            f"{crop_path}"
+                        )
+
+                    if not cv2.imwrite(
+                        str(crop_depth_path),
+                        cropped_depth,
+                    ):
+                        raise IOError(
+                            f"Could not save cached depth crop: "
+                            f"{crop_depth_path}"
+                        )
+
+                    image = cropped_image
+                    depth_image = cropped_depth
 
             # -------------------------------------------------------------
             # Ground-truth label.

@@ -554,13 +554,13 @@ class QuestHandIntentEstInference:
         return threshold
 
     def _validate_feature_metadata(self) -> None:
-        expected_dim = len(self.joint_order) * self.features_per_joint
-        if expected_dim != self.input_dim:
+        valid_dims = [(len(self.joint_order) * self.features_per_joint) + 45, (len(self.joint_order) * self.features_per_joint) + 515]
+        if self.input_dim not in valid_dims:
             raise ValueError(
                 "Checkpoint feature metadata is inconsistent: "
                 f"len(joint_order)={len(self.joint_order)}, "
                 f"features_per_joint={self.features_per_joint}, so the expected "
-                f"input dimension is {expected_dim}, but input_dim={self.input_dim}."
+                f"input dimension is {valid_dims[0]} or {valid_dims[1]}, but input_dim={self.input_dim}."
             )
 
         runtime_joint_order = tuple(QUEST_JOINT_ORDER)

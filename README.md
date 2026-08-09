@@ -251,7 +251,7 @@ The primary runtime implementations are located under:
 robot_fov_estimation/src/
 ```
 
-The repository also contains OSTrack-related resources under:
+The repository also contains modified OSTrack-related resources under:
 
 ```text
 robot_fov_estimation/ostrack/
@@ -869,7 +869,7 @@ OSTrack-related code is included under:
 robot_fov_estimation/ostrack/
 ```
 
-The repository contains OSTrack runtime, training, evaluation, analysis, and visualization utilities.
+The repository contains OSTrack runtime, training, evaluation, analysis, and visualization utilities modified to work with this repo.
 
 Many dependencies associated with:
 
