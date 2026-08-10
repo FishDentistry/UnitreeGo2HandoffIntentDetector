@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional, Union
 
 import numpy as np
 import torch
@@ -16,6 +16,14 @@ import yaml
 from quest_hand_intent_model_est.src.quest_hand_int_inf_wrapper import (
     QuestHandIntentEstInference,
 )
+from quest_hand_intent_model_est.src.quest_hand_int_tabm_inf_wrapper import (
+    QuestHandIntentTabMEstInference,
+)
+
+QuestInferenceModel = Union[
+    QuestHandIntentEstInference,
+    QuestHandIntentTabMEstInference,
+]
 from quest_hand_intent_model_est.src.quest_joint_features import (
     SKELETON_EDGES,
     extract_quest_joint_features,
@@ -40,8 +48,8 @@ CONFIG_DIR = REPO_ROOT / "quest_hand_intent_model_est" / "configs"
 HANDOFF_CONFIG_PATH = CONFIG_DIR / "handoff_config.yaml"
 COUNTERFACTUAL_CONFIG_PATH = CONFIG_DIR / "counterfactual_config.yaml"
 
-WEIGHT_SEARCH_FEATURES_TYPE = "keypoints_resnet"
-RESNET_ENCODER: ResNet18ImageEncoder | None = None
+WEIGHT_SEARCH_FEATURES_TYPE = "keypoints_projections"
+RESNET_ENCODER: Optional[ResNet18ImageEncoder] = None
 
 
 def get_resnet_encoder() -> ResNet18ImageEncoder:
@@ -144,8 +152,8 @@ class LatencyTracker:
 
     @staticmethod
     def _as_device(
-        device: torch.device | str | None,
-    ) -> torch.device | None:
+        device: Optional[Union[torch.device, str]],
+    ) -> Optional[torch.device]:
         if device is None:
             return None
         return torch.device(device)
@@ -162,7 +170,7 @@ class LatencyTracker:
         self,
         name: str,
         *,
-        device: torch.device | str | None = None,
+        device: Optional[Union[torch.device, str]] = None,
     ) -> Iterator[None]:
         resolved_device = self._as_device(device)
 
@@ -260,12 +268,12 @@ class LatencyTracker:
 
         self._pending_cuda_events.clear()
 
-    def snapshot(self) -> dict[str, dict[str, float | int]]:
+    def snapshot(self) -> dict[str, dict[str, Union[float, int]]]:
         self._finalize_cuda_events()
 
         snapshot: dict[
             str,
-            dict[str, float | int],
+            dict[str, Union[float, int]],
         ] = {}
 
         for name in sorted(self.totals_ms):
@@ -287,10 +295,10 @@ class LatencyTracker:
 
 @contextmanager
 def measure_latency(
-    tracker: LatencyTracker | None,
+    tracker: Optional[LatencyTracker],
     name: str,
     *,
-    device: torch.device | str | None = None,
+    device: Optional[Union[torch.device, str]] = None,
 ) -> Iterator[None]:
     if tracker is None:
         yield
@@ -301,9 +309,9 @@ def measure_latency(
 
 
 def format_latency_snapshot(
-    latency: dict[str, dict[str, float | int]],
+    latency: dict[str, dict[str, Union[float, int]]],
 ) -> str:
-    def total(name: str) -> float | None:
+    def total(name: str) -> Optional[float]:
         component = latency.get(name)
         if component is None:
             return None
@@ -1069,7 +1077,7 @@ def regenerate_resnet_candidate_features(
     candidate_joint_position_features: torch.Tensor,
     fixed_head_orientation_features: torch.Tensor,
     *,
-    model: QuestHandIntentEstInference,
+    model: QuestInferenceModel,
 ) -> torch.Tensor:
     """
     Regenerate the nondifferentiable pose image and its ResNet embedding for
@@ -1133,28 +1141,45 @@ def reconstruct_arms_from_hand_perturbation(
     original_joint_features: torch.Tensor,
     hand_perturbation: torch.Tensor,
     joint_indices: dict[str, int],
+    object_arm: str = "both",
     fabrik_iterations: int = 4,
-    latency_tracker: LatencyTracker | None = None,
+    latency_tracker: Optional[LatencyTracker] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply six hand perturbation values and reconstruct both arms.
+    Apply hand perturbations and reconstruct only the selected arm(s).
 
-    hand_perturbation:
-        [left_dx, left_dy, left_dz,
-         right_dx, right_dy, right_dz]
+    object_arm="both":
+        hand_perturbation =
+            [left_dx, left_dy, left_dz,
+             right_dx, right_dy, right_dz]
+
+    object_arm="left" or "right":
+        hand_perturbation = [dx, dy, dz]
+        for only the selected arm. The opposite arm remains exactly as
+        observed in original_joint_features.
 
     Returns:
         reconstructed 63-value joint-position tensor
-        reachability loss
+        reachability loss for the selected arm(s)
 
     Derived projection/ResNet features are not stored here. They are rebuilt
     from the reconstructed joints by find_minimal_perturbation for every
     classifier candidate.
     """
-    if hand_perturbation.shape != (1, 6):
+    object_arm = str(object_arm).strip().lower()
+    if object_arm not in ("both", "left", "right"):
         raise ValueError(
-            "hand_perturbation must have shape (1, 6), "
-            f"received {hand_perturbation.shape}."
+            "object_arm must be one of 'both', 'left', or 'right', "
+            f"got {object_arm!r}."
+        )
+
+    expected_perturbation_width = 6 if object_arm == "both" else 3
+    if hand_perturbation.shape != (1, expected_perturbation_width):
+        raise ValueError(
+            "hand_perturbation must have shape "
+            f"(1, {expected_perturbation_width}) when "
+            f"object_arm={object_arm!r}, received "
+            f"{tuple(hand_perturbation.shape)}."
         )
 
     if original_joint_features.shape != (1, JOINT_POSITION_FEATURE_COUNT):
@@ -1187,10 +1212,17 @@ def reconstruct_arms_from_hand_perturbation(
 
     candidate_joint_features = original_joint_features.clone()
 
-    hand_deltas = {
-        "left": hand_perturbation[0, 0:3],
-        "right": hand_perturbation[0, 3:6],
-    }
+    if object_arm == "both":
+        active_sides = ("left", "right")
+        hand_deltas = {
+            "left": hand_perturbation[0, 0:3],
+            "right": hand_perturbation[0, 3:6],
+        }
+    else:
+        active_sides = (object_arm,)
+        hand_deltas = {
+            object_arm: hand_perturbation[0, 0:3],
+        }
 
     reachability_loss = torch.zeros(
         (),
@@ -1198,7 +1230,7 @@ def reconstruct_arms_from_hand_perturbation(
         device=original_joint_features.device,
     )
 
-    for side in ("left", "right"):
+    for side in active_sides:
         chain_names = ARM_CHAINS[side]
 
         original_chain = torch.stack(
@@ -1290,30 +1322,33 @@ def reconstruct_arms_from_hand_perturbation(
 
 
 def find_minimal_perturbation(
-    model: QuestHandIntentEstInference,
+    model: QuestInferenceModel,
     joint_feat_vec: np.ndarray,
     target_intent: bool,
     *,
+    features_type: Optional[str] = None,
     classification_weight: float,
     reachability_weight: float,
     max_iterations: int = 1000,
     bin_search_iterations: int = 10,
     step_size: float = 0.01,
     probability_margin: float = 1e-4,
-    latency_tracker: LatencyTracker | None = None,
-) -> np.ndarray:
+    object_arm: str = "both",
+    latency_tracker: Optional[LatencyTracker] = None,
+) -> dict[str, Any]:
     """
-    Find minimal left- and right-hand position changes that produce the
-    requested classification while regenerating all joint-derived features.
+    Find minimal hand-position changes that produce the requested
+    classification while regenerating all joint-derived features.
 
-    Only six independent values are optimized:
+    object_arm controls which hand(s) may be changed:
 
-        left-hand  XYZ displacement
-        right-hand XYZ displacement
+        "both"  -> optimize six values: left XYZ + right XYZ
+        "left"  -> optimize three values: left XYZ only
+        "right" -> optimize three values: right XYZ only
 
-    For every proposed pair of hand displacements, complete left and right
-    arm poses are reconstructed with FABRIK. The classifier input is then
-    regenerated from that reconstructed pose:
+    The selected arm(s) are reconstructed with FABRIK for every candidate.
+    Any unselected arm remains exactly as observed in the original pose. The
+    classifier input is then regenerated from that reconstructed full-body pose:
 
         keypoints_projections:
             joints + fixed head RPY -> differentiable chest-plane projection
@@ -1325,8 +1360,37 @@ def find_minimal_perturbation(
 
     The projections path remains fully differentiable and therefore uses
     ordinary autograd + Adam. The ResNet path contains NumPy/OpenCV raster
-    operations, so it uses a two-evaluation SPSA gradient estimate for the six
-    hand variables rather than expensive per-dimension finite differences.
+    operations, so it uses a two-evaluation SPSA gradient estimate for the
+    active hand variables rather than expensive per-dimension finite differences.
+
+    Returns a dictionary with:
+
+        features:
+            The feature vector to display/use as guidance. If the requested
+            target probability is reached, this is the binary-searched minimal
+            successful perturbation. If optimization does not reach the target,
+            this is the best target-directed candidate encountered.
+
+        reached_target:
+            True only when the returned features satisfy threshold +/-
+            probability_margin for the requested target class.
+
+        used_fallback:
+            True when optimization exhausted max_iterations without reaching the
+            target and the returned features are the best-progress fallback.
+
+        made_progress:
+            True when the returned probability moved toward target_intent relative
+            to the original probability.
+
+        original_probability:
+            Classifier probability for the original input pose.
+
+        final_probability:
+            Classifier probability for the returned feature vector.
+
+        target_probability:
+            Required probability boundary after applying probability_margin.
     """
     if max_iterations <= 0:
         raise ValueError(
@@ -1353,13 +1417,56 @@ def find_minimal_perturbation(
             "probability_margin must be nonnegative."
         )
 
-    if WEIGHT_SEARCH_FEATURES_TYPE not in (
+    object_arm = str(object_arm).strip().lower()
+    if object_arm not in ("both", "left", "right"):
+        raise ValueError(
+            "object_arm must be one of 'both', 'left', or 'right', "
+            f"got {object_arm!r}."
+        )
+
+    active_sides = ("left", "right") if object_arm == "both" else (object_arm,)
+
+    # MLP compatibility rule:
+    # use the exact feature branch from the old working MLP implementation.
+    #
+    # TabM may use an explicitly supplied runtime feature type; if omitted,
+    # infer it from the checkpoint input size.
+    if isinstance(model, QuestHandIntentEstInference):
+        resolved_features_type = WEIGHT_SEARCH_FEATURES_TYPE
+
+        if features_type is not None:
+            requested_features_type = str(features_type).strip().lower()
+
+            if requested_features_type != resolved_features_type:
+                raise ValueError(
+                    "MLP feature-mode mismatch: the old working optimizer "
+                    f"uses {resolved_features_type!r}, but the server passed "
+                    f"{requested_features_type!r}."
+                )
+    else:
+        if features_type is not None:
+            resolved_features_type = str(features_type).strip().lower()
+        elif int(model.input_dim) == (
+            BASE_POSE_FEATURE_COUNT + PROJECTED_FEATURE_COUNT
+        ):
+            resolved_features_type = "keypoints_projections"
+        elif int(model.input_dim) == (
+            BASE_POSE_FEATURE_COUNT + 512
+        ):
+            resolved_features_type = "keypoints_resnet"
+        else:
+            raise ValueError(
+                "Could not infer TabM feature type from input_dim="
+                f"{model.input_dim}."
+            )
+
+    if resolved_features_type not in (
         "keypoints_projections",
         "keypoints_resnet",
     ):
         raise ValueError(
-            "Unsupported WEIGHT_SEARCH_FEATURES_TYPE: "
-            f"{WEIGHT_SEARCH_FEATURES_TYPE!r}."
+            "Unsupported Quest feature type: "
+            f"{resolved_features_type!r}."
         )
 
     feature_array = np.asarray(
@@ -1428,8 +1535,8 @@ def find_minimal_perturbation(
     }
 
     required_joint_names: set[str] = set()
-    for chain_names in ARM_CHAINS.values():
-        required_joint_names.update(chain_names)
+    for side in active_sides:
+        required_joint_names.update(ARM_CHAINS[side])
     required_joint_names.update(
         {"chest", "left_shoulder", "right_shoulder"}
     )
@@ -1515,6 +1622,7 @@ def find_minimal_perturbation(
                 original_joint_features=original_joint_features,
                 hand_perturbation=perturbation,
                 joint_indices=joint_indices,
+                object_arm=object_arm,
                 fabrik_iterations=10,
                 latency_tracker=tracker,
             )
@@ -1529,7 +1637,7 @@ def find_minimal_perturbation(
             track_latency=track_latency,
         )
 
-        if WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_projections":
+        if resolved_features_type == "keypoints_projections":
             candidate_features = build_projection_features(
                 candidate_joint_features,
                 track_latency=track_latency,
@@ -1557,10 +1665,33 @@ def find_minimal_perturbation(
             "classifier_forward",
             device=model.device,
         ):
-            # candidate_features is already a validated float tensor on the
-            # correct device. Calling the frozen MLP directly avoids the
-            # wrapper's repeated shape/finite-value validation and GPU sync
-            # on every optimization candidate while preserving gradients.
+            # TabM returns k raw logits per sample. Convert every member logit
+            # to a probability first, then average member probabilities.
+            if isinstance(model, QuestHandIntentTabMEstInference):
+                logits = model.model(
+                    candidate_features
+                )
+
+                if logits.ndim == 2:
+                    logits = logits.unsqueeze(-1)
+
+                if (
+                    logits.ndim != 3
+                    or int(logits.shape[-1]) != 1
+                ):
+                    raise ValueError(
+                        "Expected Quest TabM output with shape "
+                        "[batch, k, 1] or [batch, k], got "
+                        f"{tuple(logits.shape)}."
+                    )
+
+                return (
+                    torch.sigmoid(logits)
+                    .mean(dim=1)
+                    .reshape(-1)[0]
+                )
+
+            # EXACT old working MLP expression.
             return model.model(
                 candidate_features
             ).reshape(-1)[0]
@@ -1568,7 +1699,7 @@ def find_minimal_perturbation(
     # Verify that the differentiable projection reproduces the exact feature
     # representation already present in the original sample. This catches
     # ordering/layout mismatches before optimization begins.
-    if WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_projections":
+    if resolved_features_type == "keypoints_projections":
         expected_input_dim = (
             BASE_POSE_FEATURE_COUNT
             + PROJECTED_FEATURE_COUNT
@@ -1624,29 +1755,9 @@ def find_minimal_perturbation(
                 )[0].item()
             )
 
-    # No counterfactual is required if the original sample already belongs to
-    # the requested target class.
-    if probability_meets_target_class(
-        original_probability,
-        target_intent,
-        threshold,
-    ):
-        return feature_array.copy()
-
-    # Six optimization variables:
-    # [left_dx, left_dy, left_dz, right_dx, right_dy, right_dz]
-    hand_perturbation = torch.zeros(
-        (1, 6),
-        dtype=original_features.dtype,
-        device=model.device,
-        requires_grad=True,
-    )
-
-    optimizer = torch.optim.Adam(
-        [hand_perturbation],
-        lr=step_size,
-    )
-
+    # Convert probability_margin into the actual probability boundary that a
+    # robust counterfactual must satisfy. For a handoff target this is
+    # threshold + margin; for a not-handoff target it is threshold - margin.
     if target_intent:
         target_probability = min(
             threshold + probability_margin,
@@ -1657,6 +1768,39 @@ def find_minimal_perturbation(
             threshold - probability_margin,
             0.0,
         )
+
+    # No counterfactual is required only if the original sample already
+    # satisfies the requested target class with the requested margin.
+    if probability_meets_target_class(
+        original_probability,
+        target_intent,
+        target_probability,
+    ):
+        return {
+            "features": feature_array.copy(),
+            "reached_target": True,
+            "used_fallback": False,
+            "made_progress": False,
+            "original_probability": original_probability,
+            "final_probability": original_probability,
+            "target_probability": target_probability,
+        }
+
+    # Optimize six values for both arms, or three values for one selected arm.
+    # both:  [left_dx, left_dy, left_dz, right_dx, right_dy, right_dz]
+    # single arm: [dx, dy, dz]
+    perturbation_width = 6 if object_arm == "both" else 3
+    hand_perturbation = torch.zeros(
+        (1, perturbation_width),
+        dtype=original_features.dtype,
+        device=model.device,
+        requires_grad=True,
+    )
+
+    optimizer = torch.optim.Adam(
+        [hand_perturbation],
+        lr=step_size,
+    )
 
     def objective_from_probability(
         probability: torch.Tensor,
@@ -1672,8 +1816,9 @@ def find_minimal_perturbation(
         squared probability-space penalty contains an extra p*(1-p) factor and
         can effectively stall near probabilities of 0 or 1.
 
-        Success is still determined separately using model.threshold, so BCE
-        is only the optimization surrogate used to reach the opposite class.
+        Success is determined separately using target_probability, which is
+        model.threshold shifted by probability_margin toward the target class.
+        BCE is only the optimization surrogate used to reach that robust target.
         """
         distance_squared = perturbation.square().sum()
 
@@ -1718,10 +1863,41 @@ def find_minimal_perturbation(
             distance_squared.detach(),
         )
 
-    best_hand_perturbation: torch.Tensor | None = None
+    best_hand_perturbation: Optional[torch.Tensor] = None
     best_distance_squared = float("inf")
     last_probability = original_probability
+
+    # Keep the best candidate seen even if the requested target boundary is never
+    # reached. This lets the caller display useful intermediate guidance instead
+    # of receiving an all-or-nothing optimization failure. Zero perturbation is
+    # the initial fallback, so if no evaluated candidate improves on the original
+    # pose, the original pose is returned with made_progress=False.
     best_probability_toward_target = original_probability
+    best_progress_perturbation = torch.zeros_like(
+        hand_perturbation
+    ).detach().clone()
+
+    def update_best_progress(
+        probability_value: float,
+        perturbation_value: torch.Tensor,
+    ) -> None:
+        nonlocal best_probability_toward_target
+        nonlocal best_progress_perturbation
+
+        if target_intent:
+            improved = (
+                probability_value > best_probability_toward_target
+            )
+        else:
+            improved = (
+                probability_value < best_probability_toward_target
+            )
+
+        if improved:
+            best_probability_toward_target = probability_value
+            best_progress_perturbation = (
+                perturbation_value.detach().clone()
+            )
 
     with measure_latency(
         latency_tracker,
@@ -1731,7 +1907,7 @@ def find_minimal_perturbation(
         for _ in range(max_iterations):
             optimizer.zero_grad(set_to_none=True)
 
-            if WEIGHT_SEARCH_FEATURES_TYPE == "keypoints_projections":
+            if resolved_features_type == "keypoints_projections":
                 (
                     candidate_features,
                     _,
@@ -1756,21 +1932,15 @@ def find_minimal_perturbation(
                 )
 
                 last_probability = evaluated_probability
-                if target_intent:
-                    best_probability_toward_target = max(
-                        best_probability_toward_target,
-                        evaluated_probability,
-                    )
-                else:
-                    best_probability_toward_target = min(
-                        best_probability_toward_target,
-                        evaluated_probability,
-                    )
+                update_best_progress(
+                    evaluated_probability,
+                    hand_perturbation,
+                )
 
                 if probability_meets_target_class(
                     evaluated_probability,
                     target_intent,
-                    threshold,
+                    target_probability,
                 ):
                     best_distance_squared = evaluated_distance_squared
                     best_hand_perturbation = (
@@ -1796,7 +1966,7 @@ def find_minimal_perturbation(
 
             else:
                 # The pose-image rasterizer uses NumPy/OpenCV, so gradients
-                # cannot flow from the ResNet branch to the six hand variables.
+                # cannot flow from the ResNet branch to the active hand variables.
                 # SPSA estimates the full objective gradient with only two
                 # regenerated candidate evaluations, independent of dimension.
                 (
@@ -1812,11 +1982,15 @@ def find_minimal_perturbation(
                     distance_squared.item()
                 )
                 last_probability = evaluated_probability
+                update_best_progress(
+                    evaluated_probability,
+                    hand_perturbation,
+                )
 
                 if probability_meets_target_class(
                     evaluated_probability,
                     target_intent,
-                    threshold,
+                    target_probability,
                 ):
                     best_distance_squared = evaluated_distance_squared
                     best_hand_perturbation = (
@@ -1856,16 +2030,75 @@ def find_minimal_perturbation(
                     optimizer.step()
 
     if best_hand_perturbation is None:
-        raise RuntimeError(
-            "Could not find a successful hand-based perturbation after "
-            f"{max_iterations} iterations. "
-            f"Original probability={original_probability:.6f}, "
-            f"last probability={last_probability:.6f}, "
-            f"threshold={threshold:.6f}, "
-            f"target_intent={target_intent}, "
-            f"classification_weight={classification_weight}, "
-            f"reachability_weight={reachability_weight}."
+        # Adam/SPSA performs optimizer.step() after the iteration's candidate was
+        # evaluated. Evaluate the final optimizer state once so a useful last step
+        # is not discarded merely because max_iterations was reached.
+        with torch.inference_mode():
+            final_attempt_features, _, _ = reconstruct_candidate(
+                hand_perturbation.detach()
+            )
+            final_attempt_probability = float(
+                classify_candidate(
+                    final_attempt_features
+                ).item()
+            )
+
+        last_probability = final_attempt_probability
+        update_best_progress(
+            final_attempt_probability,
+            hand_perturbation,
         )
+
+        # It is possible for the final post-step candidate to reach the requested
+        # boundary. In that case treat it as a genuine success and continue into
+        # the normal binary-search minimization path.
+        if probability_meets_target_class(
+            final_attempt_probability,
+            target_intent,
+            target_probability,
+        ):
+            best_hand_perturbation = (
+                hand_perturbation.detach().clone()
+            )
+        else:
+            # No fully successful counterfactual was found. Return the candidate
+            # that moved the model farthest toward the target class so it can be
+            # displayed as intermediate guidance. On the next request, the user's
+            # newly observed physical pose becomes the next optimization start.
+            with torch.inference_mode():
+                fallback_features, _, _ = reconstruct_candidate(
+                    best_progress_perturbation
+                )
+                fallback_probability = float(
+                    classify_candidate(
+                        fallback_features
+                    ).item()
+                )
+
+            if target_intent:
+                made_progress = (
+                    fallback_probability > original_probability
+                )
+            else:
+                made_progress = (
+                    fallback_probability < original_probability
+                )
+
+            return {
+                "features": (
+                    fallback_features[0]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                ),
+                "reached_target": False,
+                "used_fallback": True,
+                "made_progress": made_progress,
+                "original_probability": original_probability,
+                "final_probability": fallback_probability,
+                "target_probability": target_probability,
+            }
 
     # Reduce the successful movement along the line from zero to the first
     # successful perturbation. Every binary-search candidate regenerates the
@@ -1897,7 +2130,7 @@ def find_minimal_perturbation(
                 if probability_meets_target_class(
                     probability,
                     target_intent,
-                    threshold,
+                    target_probability,
                 ):
                     high = scale
                 else:
@@ -1918,7 +2151,7 @@ def find_minimal_perturbation(
             if not probability_meets_target_class(
                 final_probability,
                 target_intent,
-                threshold,
+                target_probability,
             ):
                 final_features, _, _ = reconstruct_candidate(
                     best_hand_perturbation
@@ -1932,27 +2165,62 @@ def find_minimal_perturbation(
                 if not probability_meets_target_class(
                     fallback_probability,
                     target_intent,
-                    threshold,
+                    target_probability,
                 ):
-                    raise RuntimeError(
-                        "The stored successful hand perturbation no longer "
-                        "satisfies the target classification after regenerating "
-                        "derived features. "
-                        f"Probability={fallback_probability:.6f}, "
-                        f"threshold={threshold:.6f}, "
-                        f"target_intent={target_intent}."
-                    )
+                    # This should be extremely rare because the stored candidate
+                    # already satisfied the target when it was recorded. Treat it
+                    # as a best-effort result rather than throwing away usable
+                    # guidance.
+                    if target_intent:
+                        made_progress = (
+                            fallback_probability > original_probability
+                        )
+                    else:
+                        made_progress = (
+                            fallback_probability < original_probability
+                        )
 
-    return (
-        final_features[0]
-        .detach()
-        .cpu()
-        .numpy()
-        .astype(np.float32)
-    )
+                    return {
+                        "features": (
+                            final_features[0]
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float32)
+                        ),
+                        "reached_target": False,
+                        "used_fallback": True,
+                        "made_progress": made_progress,
+                        "original_probability": original_probability,
+                        "final_probability": fallback_probability,
+                        "target_probability": target_probability,
+                    }
+
+                final_probability = fallback_probability
+
+    if target_intent:
+        made_progress = final_probability > original_probability
+    else:
+        made_progress = final_probability < original_probability
+
+    return {
+        "features": (
+            final_features[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        ),
+        "reached_target": True,
+        "used_fallback": False,
+        "made_progress": made_progress,
+        "original_probability": original_probability,
+        "final_probability": final_probability,
+        "target_probability": target_probability,
+    }
 
 
-def _safe_mean(values: list[float]) -> float | None:
+def _safe_mean(values: list[float]) -> Optional[float]:
     return (
         float(np.mean(values))
         if values
@@ -1960,7 +2228,7 @@ def _safe_mean(values: list[float]) -> float | None:
     )
 
 
-def _safe_median(values: list[float]) -> float | None:
+def _safe_median(values: list[float]) -> Optional[float]:
     return (
         float(np.median(values))
         if values
@@ -1968,7 +2236,7 @@ def _safe_median(values: list[float]) -> float | None:
     )
 
 
-def _safe_max(values: list[float]) -> float | None:
+def _safe_max(values: list[float]) -> Optional[float]:
     return (
         float(np.max(values))
         if values
@@ -1978,7 +2246,7 @@ def _safe_max(values: list[float]) -> float | None:
 
 def summarize_latency_snapshots(
     snapshots: list[
-        dict[str, dict[str, float | int]]
+        dict[str, dict[str, Union[float, int]]]
     ],
     *,
     evaluation_total_ms: float,
@@ -2049,7 +2317,7 @@ def summarize_latency_snapshots(
 
 def evaluate_counterfactual_weights(
     *,
-    model: QuestHandIntentEstInference,
+    model: QuestInferenceModel,
     rows: list[dict[str, Any]],
     classification_weight: float,
     reachability_weight: float,
@@ -2069,7 +2337,7 @@ def evaluate_counterfactual_weights(
 
     sample_results: list[dict[str, Any]] = []
     sample_latency_snapshots: list[
-        dict[str, dict[str, float | int]]
+        dict[str, dict[str, Union[float, int]]]
     ] = []
     perturbation_distances: list[float] = []
     probability_changes: list[float] = []
@@ -2134,7 +2402,7 @@ def evaluate_counterfactual_weights(
                 "minimal_perturbation",
                 device=model.device,
             ):
-                perturbed_features = (
+                perturbation_result = (
                     find_minimal_perturbation(
                         model=model,
                         joint_feat_vec=original_features,
@@ -2153,6 +2421,10 @@ def evaluate_counterfactual_weights(
                         latency_tracker=latency_tracker,
                     )
                 )
+                perturbed_features = np.asarray(
+                    perturbation_result["features"],
+                    dtype=np.float32,
+                )
 
             with measure_latency(
                 latency_tracker,
@@ -2165,10 +2437,12 @@ def evaluate_counterfactual_weights(
                     ).probability
                 )
 
-            success = probability_meets_target_class(
-                final_probability,
-                target_intent,
-                threshold,
+            # find_minimal_perturbation already evaluates success against the
+            # margin-shifted target_probability. A fallback can cross the raw
+            # classifier threshold without satisfying that requested margin, so
+            # use the returned status rather than re-checking the raw threshold.
+            success = bool(
+                perturbation_result["reached_target"]
             )
 
             with measure_latency(
@@ -2228,6 +2502,15 @@ def evaluate_counterfactual_weights(
                         final_probability
                     ),
                     "success": success,
+                    "used_fallback": bool(
+                        perturbation_result["used_fallback"]
+                    ),
+                    "made_progress": bool(
+                        perturbation_result["made_progress"]
+                    ),
+                    "target_probability": float(
+                        perturbation_result["target_probability"]
+                    ),
                     "bone_valid": (
                         not bone_statistics[
                             "has_violation"
@@ -2446,7 +2729,7 @@ def print_counterfactual_metrics(
         return f"{100.0 * value:.2f}%"
 
     def optional_float(
-        value: float | None,
+        value: Optional[float],
         decimals: int = 6,
     ) -> str:
         if value is None:
@@ -2651,7 +2934,7 @@ def choose_best_weight_result(
 
 def tune_counterfactual_weights(
     *,
-    model: QuestHandIntentEstInference,
+    model: QuestInferenceModel,
     rows: list[dict[str, Any]],
     counterfactual_config: dict[str, Any],
     verbose_samples: bool,
@@ -2858,7 +3141,7 @@ def get_visualization_output_path(
 
 def visualize_counterfactual_samples(
     *,
-    model: QuestHandIntentEstInference,
+    model: QuestInferenceModel,
     rows: list[dict[str, Any]],
     sample_indices: list[int],
     counterfactual_config: dict[str, Any],
@@ -2919,7 +3202,7 @@ def visualize_counterfactual_samples(
         )
 
         try:
-            perturbed_features = find_minimal_perturbation(
+            perturbation_result = find_minimal_perturbation(
                 model=model,
                 joint_feat_vec=original_features,
                 target_intent=target_intent,
@@ -2948,6 +3231,10 @@ def visualize_counterfactual_samples(
                         "probability_margin"
                     ]
                 ),
+            )
+            perturbed_features = np.asarray(
+                perturbation_result["features"],
+                dtype=np.float32,
             )
         except Exception as error:
             print(
@@ -3000,10 +3287,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--quest-mlp-est-path",
+        "--quest-estimator-path",
+        dest="quest_estimator_path",
         type=str,
         required=True,
         help=(
-            "Path to the trained handoff-classification model."
+            "Path to the trained Quest handoff-classification checkpoint. "
+            "The legacy --quest-mlp-est-path name remains accepted."
+        ),
+    )
+    parser.add_argument(
+        "--quest-model-type",
+        type=str,
+        choices=["mlp", "tabm"],
+        default="mlp",
+        help=(
+            "Quest estimator architecture used for evaluation/weight search. "
+            "Defaults to mlp."
         ),
     )
     parser.add_argument(
@@ -3146,8 +3446,19 @@ def main() -> None:
         / handoff_config["dataset"]["root"]
     )
 
-    model = QuestHandIntentEstInference(
-        checkpoint_path=args.quest_mlp_est_path,
+    if args.quest_model_type == "tabm":
+        model = QuestHandIntentTabMEstInference(
+            checkpoint_path=args.quest_estimator_path,
+        )
+    else:
+        model = QuestHandIntentEstInference(
+            checkpoint_path=args.quest_estimator_path,
+        )
+
+    print(
+        "Loaded Quest estimator for counterfactual evaluation: "
+        f"type={args.quest_model_type}, "
+        f"path={Path(args.quest_estimator_path).expanduser().resolve()}"
     )
 
     samples = discover_samples(

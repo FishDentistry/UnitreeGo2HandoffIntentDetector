@@ -16,7 +16,10 @@ setup(
             ["package.xml"],
         ),
     ],
-    install_requires=["setuptools"],
+    install_requires=[
+        "setuptools",
+        "requests",
+    ],
     zip_safe=True,
     maintainer="Maintainer",
     maintainer_email="maintainer@example.com",
@@ -26,6 +29,9 @@ setup(
         "console_scripts": [
             "handoff_inference_node = "
             "ros_handoff_detection.handoff_inference_node:main",
+
+            "robot_ground_truth_node = "
+            "ros_handoff_detection.robot_ground_truth_node:main",
         ],
     },
 )

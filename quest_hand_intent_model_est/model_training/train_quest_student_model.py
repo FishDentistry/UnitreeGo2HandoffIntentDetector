@@ -38,6 +38,28 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = MODEL_IMPL_ROOT / "configs" / "handoff_config.yaml"
 
 
+# ----------------------------------------------------------------------
+# Quest TabM student tuning configuration
+#
+# Used only when --tune-tabm is passed with --model-type tabm.
+#
+# The search is participant-aware: validation participants never appear
+# in the corresponding tuning-training fold. No checkpoints or evaluation
+# bundles are written while candidate hyperparameters are being searched.
+# ----------------------------------------------------------------------
+TABM_TUNE_NUM_TRIALS = 16
+TABM_TUNE_NUM_FOLDS = 5
+
+TABM_STUDENT_TUNE_SPACE = {
+    "epochs": [20, 30, 50, 75],
+    "batch_size": [16, 32, 64],
+    "learning_rate": [5e-4, 1e-3, 2e-3, 4e-3],
+    "weight_decay": [0.0, 1e-4, 3e-4, 1e-3],
+    "k": [16, 24, 32, 48],
+    "logit_loss_weight": [0.25, 0.5, 1.0, 2.0],
+}
+
+
 def make_json_serializable(value):
     """Convert common scientific-Python values into JSON-safe objects."""
     if isinstance(value, dict):
@@ -93,6 +115,7 @@ def save_evaluation_results(
     teacher_weights_path,
     dataset_root,
     dataset_summary,
+    tuning_summary=None,
 ):
     """Save one non-overwriting evaluation bundle as JSON and CSV files."""
     eval_root = (
@@ -120,6 +143,7 @@ def save_evaluation_results(
             "evaluation_directory": str(run_dir),
         },
         "dataset_summary": dataset_summary,
+        "tabm_tuning": tuning_summary,
         "lopo_evaluation": lopo_evaluation,
         "final_training_summary": final_train_summary,
     }
@@ -145,6 +169,7 @@ def save_evaluation_results(
         "model_type": args.model_type,
         "teacher_model_type": args.model_type,
         "student_model_type": args.model_type,
+        "tune_tabm": bool(args.tune_tabm),
         "num_participants": lopo_evaluation["num_participants"],
         "num_folds": lopo_evaluation["num_folds"],
         "include_rotations": lopo_evaluation["include_rotations"],
@@ -171,6 +196,14 @@ def save_evaluation_results(
         "final_train_num_samples": final_train_summary.get("num_samples"),
         "final_train_input_dim": final_train_summary.get("input_dim"),
         "final_train_loss": final_train_summary.get("final_loss"),
+        "final_train_epochs": final_train_summary.get("epochs"),
+        "final_train_batch_size": final_train_summary.get("batch_size"),
+        "final_train_learning_rate": final_train_summary.get("learning_rate"),
+        "final_train_weight_decay": final_train_summary.get("weight_decay"),
+        "final_train_tabm_k": final_train_summary.get("tabm_k"),
+        "final_train_logit_loss_weight": final_train_summary.get(
+            "logit_loss_weight"
+        ),
         "final_train_teacher_student_agreement": final_train_summary.get(
             "teacher_student_agreement"
         ),
@@ -234,11 +267,29 @@ def save_evaluation_results(
         writer.writeheader()
         writer.writerows(fold_rows)
 
+    tuning_json_path = None
+    if tuning_summary is not None:
+        tuning_json_path = run_dir / "tuning_results.json"
+        with tuning_json_path.open("w", encoding="utf-8") as file_obj:
+            json.dump(
+                make_json_serializable(tuning_summary),
+                file_obj,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            file_obj.write("\n")
+
     return {
         "run_dir": str(run_dir),
         "evaluation_json": str(full_json_path),
         "summary_csv": str(summary_csv_path),
         "fold_metrics_csv": str(folds_csv_path),
+        "tuning_json": (
+            str(tuning_json_path)
+            if tuning_json_path is not None
+            else None
+        ),
     }
 
 
@@ -1402,6 +1453,562 @@ def evaluate_quest_student(
     }
 
 
+
+def get_usable_quest_rows(rows):
+    """Return rows usable for Quest student participant-level evaluation."""
+    usable_rows = []
+
+    for row in rows:
+        if row.get("skipped", False):
+            continue
+        if row.get("feature_vector") is None:
+            continue
+        if row.get("quest_joints_pth") is None:
+            continue
+        if row.get("participant_id") is None:
+            continue
+
+        usable_rows.append(row)
+
+    return usable_rows
+
+
+def make_quest_participant_cv_folds(
+    rows,
+    *,
+    num_folds: int,
+    random_state: int,
+):
+    """
+    Build participant-level folds for student hyperparameter tuning.
+
+    Each participant is assigned wholly to one validation fold, so no
+    participant contributes samples to both train and validation in a
+    particular tuning fold.
+    """
+    usable_rows = get_usable_quest_rows(rows)
+
+    participants = sorted(
+        {
+            str(row["participant_id"])
+            for row in usable_rows
+        }
+    )
+
+    if len(participants) < 2:
+        raise ValueError(
+            "Quest TabM tuning requires at least two participants."
+        )
+
+    fold_count = min(
+        int(num_folds),
+        len(participants),
+    )
+
+    if fold_count < 2:
+        raise ValueError(
+            "Quest TabM tuning requires at least two participant folds."
+        )
+
+    rng = np.random.default_rng(int(random_state))
+    shuffled_participants = np.asarray(
+        participants,
+        dtype=object,
+    )
+    rng.shuffle(shuffled_participants)
+
+    participant_groups = [
+        [str(value) for value in group.tolist()]
+        for group in np.array_split(
+            shuffled_participants,
+            fold_count,
+        )
+        if len(group) > 0
+    ]
+
+    folds = []
+
+    for fold_index, validation_participants in enumerate(
+        participant_groups
+    ):
+        validation_set = set(validation_participants)
+
+        train_rows = [
+            row
+            for row in usable_rows
+            if str(row["participant_id"])
+            not in validation_set
+        ]
+
+        validation_rows = [
+            row
+            for row in usable_rows
+            if str(row["participant_id"])
+            in validation_set
+        ]
+
+        if not train_rows:
+            raise ValueError(
+                "A Quest TabM tuning fold contained no training rows."
+            )
+
+        if not validation_rows:
+            raise ValueError(
+                "A Quest TabM tuning fold contained no validation rows."
+            )
+
+        folds.append(
+            {
+                "fold_index": int(fold_index),
+                "validation_participants": sorted(
+                    validation_set
+                ),
+                "train_rows": train_rows,
+                "validation_rows": validation_rows,
+            }
+        )
+
+    return folds
+
+
+def generate_quest_tabm_tuning_candidates(
+    *,
+    current_params,
+    random_state: int,
+    num_trials: int,
+):
+    """
+    Return a reproducible random subset of the Quest TabM search space.
+
+    The current configuration is always included as the first trial, so the
+    tuning run always compares against the settings the script would otherwise
+    have used.
+    """
+    import itertools
+
+    all_candidates = []
+
+    for (
+        epochs,
+        batch_size,
+        learning_rate,
+        weight_decay,
+        k,
+        logit_loss_weight,
+    ) in itertools.product(
+        TABM_STUDENT_TUNE_SPACE["epochs"],
+        TABM_STUDENT_TUNE_SPACE["batch_size"],
+        TABM_STUDENT_TUNE_SPACE["learning_rate"],
+        TABM_STUDENT_TUNE_SPACE["weight_decay"],
+        TABM_STUDENT_TUNE_SPACE["k"],
+        TABM_STUDENT_TUNE_SPACE["logit_loss_weight"],
+    ):
+        all_candidates.append(
+            {
+                "epochs": int(epochs),
+                "batch_size": int(batch_size),
+                "learning_rate": float(learning_rate),
+                "weight_decay": float(weight_decay),
+                "k": int(k),
+                "logit_loss_weight": float(
+                    logit_loss_weight
+                ),
+            }
+        )
+
+    baseline = {
+        "epochs": int(current_params["epochs"]),
+        "batch_size": int(
+            current_params["batch_size"]
+        ),
+        "learning_rate": float(
+            current_params["learning_rate"]
+        ),
+        "weight_decay": float(
+            current_params["weight_decay"]
+        ),
+        "k": int(current_params["k"]),
+        "logit_loss_weight": float(
+            current_params["logit_loss_weight"]
+        ),
+    }
+
+    remaining = [
+        candidate
+        for candidate in all_candidates
+        if candidate != baseline
+    ]
+
+    rng = np.random.default_rng(int(random_state))
+    rng.shuffle(remaining)
+
+    trial_count = max(1, int(num_trials))
+
+    selected = [baseline]
+    if trial_count > 1:
+        selected.extend(
+            remaining[: trial_count - 1]
+        )
+
+    return selected
+
+
+def tune_quest_tabm_hyperparameters(
+    rows,
+    *,
+    teacher_model,
+    student_features_type,
+    current_params,
+    random_state: int = 0,
+    device: str = "auto",
+    threshold: float = 0.5,
+    include_rotations: bool = False,
+    num_trials: int = TABM_TUNE_NUM_TRIALS,
+    num_folds: int = TABM_TUNE_NUM_FOLDS,
+):
+    """
+    Tune the Quest TabM student to imitate the fixed TabM teacher.
+
+    Primary objective
+    -----------------
+    Minimize mean participant-fold teacher/student probability MAE.
+
+    Tie-breakers
+    ------------
+    1. Lower pooled probability MAE.
+    2. Lower pooled probability MSE.
+    3. Higher pooled teacher/student agreement accuracy.
+
+    No model checkpoint or evaluation bundle is written during tuning.
+    """
+    tune_started_at = datetime.now().astimezone()
+    tune_start = time.perf_counter()
+
+    folds = make_quest_participant_cv_folds(
+        rows,
+        num_folds=num_folds,
+        random_state=random_state,
+    )
+
+    candidates = generate_quest_tabm_tuning_candidates(
+        current_params=current_params,
+        random_state=random_state,
+        num_trials=num_trials,
+    )
+
+    print(
+        "\n========================================"
+    )
+    print(
+        "Starting Quest TabM student hyperparameter tuning"
+    )
+    print(
+        "========================================"
+    )
+    print(f"Trials: {len(candidates)}")
+    print(f"Participant CV folds: {len(folds)}")
+    print(
+        "Primary objective: minimize mean held-out "
+        "teacher/student probability MAE"
+    )
+    print(
+        "No checkpoints or evaluation bundles will "
+        "be saved during tuning."
+    )
+
+    trial_results = []
+
+    for trial_index, candidate in enumerate(candidates):
+        print(
+            "\n----------------------------------------"
+        )
+        print(
+            f"Tuning trial {trial_index + 1}/"
+            f"{len(candidates)}"
+        )
+        print("Parameters:", candidate)
+
+        fold_results = []
+        all_teacher_scores = []
+        all_student_scores = []
+        all_teacher_predictions = []
+        all_student_predictions = []
+
+        for tune_fold_index, fold in enumerate(folds):
+            print(
+                f"\nTune fold {tune_fold_index + 1}/"
+                f"{len(folds)} "
+                f"validation participants="
+                f"{fold['validation_participants']}"
+            )
+
+            fold_seed = (
+                int(random_state)
+                + trial_index * 1000
+                + tune_fold_index
+            )
+
+            student_model, train_summary = (
+                train_quest_student_tabm(
+                    rows=fold["train_rows"],
+                    teacher_model=teacher_model,
+                    teacher_model_type="tabm",
+                    student_features_type=student_features_type,
+                    learning_rate=candidate["learning_rate"],
+                    weight_decay=candidate["weight_decay"],
+                    logit_loss_weight=(
+                        candidate["logit_loss_weight"]
+                    ),
+                    batch_size=candidate["batch_size"],
+                    epochs=candidate["epochs"],
+                    k=candidate["k"],
+                    random_state=fold_seed,
+                    device=device,
+                    threshold=threshold,
+                    include_rotations=include_rotations,
+                    output_path=None,
+                )
+            )
+
+            evaluation = evaluate_quest_student(
+                model=student_model,
+                teacher_model=teacher_model,
+                model_type="tabm",
+                test_rows=fold["validation_rows"],
+                device=train_summary["device"],
+                student_features_type=student_features_type,
+                threshold=threshold,
+                include_rotations=include_rotations,
+            )
+
+            fold_result = {
+                "fold_index": int(tune_fold_index),
+                "validation_participants": (
+                    fold["validation_participants"]
+                ),
+                "probability_mae": float(
+                    evaluation["probability_mae"]
+                ),
+                "probability_mse": float(
+                    evaluation["probability_mse"]
+                ),
+                "agreement_metrics": (
+                    evaluation["agreement_metrics"]
+                ),
+            }
+            fold_results.append(fold_result)
+
+            all_teacher_scores.extend(
+                evaluation["teacher_scores"]
+            )
+            all_student_scores.extend(
+                evaluation["student_scores"]
+            )
+            all_teacher_predictions.extend(
+                evaluation["teacher_predictions"]
+            )
+            all_student_predictions.extend(
+                evaluation["student_predictions"]
+            )
+
+            print(
+                "Tune fold metrics: "
+                f"agreement="
+                f"{evaluation['agreement_metrics']['accuracy']:.4f}, "
+                f"probability_mae="
+                f"{evaluation['probability_mae']:.6f}, "
+                f"probability_mse="
+                f"{evaluation['probability_mse']:.6f}"
+            )
+
+            del student_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        teacher_scores_array = np.asarray(
+            all_teacher_scores,
+            dtype=np.float32,
+        )
+        student_scores_array = np.asarray(
+            all_student_scores,
+            dtype=np.float32,
+        )
+
+        pooled_probability_mae = float(
+            np.mean(
+                np.abs(
+                    student_scores_array
+                    - teacher_scores_array
+                )
+            )
+        )
+        pooled_probability_mse = float(
+            np.mean(
+                (
+                    student_scores_array
+                    - teacher_scores_array
+                ) ** 2
+            )
+        )
+
+        pooled_agreement_metrics = compute_binary_metrics(
+            y_true=all_teacher_predictions,
+            y_pred=all_student_predictions,
+        )
+
+        fold_maes = [
+            fold_result["probability_mae"]
+            for fold_result in fold_results
+        ]
+        fold_mses = [
+            fold_result["probability_mse"]
+            for fold_result in fold_results
+        ]
+        fold_agreements = [
+            fold_result["agreement_metrics"]["accuracy"]
+            for fold_result in fold_results
+        ]
+
+        result = {
+            "trial_index": int(trial_index),
+            "parameters": candidate,
+            "num_folds": int(len(fold_results)),
+            "mean_probability_mae": float(
+                np.mean(fold_maes)
+            ),
+            "std_probability_mae": float(
+                np.std(fold_maes)
+            ),
+            "mean_probability_mse": float(
+                np.mean(fold_mses)
+            ),
+            "mean_agreement_accuracy": float(
+                np.mean(fold_agreements)
+            ),
+            "pooled_probability_mae": (
+                pooled_probability_mae
+            ),
+            "pooled_probability_mse": (
+                pooled_probability_mse
+            ),
+            "pooled_agreement_metrics": (
+                pooled_agreement_metrics
+            ),
+            "folds": fold_results,
+        }
+
+        trial_results.append(result)
+
+        print(
+            "\nTrial result:",
+            {
+                "mean_probability_mae": (
+                    result["mean_probability_mae"]
+                ),
+                "pooled_probability_mae": (
+                    pooled_probability_mae
+                ),
+                "pooled_probability_mse": (
+                    pooled_probability_mse
+                ),
+                "pooled_agreement_accuracy": (
+                    pooled_agreement_metrics["accuracy"]
+                ),
+            },
+        )
+
+    def rank_key(result):
+        return (
+            float(result["mean_probability_mae"]),
+            float(result["pooled_probability_mae"]),
+            float(result["pooled_probability_mse"]),
+            -float(
+                result["pooled_agreement_metrics"][
+                    "accuracy"
+                ]
+            ),
+        )
+
+    best_result = min(
+        trial_results,
+        key=rank_key,
+    )
+
+    tuning_summary = {
+        "enabled": True,
+        "started_at": tune_started_at.isoformat(),
+        "completed_at": (
+            datetime.now().astimezone().isoformat()
+        ),
+        "train_seconds": float(
+            time.perf_counter() - tune_start
+        ),
+        "objective": (
+            "minimize_mean_validation_teacher_student_"
+            "probability_mae"
+        ),
+        "selection_tie_breakers": [
+            "pooled_probability_mae",
+            "pooled_probability_mse",
+            "pooled_agreement_accuracy",
+        ],
+        "num_trials": int(len(trial_results)),
+        "num_folds": int(len(folds)),
+        "search_space": TABM_STUDENT_TUNE_SPACE,
+        "best_trial_index": int(
+            best_result["trial_index"]
+        ),
+        "best_parameters": (
+            best_result["parameters"]
+        ),
+        "best_mean_probability_mae": (
+            best_result["mean_probability_mae"]
+        ),
+        "best_pooled_probability_mae": (
+            best_result["pooled_probability_mae"]
+        ),
+        "best_pooled_probability_mse": (
+            best_result["pooled_probability_mse"]
+        ),
+        "best_pooled_agreement_metrics": (
+            best_result["pooled_agreement_metrics"]
+        ),
+        "trials": trial_results,
+    }
+
+    print(
+        "\n========================================"
+    )
+    print(
+        "Quest TabM student hyperparameter tuning complete"
+    )
+    print(
+        "========================================"
+    )
+    print(
+        "Best parameters:",
+        tuning_summary["best_parameters"],
+    )
+    print(
+        "Best mean validation probability MAE:",
+        tuning_summary["best_mean_probability_mae"],
+    )
+    print(
+        "Best pooled validation probability MAE:",
+        tuning_summary["best_pooled_probability_mae"],
+    )
+    print(
+        "Best pooled teacher/student agreement:",
+        tuning_summary[
+            "best_pooled_agreement_metrics"
+        ],
+    )
+
+    return (
+        dict(tuning_summary["best_parameters"]),
+        tuning_summary,
+    )
+
 def leave_one_participant_out_evaluation(
     rows,
     teacher_model,
@@ -1629,6 +2236,16 @@ def main():
     parser.add_argument("--hand", type=str, choices=["left", "right"], default=None, help="Filter to one hand")
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--tune-tabm",
+        action="store_true",
+        help=(
+            "Tune the TabM student before the normal LOPO/final-training "
+            "workflow. Valid only with --model-type tabm. Candidate models "
+            "are evaluated with participant-level validation and are not "
+            "saved. The best settings are then used for the normal run."
+        ),
+    )
     parser.add_argument("--student-epochs", "--mlp-epochs", dest="student_epochs", type=int, default=30)
     parser.add_argument("--student-batch-size", "--mlp-batch-size", dest="student_batch_size", type=int, default=32)
     parser.add_argument(
@@ -1793,6 +2410,77 @@ def main():
         img_encoder=resnet_encoder,
         args=args,
     )
+
+    tuning_summary = None
+
+    if args.tune_tabm:
+        if args.model_type != "tabm":
+            raise ValueError(
+                "--tune-tabm is only valid when --model-type tabm is selected."
+            )
+
+        resolved_tabm_learning_rate = (
+            2e-3
+            if args.student_learning_rate is None
+            else float(args.student_learning_rate)
+        )
+
+        current_params = {
+            "epochs": int(args.student_epochs),
+            "batch_size": int(args.student_batch_size),
+            "learning_rate": float(resolved_tabm_learning_rate),
+            "weight_decay": float(args.tabm_weight_decay),
+            "k": int(args.tabm_k),
+            "logit_loss_weight": float(args.logit_loss_weight),
+        }
+
+        best_params, tuning_summary = (
+            tune_quest_tabm_hyperparameters(
+                rows=rows,
+                teacher_model=model,
+                student_features_type=args.student_features_type,
+                current_params=current_params,
+                random_state=args.student_random_state,
+                device="auto",
+                threshold=args.decision_threshold,
+                include_rotations=args.include_quest_joint_rotations,
+            )
+        )
+
+        # From this point onward, execute the original training/evaluation
+        # workflow once, but with the selected TabM student hyperparameters.
+        args.student_epochs = int(best_params["epochs"])
+        args.student_batch_size = int(best_params["batch_size"])
+        args.student_learning_rate = float(
+            best_params["learning_rate"]
+        )
+        args.tabm_weight_decay = float(
+            best_params["weight_decay"]
+        )
+        args.tabm_k = int(best_params["k"])
+        args.logit_loss_weight = float(
+            best_params["logit_loss_weight"]
+        )
+
+        # The auto-generated variation name includes logit_loss_weight,
+        # so rebuild it after tuning. Respect an explicit --eval-run-name.
+        if args.eval_run_name is None:
+            variation_name = build_model_variation_name(args)
+
+        print(
+            "\nUsing tuned Quest TabM student hyperparameters "
+            "for normal LOPO/final training:"
+        )
+        print(
+            {
+                "student_epochs": args.student_epochs,
+                "student_batch_size": args.student_batch_size,
+                "student_learning_rate": args.student_learning_rate,
+                "tabm_weight_decay": args.tabm_weight_decay,
+                "tabm_k": args.tabm_k,
+                "logit_loss_weight": args.logit_loss_weight,
+            }
+        )
 
     lopo_evaluation = leave_one_participant_out_evaluation(
         rows=rows,
@@ -1960,18 +2648,22 @@ def main():
         teacher_weights_path=HAND_INTENT_WEIGHTS_PATH,
         dataset_root=dataset_root,
         dataset_summary=dataset_summary,
+        tuning_summary=tuning_summary,
     )
 
     print(f"Evaluation results saved to: {saved_eval_paths['run_dir']}")
     print(f"  Full JSON: {saved_eval_paths['evaluation_json']}")
     print(f"  Summary CSV: {saved_eval_paths['summary_csv']}")
     print(f"  Fold metrics CSV: {saved_eval_paths['fold_metrics_csv']}")
+    if saved_eval_paths.get("tuning_json") is not None:
+        print(f"  Tuning results: {saved_eval_paths['tuning_json']}")
 
     return {
         "lopo_evaluation": lopo_evaluation,
         "final_train_summary": final_train_summary,
         "final_output_path": str(final_output_path),
         "saved_eval_paths": saved_eval_paths,
+        "tuning_summary": tuning_summary,
         "run_id": run_id,
         "variation_name": variation_name,
     }
@@ -1979,3 +2671,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

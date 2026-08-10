@@ -1,5 +1,7 @@
-
-#Run from repo root with: python -m servers.check_current_handoff_pose_server --quest-mlp-est-path /path/to/mlp_weights_file/file.pth
+# Run from repo root, e.g.:
+# python -m servers.check_current_handoff_pose_server \
+#     --quest-model-type tabm \
+#     --quest-model-features-type keypoints_projections
 import argparse
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -14,6 +16,7 @@ import cv2
 from quest_hand_intent_model_est.src.quest_hand_int_inf_wrapper import (
     QuestHandIntentEstInference,
 )
+from quest_hand_intent_model_est.src.quest_hand_int_tabm_inf_wrapper import QuestHandIntentTabMEstInference as TabMModel
 from quest_hand_intent_model_est.src.quest_joint_features import (
     extract_quest_joint_features_json, feature_vector_to_joint_poses,
     construct_pose_img_from_joint_feature_vector
@@ -42,7 +45,101 @@ ROBOT_DETECTOR_CLASS_NAMES = [
     "robot dog"
 ]
 
-QUEST_MODEL_FEATURES_TYPE = "keypoints_projections"  # or "keypoints_projections"
+QUEST_MODEL_TYPES = ("mlp", "tabm")
+QUEST_MODEL_FEATURES_TYPES = (
+    "keypoints_projections",
+    "keypoints_resnet",
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+QUEST_OUTPUT_ROOT = (
+    REPO_ROOT
+    / "quest_hand_intent_model_est"
+    / "outputs"
+)
+
+
+def resolve_quest_estimator_path(
+    quest_model_type: str,
+    quest_model_features_type: str,
+    override_path: Optional[str] = None,
+) -> Path:
+    """Resolve the Quest student checkpoint path.
+
+    If override_path is supplied, it takes precedence. Otherwise search the
+    normal Quest model output directory for a checkpoint whose variation
+    folder matches the selected model type and student feature type.
+    """
+    model_type = str(quest_model_type).strip().lower()
+    features_type = str(quest_model_features_type).strip().lower()
+
+    if model_type not in QUEST_MODEL_TYPES:
+        raise ValueError(
+            f"Invalid quest model type: {quest_model_type}. "
+            f"Expected one of {QUEST_MODEL_TYPES}."
+        )
+
+    if features_type not in QUEST_MODEL_FEATURES_TYPES:
+        raise ValueError(
+            f"Invalid quest model features type: {quest_model_features_type}. "
+            f"Expected one of {QUEST_MODEL_FEATURES_TYPES}."
+        )
+
+    if override_path is not None:
+        resolved = Path(override_path).expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"Quest estimator checkpoint does not exist: {resolved}"
+            )
+        return resolved
+
+    if model_type == "mlp":
+        model_root = QUEST_OUTPUT_ROOT / "quest_hand_intent_mlp_weights"
+        checkpoint_name = "MLP.pth"
+    else:
+        model_root = QUEST_OUTPUT_ROOT / "quest_hand_intent_tabm"
+        checkpoint_name = "TabM.pth"
+
+    variation_pattern = (
+        f"model-{model_type}__*"
+        f"student_features-{features_type}__*"
+    )
+
+    matches = [
+        path
+        for path in model_root.glob(
+            f"{variation_pattern}/{checkpoint_name}"
+        )
+        if path.is_file()
+    ]
+
+    if not matches:
+        raise FileNotFoundError(
+            "Could not automatically locate a Quest estimator checkpoint. "
+            f"Searched under {model_root} for model_type={model_type}, "
+            f"student_features_type={features_type}, checkpoint={checkpoint_name}. "
+            "Pass --quest-estimator-path to override automatic resolution."
+        )
+
+    # There can be multiple matching variation directories if, for example,
+    # different teacher features or tuned loss weights were used. Prefer the
+    # most recently modified checkpoint; an explicit path can always override
+    # this behavior.
+    matches.sort(
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    selected = matches[0].resolve()
+
+    if len(matches) > 1:
+        print(
+            "Multiple Quest estimator checkpoints matched "
+            f"model_type={model_type}, features_type={features_type}. "
+            f"Using the most recently modified checkpoint: {selected}"
+        )
+
+    return selected
 
 
 def format_perturbation_response(
@@ -154,13 +251,30 @@ def format_robot_tracking_result(
     }
 
 
-def create_app(robot_obj_det_weights_path:str, model_path: str) -> FastAPI:
+def create_app(
+    robot_obj_det_weights_path: str,
+    model_path: str,
+    quest_model_type: str,
+    quest_model_features_type: str,
+) -> FastAPI:
     app = FastAPI()
 
-    model = QuestHandIntentEstInference(
-        checkpoint_path=model_path,
-    )
+    quest_model_type = str(quest_model_type).strip().lower()
+    quest_model_features_type = str(quest_model_features_type).strip().lower()
 
+    if quest_model_type == "mlp":
+        model = QuestHandIntentEstInference(
+            checkpoint_path=model_path,
+        )
+    elif quest_model_type == "tabm":
+        model = TabMModel(
+            checkpoint_path=model_path,
+        )
+    else:
+        raise ValueError(
+            f"Invalid quest_model_type: {quest_model_type}"
+        )
+    
     configure_posefix_for_hand_guidance()
 
     # ------------------------------------------------------------------
@@ -358,37 +472,53 @@ def create_app(robot_obj_det_weights_path:str, model_path: str) -> FastAPI:
         )
         proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(joint_feat_vec)
         quest_features = []
-        if(QUEST_MODEL_FEATURES_TYPE == "keypoints_projections"):
+        if quest_model_features_type == "keypoints_projections":
             quest_features = np.concatenate([joint_feat_vec, proj_joints], axis=0)
-        elif(QUEST_MODEL_FEATURES_TYPE == "keypoints_resnet"):
+        elif quest_model_features_type == "keypoints_resnet":
             resnet_embedding = resnet_encoder.predict(pose_img)["embedding"]
             quest_features = np.concatenate([joint_feat_vec, resnet_embedding.flatten().astype(np.float32)], axis=0)
         else:
-            raise ValueError(f"Invalid QUEST_MODEL_FEATURES_TYPE: {QUEST_MODEL_FEATURES_TYPE}")
+            raise ValueError(
+                f"Invalid quest_model_features_type: "
+                f"{quest_model_features_type}"
+            )
         
         original_prediction = model.predict_features(
             quest_features
         )
+        print("Original prediction:", original_prediction)
 
         target_intent = True
 
         if original_prediction.is_handoff == target_intent:
+            print("NO PERTURBATIONS NEEDED")
             return {
                 "perturbations_needed": False,
                 "joint_position_perturbations": {},
                 "joint_rotation_perturbations": {},
                 "text_guidance": "",
             }
-        
-        perturbed_features = find_minimal_perturbation(
+        pertstart = time.time()
+        perturbed_result = find_minimal_perturbation(
             model=model,
             joint_feat_vec=quest_features,
             target_intent=True,
+            features_type=quest_model_features_type,
             classification_weight=1000.0,
             reachability_weight=1000.0,
             probability_margin=0.05,
-            max_iterations=500,
+            max_iterations=100,
+            object_arm="right"
         )
+        perturbation_success = perturbed_result["reached_target"]
+        perturbed_features = perturbed_result["features"]
+        perttotal = time.time() - pertstart
+        print(f"Perturbation time: {perttotal:.3f} seconds")
+        if(perturbation_success):
+            print("PERTURBATION SUCCESSFUL")
+        else:
+            print("PERTURBATION FAILED, returning best effort")
+
         perturbed_joints = perturbed_features[:63]
         
         joint_feat_vec = joint_feat_vec[:-3]
@@ -480,10 +610,35 @@ def main() -> None:
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--quest-mlp-est-path",
+        "--quest-model-type",
         type=str,
-        required=True,
-        help="Path to the trained handoff-classification model.",
+        choices=QUEST_MODEL_TYPES,
+        default="tabm",
+        help=(
+            "Quest student model architecture. Defaults to tabm."
+        ),
+    )
+
+    parser.add_argument(
+        "--quest-model-features-type",
+        type=str,
+        choices=QUEST_MODEL_FEATURES_TYPES,
+        default="keypoints_projections",
+        help=(
+            "Quest student feature representation. Defaults to "
+            "keypoints_projections."
+        ),
+    )
+
+    parser.add_argument(
+        "--quest-estimator-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit Quest estimator checkpoint path. If supplied, "
+            "this overrides automatic path resolution from --quest-model-type "
+            "and --quest-model-features-type."
+        ),
     )
 
     parser.add_argument(
@@ -507,7 +662,25 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    app = create_app(args.robot_obj_det_weights_path, args.quest_mlp_est_path)
+    quest_estimator_path = resolve_quest_estimator_path(
+        quest_model_type=args.quest_model_type,
+        quest_model_features_type=args.quest_model_features_type,
+        override_path=args.quest_estimator_path,
+    )
+
+    print(
+        "Quest model configuration: "
+        f"type={args.quest_model_type}, "
+        f"features={args.quest_model_features_type}, "
+        f"checkpoint={quest_estimator_path}"
+    )
+
+    app = create_app(
+        args.robot_obj_det_weights_path,
+        str(quest_estimator_path),
+        args.quest_model_type,
+        args.quest_model_features_type,
+    )
 
     uvicorn.run(
         app,

@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import inspect
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence, Union
+from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -38,7 +38,7 @@ class HandIntentPrediction:
         """Return the binary prediction as 0 or 1."""
         return int(self.is_handoff)
 
-    def as_dict(self) -> dict[str, float | bool | int]:
+    def as_dict(self) -> dict[str, Union[float, bool, int]]:
         """Return a JSON-serializable representation."""
         return {
             "probability": self.probability,
@@ -48,7 +48,7 @@ class HandIntentPrediction:
         }
 
 
-class QuestHandIntentEstInference:
+class QuestHandIntentTabMEstInference:
     """Load a trained Quest TabM model for inference and differentiable scoring.
 
     Parameters
@@ -74,8 +74,8 @@ class QuestHandIntentEstInference:
         self,
         checkpoint_path: PathLike,
         *,
-        device: str | torch.device = "auto",
-        threshold: float | None = None,
+        device: Union[str, torch.device] = "auto",
+        threshold: Optional[float] = None,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
         self.device = self._resolve_device(device)
@@ -315,7 +315,7 @@ class QuestHandIntentEstInference:
         self,
         features: FeatureInput,
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
     ) -> HandIntentPrediction:
         """Predict from one already-extracted feature vector."""
         probabilities = self.predict_feature_probabilities(features)
@@ -330,7 +330,7 @@ class QuestHandIntentEstInference:
         self,
         feature_batch: FeatureInput,
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
     ) -> list[HandIntentPrediction]:
         """Predict from a batch of already-extracted feature vectors."""
         probabilities = self.predict_feature_probabilities(feature_batch)
@@ -384,7 +384,7 @@ class QuestHandIntentEstInference:
         self,
         joint_payload: Mapping[str, Any],
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
     ) -> HandIntentPrediction:
         """Extract features from an in-memory joint JSON object and predict."""
         features = self.features_from_joint_json(joint_payload)
@@ -394,7 +394,7 @@ class QuestHandIntentEstInference:
         self,
         joint_json_path: PathLike,
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
     ) -> HandIntentPrediction:
         """Extract features from one joint JSON file path and predict."""
         features = self.features_from_joint_json_file(joint_json_path)
@@ -404,7 +404,7 @@ class QuestHandIntentEstInference:
         self,
         joint_json_paths: Iterable[PathLike],
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
         batch_size: int = 256,
     ) -> list[HandIntentPrediction]:
         """Predict multiple joint JSON file paths in mini-batches."""
@@ -439,7 +439,7 @@ class QuestHandIntentEstInference:
         self,
         joint_json_path: PathLike,
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
     ) -> HandIntentPrediction:
         """Backward-compatible alias for ``predict_joint_json_file``."""
         return self.predict_joint_json_file(
@@ -451,7 +451,7 @@ class QuestHandIntentEstInference:
         self,
         joint_json_paths: Iterable[PathLike],
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
         batch_size: int = 256,
     ) -> list[HandIntentPrediction]:
         """Backward-compatible alias for ``predict_joint_json_files``."""
@@ -473,7 +473,7 @@ class QuestHandIntentEstInference:
         self,
         joint_json_path: PathLike,
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
     ) -> bool:
         """Return only the decision for a joint JSON file path.
 
@@ -489,7 +489,7 @@ class QuestHandIntentEstInference:
         self,
         joint_json_path: PathLike,
         *,
-        threshold: float | None = None,
+        threshold: Optional[float] = None,
     ) -> HandIntentPrediction:
         """Backward-compatible alias for ``predict_joint_json_file``."""
         return self.predict_joint_json_file(
@@ -503,7 +503,7 @@ class QuestHandIntentEstInference:
 
     def _validate_extracted_feature_vector(
         self,
-        feature_vector: Sequence[float] | np.ndarray | torch.Tensor,
+        feature_vector: Union[Sequence[float], np.ndarray, torch.Tensor],
         *,
         source_description: str,
     ) -> np.ndarray:
@@ -532,8 +532,8 @@ class QuestHandIntentEstInference:
 
     def _make_prediction(
         self,
-        probability: float | np.floating,
-        threshold: float | None,
+        probability: Union[float, np.floating],
+        threshold: Optional[float],
     ) -> HandIntentPrediction:
         resolved_threshold = (
             self.threshold
@@ -548,7 +548,7 @@ class QuestHandIntentEstInference:
         )
 
     @staticmethod
-    def _resolve_device(device: str | torch.device) -> torch.device:
+    def _resolve_device(device: Union[str, torch.device]) -> torch.device:
         if isinstance(device, torch.device):
             resolved = device
         elif device == "auto":
