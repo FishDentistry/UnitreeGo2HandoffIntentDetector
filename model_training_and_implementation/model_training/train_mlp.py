@@ -721,6 +721,8 @@ def main():
     print(f"  Summary CSV: {saved_eval_paths['summary_csv']}")
     print(f"  Fold metrics CSV: {saved_eval_paths['fold_metrics_csv']}")
 
+    print("FINAL LOPO POOLED BALANCE ACCURACY:", lopo_evaluation["pooled_metrics"]["balanced_accuracy"])
+
     return {
         "lopo_evaluation": lopo_evaluation,
         "final_train_summary": final_train_summary,

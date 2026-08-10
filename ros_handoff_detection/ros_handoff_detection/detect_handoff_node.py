@@ -8,7 +8,15 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Float32, String
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
-from model_training_and_implementation.src.handoff_detection_wrapper import HandoffDetector
+from model_training_and_implementation.src.handoff_detection_wrapper import (
+    HandoffDetector as MLPHandoffDetector,
+)
+from model_training_and_implementation.src.tabm_handoff_detection_wrapper import (
+    HandoffDetector as TabMHandoffDetector,
+)
+
+
+MODEL_TYPES = ("mlp", "tabm")
 
 
 class HandoffInferenceNode(Node):
@@ -18,6 +26,10 @@ class HandoffInferenceNode(Node):
         # ---------------------------------------------------------
         # Parameters
         # ---------------------------------------------------------
+        self.declare_parameter(
+            "model_type",
+            "tabm",
+        )
         self.declare_parameter(
             "features_type",
             "keypoints_headpose_resnet",
@@ -29,6 +41,14 @@ class HandoffInferenceNode(Node):
         self.declare_parameter(
             "threshold",
             0.5,
+        )
+
+        model_type = (
+            self.get_parameter("model_type")
+            .get_parameter_value()
+            .string_value
+            .strip()
+            .lower()
         )
 
         features_type = (
@@ -49,17 +69,39 @@ class HandoffInferenceNode(Node):
             .double_value
         )
 
+        if model_type not in MODEL_TYPES:
+            raise ValueError(
+                f"Unsupported model_type '{model_type}'. "
+                f"Expected one of: {', '.join(MODEL_TYPES)}."
+            )
+
+        self.model_type = model_type
+
         # ---------------------------------------------------------
         # Model
         # ---------------------------------------------------------
-        self.detector = HandoffDetector(
+        if self.model_type == "mlp":
+            detector_class = MLPHandoffDetector
+
+        elif self.model_type == "tabm":
+            detector_class = TabMHandoffDetector
+
+        else:
+            # Defensive fallback. The validation above should make
+            # this branch unreachable.
+            raise ValueError(
+                f"Unsupported model_type: {self.model_type}"
+            )
+
+        self.detector = detector_class(
             features_type=features_type,
             crop_around_object=crop_around_object,
             threshold=threshold,
         )
 
         self.get_logger().info(
-            f"Loaded handoff detector: {self.detector.model_path}"
+            f"Loaded {self.model_type.upper()} handoff detector: "
+            f"{self.detector.model_path}"
         )
 
         # ---------------------------------------------------------
@@ -114,7 +156,8 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
-            "Handoff inference node started."
+            "Handoff inference node started "
+            f"with model_type={self.model_type}."
         )
 
     def image_callback(
@@ -159,13 +202,15 @@ class HandoffInferenceNode(Node):
             )
 
             self.get_logger().info(
+                f"[{self.model_type.upper()}] "
                 f"{classification} "
                 f"(confidence={confidence:.3f})"
             )
 
         except Exception as exc:
             self.get_logger().warning(
-                f"Handoff inference failed: {exc}"
+                f"Handoff inference failed "
+                f"[{self.model_type.upper()}]: {exc}"
             )
 
 

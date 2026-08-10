@@ -3,30 +3,25 @@ import csv
 import json
 import math
 import re
-import shutil
 import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
-import joblib
 import numpy as np
+import torch
 import yaml
 from shared.util.extract_all_samples import discover_samples, organize_samples, rows_to_xy
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
-from xgboost import XGBClassifier
+from torch.utils.data import DataLoader, TensorDataset
 from ..src.dino_detector import DINOObjectDetector
 from ..src.rtmpose_keypoints import RTMPoseKeypointDetector
 from ..src.rtmpose_headpose import RTMPoseHeadPoseEstimator
+from ..src.hand_intent_tabm import HandIntentTabM
 from ..src.resnet_encoder import ResNet18ImageEncoder
 from ..src.dino_encoder import DINOv2ImageEncoder
 
 
 FEATURES_TYPE = ["keypoints","keypoints_headpose","keypoints_headpose_dino","keypoints_resnet","keypoints_headpose_resnet"]
-MODEL_TYPES = ["logistic_regression", "linear_svm", "rbf_svm", "xgboost"]
 
 MODEL_IMPL_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -72,7 +67,6 @@ def build_model_variation_name(args):
 
 def save_evaluation_results(
     *,
-    model_type,
     lopo_evaluation,
     final_train_summary,
     args,
@@ -83,17 +77,13 @@ def save_evaluation_results(
     dataset_root,
     dataset_summary,
 ):
-    """Save evaluation files for one model type and variation."""
+    """Save evaluation files, overwriting the previous run of this variation."""
     eval_root = (
         Path(args.eval_output_dir)
         if args.eval_output_dir is not None
-        else MODEL_IMPL_ROOT / "outputs" / "eval_results" / "classical_models"
+        else MODEL_IMPL_ROOT / "outputs" / "eval_results" / "tabm"
     )
-    variation_dir = (
-        eval_root
-        / sanitize_path_component(variation_name)
-        / sanitize_path_component(model_type)
-    )
+    variation_dir = eval_root / sanitize_path_component(variation_name)
     variation_dir.mkdir(parents=True, exist_ok=True)
 
     completed_at = datetime.now().astimezone()
@@ -102,7 +92,6 @@ def save_evaluation_results(
         "run": {
             "run_id": run_id,
             "variation_name": variation_name,
-            "model_type": model_type,
             "started_at": run_started_at.isoformat(),
             "completed_at": completed_at.isoformat(),
         },
@@ -132,7 +121,6 @@ def save_evaluation_results(
     summary_row = {
         "run_id": run_id,
         "variation_name": variation_name,
-        "model_type": model_type,
         "features_type": args.features_type,
         "crop_around_object": bool(args.crop_around_object),
         "decision_threshold": float(args.decision_threshold),
@@ -152,6 +140,9 @@ def save_evaluation_results(
         "final_train_num_samples": final_train_summary.get("num_samples"),
         "final_train_input_dim": final_train_summary.get("input_dim"),
         "final_train_seconds": final_train_summary.get("train_seconds"),
+        "final_train_loss": final_train_summary.get("final_loss"),
+        "tabm_k": final_train_summary.get("tabm_k"),
+        "weight_decay": final_train_summary.get("weight_decay"),
         "model_weights": str(final_output_path),
     }
 
@@ -169,7 +160,6 @@ def save_evaluation_results(
             {
                 "run_id": run_id,
                 "variation_name": variation_name,
-                "model_type": model_type,
                 "fold_index": fold["fold_index"],
                 "held_out_participant": fold["held_out_participant"],
                 "train_size": split.get("train_size"),
@@ -206,74 +196,18 @@ def save_evaluation_results(
         "evaluation_json": str(full_json_path),
         "summary_csv": str(summary_csv_path),
         "fold_metrics_csv": str(folds_csv_path),
-        "summary_row": summary_row,
     }
 
 
-def build_classifier(model_type: str, random_state: int = 0):
-    """Create one of the four classical hand-intent classifiers."""
-    if model_type == "logistic_regression":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "classifier",
-                    LogisticRegression(
-                        max_iter=5000,
-                        random_state=int(random_state),
-                    ),
-                ),
-            ]
-        )
-
-    if model_type == "linear_svm":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "classifier",
-                    SVC(
-                        kernel="linear",
-                        probability=True,
-                        random_state=int(random_state),
-                    ),
-                ),
-            ]
-        )
-
-    if model_type == "rbf_svm":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "classifier",
-                    SVC(
-                        kernel="rbf",
-                        probability=True,
-                        random_state=int(random_state),
-                    ),
-                ),
-            ]
-        )
-
-    if model_type == "xgboost":
-        return XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="logloss",
-            random_state=int(random_state),
-            n_jobs=-1,
-        )
-
-    raise ValueError(
-        f"Unsupported model_type={model_type}. "
-        f"Expected one of: {MODEL_TYPES}"
-    )
-
-
-def train_classifier(
+def train_tabm(
     rows,
-    model_type: str,
+    learning_rate: float = 2e-3,
+    weight_decay: float = 3e-4,
+    batch_size: int = 32,
+    epochs: int = 30,
+    k: int = 32,
     random_state: int = 0,
+    device: str = "auto",
     output_path=None,
 ):
     X, y, summary = rows_to_xy(rows)
@@ -281,42 +215,165 @@ def train_classifier(
     if X.ndim != 2:
         raise ValueError(f"Expected X to be 2D, got shape {X.shape}")
 
-    if len(np.unique(y)) < 2:
-        raise ValueError("Need both classes present in the training split.")
+    torch.manual_seed(int(random_state))
+    np.random.seed(int(random_state))
 
-    model = build_classifier(
-        model_type=model_type,
-        random_state=random_state,
+    if device == "auto":
+        resolved_device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    else:
+        resolved_device = torch.device(device)
+
+    model = HandIntentTabM(
+        input_size=int(X.shape[1]),
+        output_size=1,
+        k=int(k),
+    ).to(resolved_device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(learning_rate),
+        weight_decay=float(weight_decay),
     )
 
+    # TabM returns k independent logits per sample. Compute the BCE loss
+    # for every member prediction independently, then average the losses.
+    criterion = torch.nn.BCEWithLogitsLoss(reduction="mean")
+
+    x_tensor = torch.from_numpy(X.astype(np.float32))
+    y_tensor = torch.from_numpy(
+        y.astype(np.float32).reshape(-1, 1)
+    )
+
+    dataset = TensorDataset(x_tensor, y_tensor)
+    loader = DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=True,
+    )
+
+    loss_history = []
+    num_batches_per_epoch = len(loader)
     train_start = time.perf_counter()
-    model.fit(X, y)
-    train_seconds = float(time.perf_counter() - train_start)
+
+    model.train()
+
+    for epoch_index in range(int(epochs)):
+        print(
+            "Starting epoch",
+            epoch_index + 1,
+            "of",
+            int(epochs),
+        )
+
+        running_loss = 0.0
+        sample_count = 0
+
+        for xb, yb in loader:
+            xb = xb.to(resolved_device)
+            yb = yb.to(resolved_device)
+
+            optimizer.zero_grad()
+
+            logits = model(xb)
+
+            # Expected TabM shape: [batch, k, 1].
+            # Accept [batch, k] as well to make the trainer tolerant of
+            # a wrapper that squeezes the final output dimension.
+            if logits.ndim == 2:
+                logits = logits.unsqueeze(-1)
+
+            if logits.ndim != 3:
+                raise ValueError(
+                    "Expected TabM output with shape [batch, k, 1] "
+                    f"or [batch, k], got {tuple(logits.shape)}"
+                )
+
+            if logits.shape[-1] != 1:
+                raise ValueError(
+                    "Expected binary TabM output dimension 1, got "
+                    f"{logits.shape[-1]}"
+                )
+
+            targets = yb.unsqueeze(1).expand(
+                -1,
+                logits.shape[1],
+                -1,
+            )
+
+            loss = criterion(logits, targets)
+
+            loss.backward()
+            optimizer.step()
+
+            current_batch = int(xb.shape[0])
+            running_loss += (
+                float(loss.item()) * current_batch
+            )
+            sample_count += current_batch
+
+        epoch_loss = (
+            running_loss / max(sample_count, 1)
+        )
+        loss_history.append(epoch_loss)
+
+    train_seconds = float(
+        time.perf_counter() - train_start
+    )
 
     if output_path is not None:
         path_obj = Path(output_path)
-        path_obj.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(
+        path_obj.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        torch.save(
             {
-                "model_type": model_type,
+                "model_type": "tabm",
                 "input_dim": int(X.shape[1]),
+                "output_dim": 1,
+                "tabm_k": int(k),
+                "model_state_dict": model.state_dict(),
+                "learning_rate": float(learning_rate),
+                "weight_decay": float(weight_decay),
+                "batch_size": int(batch_size),
+                "epochs": int(epochs),
                 "random_state": int(random_state),
-                "model": model,
+                "device": str(resolved_device),
             },
             path_obj,
         )
 
     train_summary = {
         **summary,
-        "model_type": model_type,
+        "model_type": "tabm",
         "num_samples": int(X.shape[0]),
         "input_dim": int(X.shape[1]),
+        "epochs": int(epochs),
+        "batch_size": int(batch_size),
+        "learning_rate": float(learning_rate),
+        "weight_decay": float(weight_decay),
+        "tabm_k": int(k),
         "random_state": int(random_state),
+        "device": str(resolved_device),
+        "num_batches_per_epoch": int(
+            num_batches_per_epoch
+        ),
+        "total_optimizer_steps": int(
+            num_batches_per_epoch * int(epochs)
+        ),
         "train_seconds": train_seconds,
+        "final_loss": (
+            float(loss_history[-1])
+            if loss_history
+            else None
+        ),
+        "loss_history": loss_history,
     }
 
     return model, train_summary
-
 
 def compute_binary_metrics(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=np.int32)
@@ -360,28 +417,11 @@ def compute_binary_metrics(y_true, y_pred):
     }
 
 
-def get_positive_class_scores(model, X):
-    """Return P(class=1) for classifiers that expose predict_proba."""
-    probabilities = model.predict_proba(X)
-    classes = np.asarray(model.classes_)
-    positive_matches = np.where(classes == 1)[0]
-
-    if len(positive_matches) != 1:
-        raise ValueError(
-            f"Expected exactly one positive class labeled 1, got classes={classes.tolist()}"
-        )
-
-    return np.asarray(
-        probabilities[:, int(positive_matches[0])],
-        dtype=np.float64,
-    )
-
-
-def evaluate_classifier(
+def evaluate_tabm(
     model,
-    model_type: str,
     train_rows,
     test_rows,
+    device: str,
     threshold: float = 0.5,
 ):
     def participant_ids(rows):
@@ -399,23 +439,70 @@ def evaluate_classifier(
     X_test, y_test, test_summary = rows_to_xy(test_rows)
 
     if len(np.unique(y_train)) < 2:
-        raise ValueError("Need both classes present in the training split.")
+        raise ValueError(
+            "Need both classes present in the training split."
+        )
 
-    scores = get_positive_class_scores(model, X_test)
-    y_pred = (scores >= float(threshold)).astype(np.int32)
-    metrics = compute_binary_metrics(y_test, y_pred)
+    model.eval()
+
+    x_test_tensor = torch.from_numpy(
+        X_test.astype(np.float32)
+    ).to(torch.device(device))
+
+    with torch.no_grad():
+        logits = model(x_test_tensor)
+
+        if logits.ndim == 2:
+            logits = logits.unsqueeze(-1)
+
+        if logits.ndim != 3:
+            raise ValueError(
+                "Expected TabM output with shape [batch, k, 1] "
+                f"or [batch, k], got {tuple(logits.shape)}"
+            )
+
+        # For classification, average member probabilities rather than
+        # averaging logits first.
+        member_probabilities = torch.sigmoid(logits)
+
+        scores = (
+            member_probabilities
+            .mean(dim=1)
+            .squeeze(-1)
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+        )
+
+    y_pred = (
+        scores >= float(threshold)
+    ).astype(np.int32)
+
+    metrics = compute_binary_metrics(
+        y_test,
+        y_pred,
+    )
 
     evaluation = {
-        "model_name": model_type,
+        "model_name": "tabm",
         "train_summary": train_summary,
         "test_summary": test_summary,
         "split": {
             "train_size": int(len(train_rows)),
             "test_size_count": int(len(test_rows)),
-            "train_label_counts": train_summary["label_counts"],
-            "test_label_counts": test_summary["label_counts"],
-            "train_participants": participant_ids(train_rows),
-            "test_participants": participant_ids(test_rows),
+            "train_label_counts": train_summary[
+                "label_counts"
+            ],
+            "test_label_counts": test_summary[
+                "label_counts"
+            ],
+            "train_participants": participant_ids(
+                train_rows
+            ),
+            "test_participants": participant_ids(
+                test_rows
+            ),
         },
         "metrics": metrics,
         "y_true": y_test.tolist(),
@@ -425,115 +512,23 @@ def evaluate_classifier(
 
     return evaluation
 
-
-
-def export_xgboost_error_images(
-    *,
-    test_rows,
-    y_true,
-    y_pred,
-    scores,
-    held_out_participant,
-    error_images_dir,
-    use_crop: bool,
-):
-    """Copy misclassified XGBoost test images into error_images_dir."""
-    error_images_dir = Path(error_images_dir)
-    error_images_dir.mkdir(parents=True, exist_ok=True)
-
-    y_true = np.asarray(y_true, dtype=np.int32)
-    y_pred = np.asarray(y_pred, dtype=np.int32)
-    scores = np.asarray(scores, dtype=np.float64)
-
-    if not (
-        len(test_rows)
-        == len(y_true)
-        == len(y_pred)
-        == len(scores)
-    ):
-        raise ValueError(
-            "Cannot export XGBoost errors because test_rows, y_true, "
-            "y_pred, and scores have different lengths."
-        )
-
-    exported = 0
-
-    for row, true_label, predicted_label, score in zip(
-        test_rows,
-        y_true,
-        y_pred,
-        scores,
-    ):
-        if int(true_label) == int(predicted_label):
-            continue
-
-        original_image_path = Path(row["image"])
-
-        if use_crop:
-            crop_path = original_image_path.parent / "crop.png"
-            source_image_path = (
-                crop_path if crop_path.is_file() else original_image_path
-            )
-        else:
-            source_image_path = original_image_path
-
-        if not source_image_path.is_file():
-            print(
-                "WARNING: could not export misclassified image because "
-                f"the source file does not exist: {source_image_path}"
-            )
-            continue
-
-        error_type = (
-            "FP"
-            if int(true_label) == 0 and int(predicted_label) == 1
-            else "FN"
-        )
-
-        participant_component = sanitize_path_component(
-            held_out_participant
-        )
-        row_index = row.get("index", "unknown")
-        original_stem = sanitize_path_component(
-            original_image_path.stem
-        )
-        source_suffix = source_image_path.suffix or ".png"
-
-        output_name = (
-            f"participant-{participant_component}"
-            f"__{error_type}"
-            f"__true-{int(true_label)}"
-            f"__pred-{int(predicted_label)}"
-            f"__score-{float(score):.6f}"
-            f"__index-{row_index}"
-            f"__{original_stem}"
-            f"{source_suffix}"
-        )
-
-        shutil.copy2(
-            source_image_path,
-            error_images_dir / output_name,
-        )
-
-        exported += 1
-
-    return exported
-
-
 def leave_one_participant_out_evaluation(
     rows,
-    model_type: str,
+    learning_rate: float = 2e-3,
+    weight_decay: float = 3e-4,
+    batch_size: int = 32,
+    epochs: int = 30,
+    k: int = 32,
     random_state: int = 0,
+    device: str = "auto",
     threshold: float = 0.5,
-    error_images_dir=None,
-    use_crop_for_error_images: bool = False,
 ):
     """
     Perform leave-one-participant-out evaluation.
 
     For each fold:
         - Hold out one participant for testing.
-        - Train a new classifier from scratch on all other participants.
+        - Train a new TabM model from scratch on all other participants.
         - Evaluate on the held-out participant.
 
     Returns per-participant results and pooled metrics.
@@ -576,7 +571,7 @@ def leave_one_participant_out_evaluation(
 
     for fold_index, held_out_participant in enumerate(participants):
         print(
-            f"\n{model_type}: LOPO fold {fold_index + 1}/{len(participants)}: "
+            f"\nLOPO fold {fold_index + 1}/{len(participants)}: "
             f"holding out participant {held_out_participant}"
         )
 
@@ -603,44 +598,28 @@ def leave_one_participant_out_evaluation(
             )
 
         # Important: create and train a completely new model for every fold.
-        fold_model, train_summary = train_classifier(
+        fold_model, train_summary = train_tabm(
             train_rows,
-            model_type=model_type,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            epochs=epochs,
+            k=k,
             random_state=random_state + fold_index,
+            device=device,
             output_path=None,
         )
 
-        fold_evaluation = evaluate_classifier(
+        fold_evaluation = evaluate_tabm(
             model=fold_model,
-            model_type=model_type,
             train_rows=train_rows,
             test_rows=test_rows,
+            device=train_summary["device"],
             threshold=threshold,
         )
 
         fold_evaluation["fold_index"] = fold_index
         fold_evaluation["held_out_participant"] = held_out_participant
-        fold_evaluation["train_seconds"] = train_summary["train_seconds"]
-
-        if model_type == "xgboost" and error_images_dir is not None:
-            num_exported = export_xgboost_error_images(
-                test_rows=test_rows,
-                y_true=fold_evaluation["y_true"],
-                y_pred=fold_evaluation["y_pred"],
-                scores=fold_evaluation["scores"],
-                held_out_participant=held_out_participant,
-                error_images_dir=error_images_dir,
-                use_crop=bool(use_crop_for_error_images),
-            )
-
-            fold_evaluation["num_error_images_exported"] = int(
-                num_exported
-            )
-
-            print(
-                f"Exported {num_exported} XGBoost error images for "
-                f"participant {held_out_participant}"
-            )
 
         fold_results.append(fold_evaluation)
 
@@ -689,7 +668,6 @@ def leave_one_participant_out_evaluation(
 
     return {
         "evaluation_type": "leave_one_participant_out",
-        "model_type": model_type,
         "num_participants": len(participants),
         "participants": participants,
         "num_folds": len(fold_results),
@@ -705,33 +683,6 @@ def leave_one_participant_out_evaluation(
         "y_pred": all_y_pred,
         "scores": all_scores,
     }
-
-
-def save_comparison_summary(
-    *,
-    args,
-    variation_name,
-    summary_rows,
-):
-    """Save one compact CSV comparing all four model types."""
-    eval_root = (
-        Path(args.eval_output_dir)
-        if args.eval_output_dir is not None
-        else MODEL_IMPL_ROOT / "outputs" / "eval_results"
-    )
-    variation_dir = eval_root / sanitize_path_component(variation_name)
-    variation_dir.mkdir(parents=True, exist_ok=True)
-
-    comparison_path = variation_dir / "model_comparison_summary.csv"
-    with comparison_path.open("w", encoding="utf-8", newline="") as file_obj:
-        writer = csv.DictWriter(
-            file_obj,
-            fieldnames=list(summary_rows[0].keys()),
-        )
-        writer.writeheader()
-        writer.writerows(summary_rows)
-
-    return comparison_path
 
 
 def main():
@@ -752,42 +703,25 @@ def main():
     parser.add_argument("--hand",type=str,choices=["left", "right"],default=None,help="Filter to one hand",)
     parser.add_argument("--start-index",type=int,default=0,)
     parser.add_argument("--max-samples",type=int,default=None,)
-    parser.add_argument(
-        "--models",
-        nargs="+",
-        choices=MODEL_TYPES,
-        default=["xgboost"],
-        help=(
-            "One or more classical model types to train/evaluate. "
-            "Defaults to xgboost. Example: "
-            "--models xgboost rbf_svm"
-        ),
-    )
-    parser.add_argument("--model-random-state",type=int,default=0,)
+    parser.add_argument("--tabm-epochs",type=int,default=30,)
+    parser.add_argument("--tabm-batch-size",type=int,default=32,)
+    parser.add_argument("--tabm-learning-rate",type=float,default=2e-3,)
+    parser.add_argument("--tabm-weight-decay",type=float,default=3e-4,)
+    parser.add_argument("--tabm-k",type=int,default=32,)
+    parser.add_argument("--tabm-random-state",type=int,default=0,)
+    parser.add_argument("--tabm-output-path",type=str,default=None,)
     parser.add_argument("--decision-threshold",type=float,default=0.5,)
-    parser.add_argument(
-        "--model-output-dir",
-        type=str,
-        default=None,
-        help=(
-            "Root directory for final classical model files. Defaults to "
-            "MODEL_IMPL_ROOT/outputs/hand_intent_classical_models."
-        ),
-    )
     parser.add_argument(
         "--eval-output-dir",
         type=str,
         default=None,
         help=(
             "Root directory for evaluation files. Defaults to "
-            "MODEL_IMPL_ROOT/outputs/eval_results."
+            "MODEL_IMPL_ROOT/outputs/eval_results/tabm."
         ),
     )
 
     args = parser.parse_args()
-
-    # Preserve the user-specified order while removing duplicates.
-    selected_models = list(dict.fromkeys(args.models))
 
     run_started_at = datetime.now().astimezone()
     run_id = run_started_at.strftime("%Y%m%dT%H%M%S_%f%z")
@@ -837,6 +771,71 @@ def main():
         args=args,
     )
 
+    lopo_evaluation = leave_one_participant_out_evaluation(
+        rows=rows,
+        learning_rate=args.tabm_learning_rate,
+        weight_decay=args.tabm_weight_decay,
+        batch_size=args.tabm_batch_size,
+        epochs=args.tabm_epochs,
+        k=args.tabm_k,
+        random_state=args.tabm_random_state,
+        device="auto",
+        threshold=args.decision_threshold,
+    )
+
+    print("\nLeave-one-participant-out evaluation complete")
+
+    print(
+        "Pooled metrics:",
+        lopo_evaluation["pooled_metrics"],
+    )
+
+    print(
+        "Participant-level metric summary:",
+        lopo_evaluation["participant_metric_summary"],
+    )
+
+    for fold in lopo_evaluation["folds"]:
+        participant = fold["held_out_participant"]
+        metrics = fold["metrics"]
+
+        print(
+            f"Participant {participant}: "
+            f"accuracy={metrics['accuracy']:.4f}, "
+            f"balanced_accuracy={metrics['balanced_accuracy']}, "
+            f"precision={metrics['precision']}, "
+            f"recall={metrics['recall']}, "
+            f"f1={metrics['f1']:.4f}"
+        )
+
+    # Train one final deployment model using all available participants.
+    output_path = args.tabm_output_path
+    if output_path is None:
+        output_path = (
+            MODEL_IMPL_ROOT
+            / "outputs"
+            / "hand_intent_tabm"
+            / sanitize_path_component(variation_name)
+            / "TabM.pth"
+        )
+    else:
+        output_path = Path(output_path)
+
+    final_model, final_train_summary = train_tabm(
+        rows=rows,
+        learning_rate=args.tabm_learning_rate,
+        weight_decay=args.tabm_weight_decay,
+        batch_size=args.tabm_batch_size,
+        epochs=args.tabm_epochs,
+        k=args.tabm_k,
+        random_state=args.tabm_random_state,
+        device="auto",
+        output_path=output_path,
+    )
+
+    print(f"\nFinal TabM saved to: {output_path}")
+    print("Final training summary:", final_train_summary)
+
     dataset_summary = {
         "num_samples_after_discovery_filters_and_slicing": int(len(samples)),
         "num_rows_after_feature_organization": int(len(rows)),
@@ -852,170 +851,30 @@ def main():
         "max_samples": args.max_samples,
     }
 
-    if args.model_output_dir is None:
-        model_output_root = (
-            MODEL_IMPL_ROOT
-            / "outputs"
-            / "hand_intent_classical_models"
-        )
-    else:
-        model_output_root = Path(args.model_output_dir)
-
-    model_output_dir = (
-        model_output_root
-        / sanitize_path_component(variation_name)
-    )
-
-    all_results = {}
-    comparison_summary_rows = []
-
-    eval_root = (
-        Path(args.eval_output_dir)
-        if args.eval_output_dir is not None
-        else MODEL_IMPL_ROOT
-        / "outputs"
-        / "eval_results"
-        / "classical_models"
-    )
-
-    xgboost_error_images_dir = None
-
-    if "xgboost" in selected_models:
-        xgboost_error_images_dir = (
-            eval_root
-            / sanitize_path_component(variation_name)
-            / "xgboost"
-            / "error_images"
-        )
-
-        # Remove stale files from previous runs so this directory contains
-        # only the errors from the current XGBoost LOPO evaluation.
-        if xgboost_error_images_dir.exists():
-            shutil.rmtree(xgboost_error_images_dir)
-
-        xgboost_error_images_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-    print(
-        "Selected model types:",
-        ", ".join(selected_models),
-    )
-
-    for model_type in selected_models:
-        print("\n" + "=" * 80)
-        print(f"Training/evaluating model type: {model_type}")
-        print("=" * 80)
-
-        lopo_evaluation = leave_one_participant_out_evaluation(
-            rows=rows,
-            model_type=model_type,
-            random_state=args.model_random_state,
-            threshold=args.decision_threshold,
-            error_images_dir=(
-                xgboost_error_images_dir
-                if model_type == "xgboost"
-                else None
-            ),
-            use_crop_for_error_images=bool(
-                args.crop_around_object
-            ),
-        )
-
-        print(f"\n{model_type}: leave-one-participant-out evaluation complete")
-
-        print(
-            "Pooled metrics:",
-            lopo_evaluation["pooled_metrics"],
-        )
-
-        print(
-            "Participant-level metric summary:",
-            lopo_evaluation["participant_metric_summary"],
-        )
-
-        for fold in lopo_evaluation["folds"]:
-            participant = fold["held_out_participant"]
-            metrics = fold["metrics"]
-
-            print(
-                f"Participant {participant}: "
-                f"accuracy={metrics['accuracy']:.4f}, "
-                f"balanced_accuracy={metrics['balanced_accuracy']}, "
-                f"precision={metrics['precision']}, "
-                f"recall={metrics['recall']}, "
-                f"f1={metrics['f1']:.4f}"
-            )
-
-        # Train one final deployment model using all available participants.
-        output_path = model_output_dir / f"{model_type}.joblib"
-
-        final_model, final_train_summary = train_classifier(
-            rows=rows,
-            model_type=model_type,
-            random_state=args.model_random_state,
-            output_path=output_path,
-        )
-
-        print(f"\nFinal {model_type} model saved to: {output_path}")
-        print("Final training summary:", final_train_summary)
-
-        saved_eval_paths = save_evaluation_results(
-            model_type=model_type,
-            lopo_evaluation=lopo_evaluation,
-            final_train_summary=final_train_summary,
-            args=args,
-            run_id=run_id,
-            variation_name=variation_name,
-            run_started_at=run_started_at,
-            final_output_path=output_path,
-            dataset_root=dataset_root,
-            dataset_summary=dataset_summary,
-        )
-
-        print(f"Evaluation results saved to: {saved_eval_paths['evaluation_dir']}")
-        print(f"  Full JSON: {saved_eval_paths['evaluation_json']}")
-        print(f"  Summary CSV: {saved_eval_paths['summary_csv']}")
-        print(f"  Fold metrics CSV: {saved_eval_paths['fold_metrics_csv']}")
-
-        print("FINAL LOPO POOLED BALANCE ACCURACY:", lopo_evaluation["pooled_metrics"]["balanced_accuracy"])
-
-        if (
-            model_type == "xgboost"
-            and xgboost_error_images_dir is not None
-        ):
-            print(
-                "  XGBoost error images: "
-                f"{xgboost_error_images_dir}"
-            )
-
-        comparison_summary_rows.append(saved_eval_paths["summary_row"])
-
-        all_results[model_type] = {
-            "lopo_evaluation": lopo_evaluation,
-            "final_train_summary": final_train_summary,
-            "final_output_path": str(output_path),
-            "saved_eval_paths": saved_eval_paths,
-            "error_images_dir": (
-                str(xgboost_error_images_dir)
-                if model_type == "xgboost"
-                else None
-            ),
-        }
-
-    comparison_summary_path = save_comparison_summary(
+    saved_eval_paths = save_evaluation_results(
+        lopo_evaluation=lopo_evaluation,
+        final_train_summary=final_train_summary,
         args=args,
+        run_id=run_id,
         variation_name=variation_name,
-        summary_rows=comparison_summary_rows,
+        run_started_at=run_started_at,
+        final_output_path=output_path,
+        dataset_root=dataset_root,
+        dataset_summary=dataset_summary,
     )
 
-    print(f"\nCombined model comparison saved to: {comparison_summary_path}")
+    print(f"Evaluation results saved to: {saved_eval_paths['evaluation_dir']}")
+    print(f"  Full JSON: {saved_eval_paths['evaluation_json']}")
+    print(f"  Summary CSV: {saved_eval_paths['summary_csv']}")
+    print(f"  Fold metrics CSV: {saved_eval_paths['fold_metrics_csv']}")
+
+    print("FINAL LOPO POOLED BALANCE ACCURACY:", lopo_evaluation["pooled_metrics"]["balanced_accuracy"])
 
     return {
-        "models": all_results,
-        "selected_models": selected_models,
-        "comparison_summary_csv": str(comparison_summary_path),
+        "lopo_evaluation": lopo_evaluation,
+        "final_train_summary": final_train_summary,
+        "final_output_path": str(output_path),
+        "saved_eval_paths": saved_eval_paths,
         "run_id": run_id,
         "variation_name": variation_name,
     }
@@ -1023,3 +882,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

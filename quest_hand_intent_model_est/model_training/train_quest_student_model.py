@@ -9,9 +9,12 @@ import json
 import math
 import re
 import time
+import importlib
+import joblib
 from datetime import datetime
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+from xgboost import XGBRegressor
 
 from model_training_and_implementation.src.dino_detector import DINOObjectDetector
 from model_training_and_implementation.src.rtmpose_keypoints import RTMPoseKeypointDetector
@@ -26,6 +29,7 @@ from quest_hand_intent_model_est.src.quest_joint_features import extract_quest_j
 
 TEACHER_FEATURES_TYPE = ["keypoints","keypoints_headpose","keypoints_headpose_dino","keypoints_resnet","keypoints_headpose_resnet"]
 STUDENT_FEATURES_TYPE = ["keypoints","keypoints_projections","keypoints_resnet"]
+MODEL_TYPES = ["mlp", "xgboost", "tabm"]
 
 
 MODEL_IMPL_ROOT = Path(__file__).resolve().parents[1]
@@ -59,17 +63,17 @@ def sanitize_path_component(value):
 
 
 def build_model_variation_name(args):
-    """Build a descriptive name for the feature/model configuration."""
+    """Build a descriptive name for the teacher/student configuration."""
     parts = [
+        f"model-{args.model_type}",
         f"teacher_features-{args.teacher_features_type}",
         f"student_features-{args.student_features_type}",
-        f"logit_weight-{args.mlp_logit_loss_weight}",
-        f"hidden_weight-{args.mlp_hidden_loss_weight}",
+        f"logit_weight-{args.logit_loss_weight}",
+        f"hidden_weight-{args.hidden_loss_weight}",
         f"crop-{args.crop_around_object}",
         f"rotations-{args.include_quest_joint_rotations}",
     ]
     return "__".join(sanitize_path_component(part) for part in parts)
-
 
 def metric_value(metrics, key):
     if metrics is None:
@@ -94,7 +98,7 @@ def save_evaluation_results(
     eval_root = (
         Path(args.eval_output_dir)
         if args.eval_output_dir is not None
-        else MODEL_IMPL_ROOT / "outputs" / "eval_results"
+        else MODEL_IMPL_ROOT / "outputs" / "eval_results" / args.model_type
     )
     run_dir = eval_root / sanitize_path_component(variation_name) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -138,6 +142,9 @@ def save_evaluation_results(
     summary_row = {
         "run_id": run_id,
         "variation_name": variation_name,
+        "model_type": args.model_type,
+        "teacher_model_type": args.model_type,
+        "student_model_type": args.model_type,
         "num_participants": lopo_evaluation["num_participants"],
         "num_folds": lopo_evaluation["num_folds"],
         "include_rotations": lopo_evaluation["include_rotations"],
@@ -235,19 +242,31 @@ def save_evaluation_results(
     }
 
 
-def get_model_input_dim(model):
-    """Return the input size expected by the model's first Linear layer."""
+def get_model_input_dim(model, model_type="mlp"):
+    """Return the expected input feature count for any supported student."""
+    model_type = str(model_type).lower()
+
+    if model_type == "xgboost":
+        if hasattr(model, "n_features_in_"):
+            return int(model.n_features_in_)
+        raise ValueError("Could not determine XGBoost input dimension.")
+
+    if hasattr(model, "input_size"):
+        return int(model.input_size)
+    if hasattr(model, "input_dim"):
+        return int(model.input_dim)
+
     for module in model.modules():
         if isinstance(module, torch.nn.Linear):
             return int(module.in_features)
 
-    raise ValueError("Could not find a Linear layer in the model.")
-
-
+    raise ValueError(
+        f"Could not determine input dimension for model_type={model_type}."
+    )
 
 
 def get_final_linear_layer(model):
-    """Return the model's final Linear layer."""
+    """Return the model's final Linear layer (MLP hidden distillation only)."""
     linear_layers = [
         module
         for module in model.modules()
@@ -260,20 +279,17 @@ def get_final_linear_layer(model):
 
 def forward_with_penultimate_hidden(model, features):
     """
-    Run a model and also return the hidden representation immediately before
-    its final Linear output layer.
+    Run an MLP and capture the representation entering its final Linear layer.
 
-    This uses a temporary forward-pre-hook, so neither the teacher nor student
-    model architecture needs to be changed.
+    This is intentionally used only for the MLP -> MLP experiment. TabM has an
+    ensemble dimension and XGBoost has no neural hidden representation.
     """
     captured = {}
     final_linear = get_final_linear_layer(model)
 
     def capture_hidden(module, inputs):
         if not inputs:
-            raise RuntimeError(
-                "Final Linear layer received no positional input."
-            )
+            raise RuntimeError("Final Linear layer received no positional input.")
         captured["hidden"] = inputs[0]
 
     handle = final_linear.register_forward_pre_hook(capture_hidden)
@@ -290,14 +306,167 @@ def forward_with_penultimate_hidden(model, features):
     return output, captured["hidden"]
 
 
-def construct_quest_training_data(rows, old_model, device="auto", include_rotations=False, student_features_type="keypoints"):
+def _import_first_class(candidates):
+    """Import the first available (module, class) pair."""
+    errors = []
+    for module_name, class_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+            return getattr(module, class_name)
+        except Exception as exc:
+            errors.append(f"{module_name}.{class_name}: {exc}")
+
+    raise ImportError(
+        "Could not import a compatible TabM class. Tried:\n  "
+        + "\n  ".join(errors)
+    )
+
+
+def get_teacher_tabm_class():
+    return _import_first_class(
+        [
+            (
+                "model_training_and_implementation.src.hand_intent_tabm",
+                "HandIntentTabM",
+            ),
+        ]
+    )
+
+
+def get_quest_tabm_class():
+    # The first entry matches the filename/class name described for this
+    # experiment. The fallbacks make the trainer tolerant of snake_case module
+    # naming or an "Estimator" class spelling.
+    return _import_first_class(
+        [
+            (
+                "quest_hand_intent_model_est.src.QuestHandIntentEstTabM",
+                "QuestHandIntentEstTabM",
+            ),
+            (
+                "quest_hand_intent_model_est.src.quest_hand_intent_est_tabm",
+                "QuestHandIntentEstTabM",
+            ),
+            (
+                "quest_hand_intent_model_est.src.quest_hand_intent_est_tabm",
+                "QuestHandIntentEstimatorTabM",
+            ),
+        ]
+    )
+
+
+def tabm_logits_to_probabilities(logits):
+    """Convert TabM [B,k,1] logits to one probability per sample."""
+    if logits.ndim == 2:
+        logits = logits.unsqueeze(-1)
+
+    if logits.ndim != 3 or logits.shape[-1] != 1:
+        raise ValueError(
+            "Expected TabM logits with shape [batch, k, 1] or [batch, k], "
+            f"got {tuple(logits.shape)}"
+        )
+
+    return torch.sigmoid(logits).mean(dim=1).reshape(-1, 1)
+
+
+def predict_model_scores(model, model_type, X, device="auto"):
+    """Return one probability-like score in [0,1] for every row in X."""
+    model_type = str(model_type).lower()
+    X = np.asarray(X, dtype=np.float32)
+
+    if model_type == "xgboost":
+        # Teacher XGBoost is a classifier and exposes predict_proba. The Quest
+        # student is trained as a regressor on the teacher's soft probability.
+        if hasattr(model, "predict_proba"):
+            scores = np.asarray(model.predict_proba(X), dtype=np.float32)[:, 1]
+        else:
+            scores = np.asarray(model.predict(X), dtype=np.float32).reshape(-1)
+        return np.clip(scores, 0.0, 1.0).reshape(-1, 1).astype(np.float32)
+
+    if device == "auto":
+        resolved_device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    else:
+        resolved_device = torch.device(device)
+
+    model = model.to(resolved_device)
+    model.eval()
+    x_tensor = torch.from_numpy(X).to(resolved_device)
+
+    with torch.no_grad():
+        output = model(x_tensor)
+        if model_type == "mlp":
+            probabilities = output.reshape(-1, 1)
+        elif model_type == "tabm":
+            probabilities = tabm_logits_to_probabilities(output)
+        else:
+            raise ValueError(f"Unsupported model_type={model_type}")
+
+    return (
+        probabilities.detach().cpu().numpy().astype(np.float32).reshape(-1, 1)
+    )
+
+
+def load_teacher_model(model_type, weights_path):
+    """Load one of the three teacher model types."""
+    model_type = str(model_type).lower()
+    weights_path = Path(weights_path)
+
+    if model_type == "mlp":
+        checkpoint = torch.load(
+            weights_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        model = HandIntentMLP(
+            input_size=int(checkpoint["input_dim"]),
+            output_size=1,
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        return model
+
+    if model_type == "tabm":
+        checkpoint = torch.load(
+            weights_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        TeacherTabM = get_teacher_tabm_class()
+        model = TeacherTabM(
+            input_size=int(checkpoint["input_dim"]),
+            output_size=1,
+            k=int(checkpoint.get("tabm_k", 32)),
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        return model
+
+    if model_type == "xgboost":
+        payload = joblib.load(weights_path)
+        if isinstance(payload, dict) and "model" in payload:
+            return payload["model"]
+        return payload
+
+    raise ValueError(f"Unsupported model_type={model_type}")
+
+
+def construct_quest_training_data(
+    rows,
+    teacher_model,
+    teacher_model_type="mlp",
+    device="auto",
+    include_rotations=False,
+    student_features_type="keypoints",
+):
     """
-    Construct aligned Quest inputs and teacher-model targets.
+    Construct aligned Quest inputs and teacher soft targets.
 
     Returns:
         X_quest: Quest joint features, shape (N, D_quest)
         y_teacher: teacher probabilities, shape (N, 1)
-        h_teacher: teacher penultimate hidden representations, shape (N, H)
+        h_teacher: MLP teacher hidden states, or None for TabM/XGBoost
         usable_rows: rows corresponding exactly to those N samples
     """
     if device == "auto":
@@ -307,44 +476,59 @@ def construct_quest_training_data(rows, old_model, device="auto", include_rotati
     else:
         resolved_device = torch.device(device)
 
-    resnet_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
-
-    old_model = old_model.to(resolved_device)
-    old_model.eval()
+    resnet_encoder = ResNet18ImageEncoder(
+        pretrained=True,
+        device="cuda",
+        l2_normalize=True,
+    )
 
     quest_feature_vectors = []
-    old_model_feature_vectors = []
+    teacher_feature_vectors = []
     usable_rows = []
 
     for row in rows:
         json_path = row.get("quest_joints_pth")
-        old_features = row.get("feature_vector")
+        teacher_features = row.get("feature_vector")
 
         if json_path is None:
             print("Skipping row: missing quest_joints_pth")
             continue
 
-        if old_features is None:
-            print(f"Skipping {json_path}: missing old model feature_vector")
+        if teacher_features is None:
+            print(f"Skipping {json_path}: missing teacher feature_vector")
             continue
 
         try:
             quest_features = np.asarray(
-                extract_quest_joint_features(json_path, include_rotations=include_rotations),
+                extract_quest_joint_features(
+                    json_path,
+                    include_rotations=include_rotations,
+                ),
                 dtype=np.float32,
             )
 
-            if(student_features_type == "keypoints_projections"):
-                proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(quest_features)
-                quest_features = np.concatenate([quest_features, proj_joints], axis=0)
-            elif(student_features_type == "keypoints_resnet"):
-                proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(quest_features)
+            if student_features_type == "keypoints_projections":
+                proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(
+                    quest_features
+                )
+                quest_features = np.concatenate(
+                    [quest_features, proj_joints], axis=0
+                )
+            elif student_features_type == "keypoints_resnet":
+                proj_joints, pose_img = construct_pose_img_from_joint_feature_vector(
+                    quest_features
+                )
                 resnet_embedding = resnet_encoder.predict(pose_img)["embedding"]
-                quest_features = np.concatenate([quest_features, resnet_embedding.flatten().astype(np.float32)], axis=0)
-                               
+                quest_features = np.concatenate(
+                    [
+                        quest_features,
+                        resnet_embedding.flatten().astype(np.float32),
+                    ],
+                    axis=0,
+                )
 
             teacher_features = np.asarray(
-                old_features,
+                teacher_features,
                 dtype=np.float32,
             )
 
@@ -355,11 +539,12 @@ def construct_quest_training_data(rows, old_model, device="auto", include_rotati
 
             if teacher_features.ndim != 1:
                 raise ValueError(
-                    f"Teacher feature vector must be 1D, got {teacher_features.shape}"
+                    "Teacher feature vector must be 1D, "
+                    f"got {teacher_features.shape}"
                 )
 
             quest_feature_vectors.append(quest_features)
-            old_model_feature_vectors.append(teacher_features)
+            teacher_feature_vectors.append(teacher_features)
             usable_rows.append(row)
 
         except Exception as error:
@@ -369,40 +554,37 @@ def construct_quest_training_data(rows, old_model, device="auto", include_rotati
         raise ValueError("No usable Quest samples were found.")
 
     X_quest = np.stack(quest_feature_vectors).astype(np.float32)
-    X_old = np.stack(old_model_feature_vectors).astype(np.float32)
+    X_teacher = np.stack(teacher_feature_vectors).astype(np.float32)
 
-    old_input_tensor = torch.from_numpy(X_old).to(resolved_device)
+    y_teacher = predict_model_scores(
+        teacher_model,
+        teacher_model_type,
+        X_teacher,
+        device=str(resolved_device),
+    )
 
-    with torch.no_grad():
-        teacher_output, teacher_hidden = forward_with_penultimate_hidden(
-            old_model,
-            old_input_tensor,
-        )
-        y_teacher = (
-            teacher_output
-            .detach()
-            .cpu()
-            .numpy()
-            .reshape(-1, 1)
-            .astype(np.float32)
-        )
+    h_teacher = None
+    if str(teacher_model_type).lower() == "mlp":
+        teacher_model = teacher_model.to(resolved_device)
+        teacher_model.eval()
+        teacher_tensor = torch.from_numpy(X_teacher).to(resolved_device)
+        with torch.no_grad():
+            _, teacher_hidden = forward_with_penultimate_hidden(
+                teacher_model,
+                teacher_tensor,
+            )
         h_teacher = (
-            teacher_hidden
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
+            teacher_hidden.detach().cpu().numpy().astype(np.float32)
         )
 
     return X_quest, y_teacher, h_teacher, usable_rows
-
-    
 
 
 def train_quest_student_mlp(
     rows,
     teacher_model,
-    student_features_type:str = "keypoints",
+    teacher_model_type="mlp",
+    student_features_type="keypoints",
     learning_rate: float = 1e-3,
     logit_loss_weight: float = 1.0,
     hidden_loss_weight: float = 0.1,
@@ -414,7 +596,9 @@ def train_quest_student_mlp(
     include_rotations: bool = False,
     output_path=None,
 ):
-    # Resolve the device used by the student model and training batches.
+    if str(teacher_model_type).lower() != "mlp":
+        raise ValueError("MLP student mode expects an MLP teacher.")
+
     if device == "auto":
         resolved_device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -423,61 +607,28 @@ def train_quest_student_mlp(
         resolved_device = torch.device(device)
 
     torch.manual_seed(int(random_state))
+    np.random.seed(int(random_state))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(random_state))
 
-    # X contains shoulder-centered Quest joint features.
-    # y contains the teacher model's soft probability for each aligned sample.
-    # teacher_hidden contains the teacher's penultimate hidden representation.
     X, y, teacher_hidden, usable_rows = construct_quest_training_data(
         rows=rows,
-        old_model=teacher_model,
+        teacher_model=teacher_model,
+        teacher_model_type=teacher_model_type,
         device=str(resolved_device),
         include_rotations=include_rotations,
         student_features_type=student_features_type,
     )
 
-    if X.ndim != 2:
-        raise ValueError(f"Expected X to be 2D, got shape {X.shape}")
-
-    if y.ndim != 2 or y.shape[1] != 1:
-        raise ValueError(
-            f"Expected teacher targets with shape (N, 1), got {y.shape}"
-        )
-
-    if len(X) != len(y):
-        raise ValueError(
-            f"Quest inputs and teacher targets are misaligned: "
-            f"{len(X)} != {len(y)}"
-        )
-
-    if teacher_hidden.ndim != 2:
-        raise ValueError(
-            "Expected teacher hidden targets to be 2D, "
-            f"got shape {teacher_hidden.shape}"
-        )
-    if len(X) != len(teacher_hidden):
-        raise ValueError(
-            "Quest inputs and teacher hidden targets are misaligned: "
-            f"{len(X)} != {len(teacher_hidden)}"
-        )
+    if teacher_hidden is None:
+        raise ValueError("MLP hidden-state distillation requires MLP teacher hidden states.")
 
     x_tensor = torch.from_numpy(X.astype(np.float32))
     y_tensor = torch.from_numpy(y.astype(np.float32))
-    teacher_hidden_tensor = torch.from_numpy(
-        teacher_hidden.astype(np.float32)
-    )
+    teacher_hidden_tensor = torch.from_numpy(teacher_hidden.astype(np.float32))
 
-    dataset = TensorDataset(
-        x_tensor,
-        y_tensor,
-        teacher_hidden_tensor,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=int(batch_size),
-        shuffle=True,
-    )
+    dataset = TensorDataset(x_tensor, y_tensor, teacher_hidden_tensor)
+    loader = DataLoader(dataset, batch_size=int(batch_size), shuffle=True)
 
     student_model = QuestHandIntentEstimatorMLP(
         input_size=int(X.shape[1]),
@@ -485,15 +636,11 @@ def train_quest_student_mlp(
     ).to(resolved_device)
 
     teacher_hidden_dim = int(teacher_hidden.shape[1])
-    student_hidden_dim = int(
-        get_final_linear_layer(student_model).in_features
-    )
+    student_hidden_dim = int(get_final_linear_layer(student_model).in_features)
 
     if student_hidden_dim == teacher_hidden_dim:
         hidden_adapter = torch.nn.Identity().to(resolved_device)
     else:
-        # Training-only projection used only if the teacher and student hidden
-        # widths differ. It is not needed or saved for runtime inference.
         hidden_adapter = torch.nn.Linear(
             student_hidden_dim,
             teacher_hidden_dim,
@@ -501,16 +648,10 @@ def train_quest_student_mlp(
         ).to(resolved_device)
 
     optimizer = torch.optim.Adam(
-        list(student_model.parameters())
-        + list(hidden_adapter.parameters()),
+        list(student_model.parameters()) + list(hidden_adapter.parameters()),
         lr=float(learning_rate),
     )
 
-    # The student and teacher both return sigmoid probabilities. Keep the
-    # original soft-target BCE loss, and additionally match the corresponding
-    # logits. torch.logit(sigmoid(z)) recovers z (up to the small clamp used
-    # below for numerical stability), so this adds logit-level distillation
-    # without changing either model architecture.
     probability_criterion = torch.nn.BCELoss()
     logit_criterion = torch.nn.SmoothL1Loss()
     hidden_criterion = torch.nn.SmoothL1Loss()
@@ -559,16 +700,10 @@ def train_quest_student_mlp(
                     1.0 - logit_epsilon,
                 )
             )
-            logit_loss = logit_criterion(
-                student_logits,
-                teacher_logits,
-            )
+            logit_loss = logit_criterion(student_logits, teacher_logits)
 
             projected_student_hidden = hidden_adapter(student_hidden)
-            hidden_loss = hidden_criterion(
-                projected_student_hidden,
-                hb,
-            )
+            hidden_loss = hidden_criterion(projected_student_hidden, hb)
 
             loss = (
                 probability_loss
@@ -584,18 +719,12 @@ def train_quest_student_mlp(
             running_probability_loss += (
                 float(probability_loss.item()) * current_batch_size
             )
-            running_logit_loss += (
-                float(logit_loss.item()) * current_batch_size
-            )
-            running_hidden_loss += (
-                float(hidden_loss.item()) * current_batch_size
-            )
+            running_logit_loss += float(logit_loss.item()) * current_batch_size
+            running_hidden_loss += float(hidden_loss.item()) * current_batch_size
             sample_count += current_batch_size
 
         epoch_loss = running_loss / max(sample_count, 1)
-        epoch_probability_loss = (
-            running_probability_loss / max(sample_count, 1)
-        )
+        epoch_probability_loss = running_probability_loss / max(sample_count, 1)
         epoch_logit_loss = running_logit_loss / max(sample_count, 1)
         epoch_hidden_loss = running_hidden_loss / max(sample_count, 1)
 
@@ -614,18 +743,12 @@ def train_quest_student_mlp(
 
     train_seconds = float(time.perf_counter() - train_start)
 
-    # Measure how closely the trained student reproduces the teacher
-    # on the data supplied to this function.
-    student_model.eval()
-    with torch.no_grad():
-        student_scores = (
-            student_model(x_tensor.to(resolved_device))
-            .detach()
-            .cpu()
-            .numpy()
-            .reshape(-1)
-        )
-
+    student_scores = predict_model_scores(
+        student_model,
+        "mlp",
+        X,
+        device=str(resolved_device),
+    ).reshape(-1)
     teacher_scores = y.reshape(-1)
 
     teacher_student_agreement = float(
@@ -634,12 +757,10 @@ def train_quest_student_mlp(
             == (teacher_scores >= float(threshold))
         )
     )
-
-    probability_mae = float(
-        np.mean(np.abs(student_scores - teacher_scores))
-    )
+    probability_mae = float(np.mean(np.abs(student_scores - teacher_scores)))
 
     train_summary = {
+        "model_type": "mlp",
         "num_samples": int(len(X)),
         "input_dim": int(X.shape[1]),
         "target_shape": tuple(y.shape),
@@ -654,11 +775,7 @@ def train_quest_student_mlp(
         "device": str(resolved_device),
         "num_batches_per_epoch": int(len(loader)),
         "train_seconds": train_seconds,
-        "final_loss": (
-            float(loss_history[-1])
-            if loss_history
-            else None
-        ),
+        "final_loss": float(loss_history[-1]) if loss_history else None,
         "loss_history": loss_history,
         "probability_loss_history": probability_loss_history,
         "logit_loss_history": logit_loss_history,
@@ -680,9 +797,9 @@ def train_quest_student_mlp(
     if output_path is not None:
         path_obj = Path(output_path)
         path_obj.parent.mkdir(parents=True, exist_ok=True)
-
         torch.save(
             {
+                "model_type": "mlp",
                 "input_dim": int(X.shape[1]),
                 "model_state_dict": student_model.state_dict(),
                 "joint_order": list(QUEST_JOINT_ORDER),
@@ -702,11 +819,425 @@ def train_quest_student_mlp(
             },
             path_obj,
         )
-
         print(f"Saved Quest student MLP to: {path_obj}")
 
     return student_model, train_summary
 
+
+def train_quest_student_tabm(
+    rows,
+    teacher_model,
+    teacher_model_type="tabm",
+    student_features_type="keypoints",
+    learning_rate: float = 2e-3,
+    weight_decay: float = 3e-4,
+    logit_loss_weight: float = 1.0,
+    batch_size: int = 32,
+    epochs: int = 30,
+    k: int = 32,
+    random_state: int = 0,
+    device: str = "auto",
+    threshold: float = 0.5,
+    include_rotations: bool = False,
+    output_path=None,
+):
+    if str(teacher_model_type).lower() != "tabm":
+        raise ValueError("TabM student mode expects a TabM teacher.")
+
+    if device == "auto":
+        resolved_device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+    else:
+        resolved_device = torch.device(device)
+
+    torch.manual_seed(int(random_state))
+    np.random.seed(int(random_state))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(random_state))
+
+    X, y, _, usable_rows = construct_quest_training_data(
+        rows=rows,
+        teacher_model=teacher_model,
+        teacher_model_type=teacher_model_type,
+        device=str(resolved_device),
+        include_rotations=include_rotations,
+        student_features_type=student_features_type,
+    )
+
+    QuestTabM = get_quest_tabm_class()
+    student_model = QuestTabM(
+        input_size=int(X.shape[1]),
+        output_size=1,
+        k=int(k),
+    ).to(resolved_device)
+
+    optimizer = torch.optim.AdamW(
+        student_model.parameters(),
+        lr=float(learning_rate),
+        weight_decay=float(weight_decay),
+    )
+    probability_criterion = torch.nn.BCEWithLogitsLoss(reduction="mean")
+    logit_criterion = torch.nn.SmoothL1Loss()
+    logit_epsilon = 1e-6
+
+    x_tensor = torch.from_numpy(X.astype(np.float32))
+    y_tensor = torch.from_numpy(y.astype(np.float32))
+    loader = DataLoader(
+        TensorDataset(x_tensor, y_tensor),
+        batch_size=int(batch_size),
+        shuffle=True,
+    )
+
+    loss_history = []
+    probability_loss_history = []
+    logit_loss_history = []
+    train_start = time.perf_counter()
+    student_model.train()
+
+    for epoch in range(int(epochs)):
+        running_loss = 0.0
+        running_probability_loss = 0.0
+        running_logit_loss = 0.0
+        sample_count = 0
+
+        for xb, yb in loader:
+            xb = xb.to(resolved_device)
+            yb = yb.to(resolved_device)
+            optimizer.zero_grad()
+
+            member_logits = student_model(xb)
+            if member_logits.ndim == 2:
+                member_logits = member_logits.unsqueeze(-1)
+            if member_logits.ndim != 3 or member_logits.shape[-1] != 1:
+                raise ValueError(
+                    "Quest TabM must return [batch,k,1] logits; got "
+                    f"{tuple(member_logits.shape)}"
+                )
+
+            expanded_targets = yb.unsqueeze(1).expand(
+                -1,
+                member_logits.shape[1],
+                -1,
+            )
+            probability_loss = probability_criterion(
+                member_logits,
+                expanded_targets,
+            )
+
+            student_probabilities = tabm_logits_to_probabilities(member_logits)
+            teacher_logits = torch.logit(
+                yb.clamp(logit_epsilon, 1.0 - logit_epsilon)
+            )
+            student_logits = torch.logit(
+                student_probabilities.clamp(
+                    logit_epsilon,
+                    1.0 - logit_epsilon,
+                )
+            )
+            logit_loss = logit_criterion(student_logits, teacher_logits)
+            loss = probability_loss + float(logit_loss_weight) * logit_loss
+
+            loss.backward()
+            optimizer.step()
+
+            current_batch_size = int(xb.shape[0])
+            running_loss += float(loss.item()) * current_batch_size
+            running_probability_loss += (
+                float(probability_loss.item()) * current_batch_size
+            )
+            running_logit_loss += float(logit_loss.item()) * current_batch_size
+            sample_count += current_batch_size
+
+        epoch_loss = running_loss / max(sample_count, 1)
+        epoch_probability_loss = running_probability_loss / max(sample_count, 1)
+        epoch_logit_loss = running_logit_loss / max(sample_count, 1)
+        loss_history.append(epoch_loss)
+        probability_loss_history.append(epoch_probability_loss)
+        logit_loss_history.append(epoch_logit_loss)
+
+        print(
+            f"Epoch {epoch + 1}/{epochs}: "
+            f"distillation_loss={epoch_loss:.6f}, "
+            f"member_soft_bce={epoch_probability_loss:.6f}, "
+            f"ensemble_logit_loss={epoch_logit_loss:.6f}"
+        )
+
+    train_seconds = float(time.perf_counter() - train_start)
+    student_scores = predict_model_scores(
+        student_model,
+        "tabm",
+        X,
+        device=str(resolved_device),
+    ).reshape(-1)
+    teacher_scores = y.reshape(-1)
+
+    teacher_student_agreement = float(
+        np.mean(
+            (student_scores >= float(threshold))
+            == (teacher_scores >= float(threshold))
+        )
+    )
+    probability_mae = float(np.mean(np.abs(student_scores - teacher_scores)))
+
+    train_summary = {
+        "model_type": "tabm",
+        "num_samples": int(len(X)),
+        "input_dim": int(X.shape[1]),
+        "target_shape": tuple(y.shape),
+        "epochs": int(epochs),
+        "batch_size": int(batch_size),
+        "learning_rate": float(learning_rate),
+        "weight_decay": float(weight_decay),
+        "tabm_k": int(k),
+        "logit_loss_weight": float(logit_loss_weight),
+        "hidden_loss_weight": 0.0,
+        "hidden_distillation_used": False,
+        "random_state": int(random_state),
+        "device": str(resolved_device),
+        "num_batches_per_epoch": int(len(loader)),
+        "train_seconds": train_seconds,
+        "final_loss": float(loss_history[-1]) if loss_history else None,
+        "loss_history": loss_history,
+        "probability_loss_history": probability_loss_history,
+        "logit_loss_history": logit_loss_history,
+        "teacher_student_agreement": teacher_student_agreement,
+        "probability_mae": probability_mae,
+        "threshold": float(threshold),
+        "include_rotations": bool(include_rotations),
+        "features_per_joint": 7 if include_rotations else 3,
+        "participants": sorted(
+            {
+                str(row["participant_id"])
+                for row in usable_rows
+                if row.get("participant_id") is not None
+            }
+        ),
+    }
+
+    if output_path is not None:
+        path_obj = Path(output_path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_type": "tabm",
+                "input_dim": int(X.shape[1]),
+                "output_dim": 1,
+                "tabm_k": int(k),
+                "model_state_dict": student_model.state_dict(),
+                "joint_order": list(QUEST_JOINT_ORDER),
+                "shoulder_centered": True,
+                "include_rotations": bool(include_rotations),
+                "features_per_joint": 7 if include_rotations else 3,
+                "target_type": "teacher_soft_probability_and_logit",
+                "learning_rate": float(learning_rate),
+                "weight_decay": float(weight_decay),
+                "logit_loss_weight": float(logit_loss_weight),
+                "batch_size": int(batch_size),
+                "epochs": int(epochs),
+                "random_state": int(random_state),
+                "threshold": float(threshold),
+            },
+            path_obj,
+        )
+        print(f"Saved Quest student TabM to: {path_obj}")
+
+    return student_model, train_summary
+
+
+def train_quest_student_xgboost(
+    rows,
+    teacher_model,
+    teacher_model_type="xgboost",
+    student_features_type="keypoints",
+    random_state: int = 0,
+    device: str = "auto",
+    threshold: float = 0.5,
+    include_rotations: bool = False,
+    output_path=None,
+):
+    if str(teacher_model_type).lower() != "xgboost":
+        raise ValueError("XGBoost student mode expects an XGBoost teacher.")
+
+    X, y, _, usable_rows = construct_quest_training_data(
+        rows=rows,
+        teacher_model=teacher_model,
+        teacher_model_type=teacher_model_type,
+        device=device,
+        include_rotations=include_rotations,
+        student_features_type=student_features_type,
+    )
+
+    # Distillation target is continuous teacher probability, so the Quest
+    # XGBoost student is a regressor rather than a hard-label classifier.
+    student_model = XGBRegressor(
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        random_state=int(random_state),
+        n_jobs=-1,
+    )
+
+    train_start = time.perf_counter()
+    student_model.fit(X, y.reshape(-1))
+    train_seconds = float(time.perf_counter() - train_start)
+
+    student_scores = np.clip(
+        np.asarray(student_model.predict(X), dtype=np.float32).reshape(-1),
+        0.0,
+        1.0,
+    )
+    teacher_scores = y.reshape(-1)
+    probability_mse = float(
+        np.mean((student_scores - teacher_scores) ** 2)
+    )
+    probability_mae = float(
+        np.mean(np.abs(student_scores - teacher_scores))
+    )
+    teacher_student_agreement = float(
+        np.mean(
+            (student_scores >= float(threshold))
+            == (teacher_scores >= float(threshold))
+        )
+    )
+
+    train_summary = {
+        "model_type": "xgboost",
+        "student_objective": "teacher_probability_regression",
+        "num_samples": int(len(X)),
+        "input_dim": int(X.shape[1]),
+        "target_shape": tuple(y.shape),
+        "epochs": None,
+        "batch_size": None,
+        "learning_rate": None,
+        "logit_loss_weight": 0.0,
+        "hidden_loss_weight": 0.0,
+        "hidden_distillation_used": False,
+        "random_state": int(random_state),
+        "device": "cpu",
+        "train_seconds": train_seconds,
+        "final_loss": probability_mse,
+        "teacher_student_agreement": teacher_student_agreement,
+        "probability_mae": probability_mae,
+        "probability_mse": probability_mse,
+        "threshold": float(threshold),
+        "include_rotations": bool(include_rotations),
+        "features_per_joint": 7 if include_rotations else 3,
+        "participants": sorted(
+            {
+                str(row["participant_id"])
+                for row in usable_rows
+                if row.get("participant_id") is not None
+            }
+        ),
+    }
+
+    if output_path is not None:
+        path_obj = Path(output_path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {
+                "model_type": "xgboost",
+                "student_objective": "teacher_probability_regression",
+                "input_dim": int(X.shape[1]),
+                "random_state": int(random_state),
+                "threshold": float(threshold),
+                "include_rotations": bool(include_rotations),
+                "features_per_joint": 7 if include_rotations else 3,
+                "joint_order": list(QUEST_JOINT_ORDER),
+                "model": student_model,
+            },
+            path_obj,
+        )
+        print(f"Saved Quest student XGBoost to: {path_obj}")
+
+    return student_model, train_summary
+
+
+def train_quest_student(
+    rows,
+    teacher_model,
+    model_type,
+    student_features_type="keypoints",
+    learning_rate=None,
+    weight_decay=3e-4,
+    logit_loss_weight=1.0,
+    hidden_loss_weight=0.1,
+    batch_size=32,
+    epochs=30,
+    tabm_k=32,
+    random_state=0,
+    device="auto",
+    threshold=0.5,
+    include_rotations=False,
+    output_path=None,
+):
+    model_type = str(model_type).lower()
+
+    if model_type == "mlp":
+        resolved_lr = 1e-3 if learning_rate is None else float(learning_rate)
+        return train_quest_student_mlp(
+            rows=rows,
+            teacher_model=teacher_model,
+            teacher_model_type="mlp",
+            student_features_type=student_features_type,
+            learning_rate=resolved_lr,
+            logit_loss_weight=logit_loss_weight,
+            hidden_loss_weight=hidden_loss_weight,
+            batch_size=batch_size,
+            epochs=epochs,
+            random_state=random_state,
+            device=device,
+            threshold=threshold,
+            include_rotations=include_rotations,
+            output_path=output_path,
+        )
+
+    if model_type == "tabm":
+        resolved_lr = 2e-3 if learning_rate is None else float(learning_rate)
+        if float(hidden_loss_weight) != 0.0:
+            print(
+                "Note: --hidden-loss-weight is ignored for TabM because "
+                "the TabM ensemble does not expose the same single "
+                "penultimate hidden representation as the MLP."
+            )
+        return train_quest_student_tabm(
+            rows=rows,
+            teacher_model=teacher_model,
+            teacher_model_type="tabm",
+            student_features_type=student_features_type,
+            learning_rate=resolved_lr,
+            weight_decay=weight_decay,
+            logit_loss_weight=logit_loss_weight,
+            batch_size=batch_size,
+            epochs=epochs,
+            k=tabm_k,
+            random_state=random_state,
+            device=device,
+            threshold=threshold,
+            include_rotations=include_rotations,
+            output_path=output_path,
+        )
+
+    if model_type == "xgboost":
+        if float(hidden_loss_weight) != 0.0 or float(logit_loss_weight) != 0.0:
+            print(
+                "Note: logit/hidden neural distillation weights are ignored "
+                "for XGBoost. The student directly regresses the teacher's "
+                "soft probability."
+            )
+        return train_quest_student_xgboost(
+            rows=rows,
+            teacher_model=teacher_model,
+            teacher_model_type="xgboost",
+            student_features_type=student_features_type,
+            random_state=random_state,
+            device=device,
+            threshold=threshold,
+            include_rotations=include_rotations,
+            output_path=output_path,
+        )
+
+    raise ValueError(f"Unsupported model_type={model_type}")
 
 
 def compute_binary_metrics(y_true, y_pred):
@@ -751,35 +1282,28 @@ def compute_binary_metrics(y_true, y_pred):
     }
 
 
-def evaluate_quest_student_mlp(
+def evaluate_quest_student(
     model,
     teacher_model,
+    model_type,
     test_rows,
     device: str,
-    student_features_type:str = "keypoints",
+    student_features_type="keypoints",
     threshold: float = 0.5,
     include_rotations: bool = False,
 ):
-    """
-    Evaluate the Quest student on held-out rows.
-
-    The primary target is the fixed teacher model's output. Binary metrics
-    therefore measure teacher-student agreement, while MAE/MSE measure how
-    closely the student reproduces the teacher probability.
-    """
-    resolved_device = torch.device(device)
-
+    """Evaluate teacher-student agreement on held-out rows."""
     X_test, teacher_targets, _, usable_rows = construct_quest_training_data(
         rows=test_rows,
-        old_model=teacher_model,
-        device=str(resolved_device),
+        teacher_model=teacher_model,
+        teacher_model_type=model_type,
+        device=device,
         include_rotations=include_rotations,
-        student_features_type=student_features_type
+        student_features_type=student_features_type,
     )
 
-    expected_input_dim = get_model_input_dim(model)
+    expected_input_dim = get_model_input_dim(model, model_type=model_type)
     actual_input_dim = int(X_test.shape[1])
-
     if actual_input_dim != expected_input_dim:
         raise ValueError(
             "Quest feature dimension mismatch: "
@@ -788,23 +1312,12 @@ def evaluate_quest_student_mlp(
             f"include_rotations={include_rotations}"
         )
 
-    model = model.to(resolved_device)
-    model.eval()
-
-    x_test_tensor = torch.from_numpy(
-        X_test.astype(np.float32)
-    ).to(resolved_device)
-
-    with torch.no_grad():
-        student_scores = (
-            model(x_test_tensor)
-            .detach()
-            .cpu()
-            .numpy()
-            .reshape(-1)
-            .astype(np.float32)
-        )
-
+    student_scores = predict_model_scores(
+        model,
+        model_type,
+        X_test,
+        device=device,
+    ).reshape(-1).astype(np.float32)
     teacher_scores = teacher_targets.reshape(-1).astype(np.float32)
 
     teacher_predictions = (
@@ -818,7 +1331,6 @@ def evaluate_quest_student_mlp(
         y_true=teacher_predictions,
         y_pred=student_predictions,
     )
-
     probability_mae = float(
         np.mean(np.abs(student_scores - teacher_scores))
     )
@@ -844,7 +1356,6 @@ def evaluate_quest_student_mlp(
             ],
             dtype=np.int32,
         )
-
         teacher_ground_truth_metrics = compute_binary_metrics(
             y_true=ground_truth,
             y_pred=teacher_predictions[ground_truth_indices],
@@ -863,7 +1374,8 @@ def evaluate_quest_student_mlp(
     )
 
     return {
-        "model_name": "quest_student_mlp",
+        "model_name": f"quest_student_{model_type}",
+        "model_type": model_type,
         "num_samples": int(len(X_test)),
         "input_dim": int(X_test.shape[1]),
         "participants": participant_ids,
@@ -881,13 +1393,11 @@ def evaluate_quest_student_mlp(
         "ground_truth": ground_truth.tolist() if len(ground_truth) else [],
         "teacher_predictions_with_ground_truth": (
             teacher_predictions[ground_truth_indices].tolist()
-            if ground_truth_indices
-            else []
+            if ground_truth_indices else []
         ),
         "student_predictions_with_ground_truth": (
             student_predictions[ground_truth_indices].tolist()
-            if ground_truth_indices
-            else []
+            if ground_truth_indices else []
         ),
     }
 
@@ -895,26 +1405,22 @@ def evaluate_quest_student_mlp(
 def leave_one_participant_out_evaluation(
     rows,
     teacher_model,
-    learning_rate: float = 1e-3,
+    model_type,
+    learning_rate=None,
+    weight_decay: float = 3e-4,
     logit_loss_weight: float = 1.0,
     hidden_loss_weight: float = 0.1,
     batch_size: int = 32,
     epochs: int = 30,
+    tabm_k: int = 32,
     random_state: int = 0,
     device: str = "auto",
     threshold: float = 0.5,
     include_rotations: bool = False,
     student_features_type: str = "keypoints",
 ):
-    """
-    Perform leave-one-participant-out evaluation of the Quest student.
-
-    For each fold, the student is trained from scratch on all participants
-    except one and evaluated on the held-out participant. The fixed teacher
-    model supplies soft targets for both training and evaluation.
-    """
+    """Perform participant-held-out teacher/student distillation evaluation."""
     usable_rows = []
-
     for row in rows:
         if row.get("skipped", False):
             continue
@@ -929,11 +1435,9 @@ def leave_one_participant_out_evaluation(
     participants = sorted(
         {str(row["participant_id"]) for row in usable_rows}
     )
-
     if len(participants) < 2:
         raise ValueError(
-            "Leave-one-participant-out evaluation requires at least "
-            "two participants."
+            "Leave-one-participant-out evaluation requires at least two participants."
         )
 
     fold_results = []
@@ -952,49 +1456,47 @@ def leave_one_participant_out_evaluation(
         )
 
         train_rows = [
-            row
-            for row in usable_rows
+            row for row in usable_rows
             if str(row["participant_id"]) != held_out_participant
         ]
         test_rows = [
-            row
-            for row in usable_rows
+            row for row in usable_rows
             if str(row["participant_id"]) == held_out_participant
         ]
 
         if not train_rows:
-            raise ValueError(
-                f"No training rows for fold {held_out_participant}."
-            )
+            raise ValueError(f"No training rows for fold {held_out_participant}.")
         if not test_rows:
-            raise ValueError(
-                f"No test rows for fold {held_out_participant}."
-            )
+            raise ValueError(f"No test rows for fold {held_out_participant}.")
 
-        fold_model, train_summary = train_quest_student_mlp(
+        fold_model, train_summary = train_quest_student(
             rows=train_rows,
             teacher_model=teacher_model,
+            model_type=model_type,
+            student_features_type=student_features_type,
             learning_rate=learning_rate,
+            weight_decay=weight_decay,
             logit_loss_weight=logit_loss_weight,
             hidden_loss_weight=hidden_loss_weight,
             batch_size=batch_size,
             epochs=epochs,
+            tabm_k=tabm_k,
             random_state=random_state + fold_index,
             device=device,
             threshold=threshold,
             include_rotations=include_rotations,
-            student_features_type = student_features_type,
             output_path=None,
         )
 
-        fold_evaluation = evaluate_quest_student_mlp(
+        fold_evaluation = evaluate_quest_student(
             model=fold_model,
             teacher_model=teacher_model,
+            model_type=model_type,
             test_rows=test_rows,
             device=train_summary["device"],
             threshold=threshold,
             include_rotations=include_rotations,
-            student_features_type = student_features_type
+            student_features_type=student_features_type,
         )
 
         fold_evaluation["fold_index"] = int(fold_index)
@@ -1002,12 +1504,8 @@ def leave_one_participant_out_evaluation(
         fold_evaluation["train_summary"] = train_summary
         fold_results.append(fold_evaluation)
 
-        all_teacher_predictions.extend(
-            fold_evaluation["teacher_predictions"]
-        )
-        all_student_predictions.extend(
-            fold_evaluation["student_predictions"]
-        )
+        all_teacher_predictions.extend(fold_evaluation["teacher_predictions"])
+        all_student_predictions.extend(fold_evaluation["student_predictions"])
         all_teacher_scores.extend(fold_evaluation["teacher_scores"])
         all_student_scores.extend(fold_evaluation["student_scores"])
 
@@ -1033,15 +1531,8 @@ def leave_one_participant_out_evaluation(
         y_pred=all_student_predictions,
     )
 
-    teacher_scores_array = np.asarray(
-        all_teacher_scores,
-        dtype=np.float32,
-    )
-    student_scores_array = np.asarray(
-        all_student_scores,
-        dtype=np.float32,
-    )
-
+    teacher_scores_array = np.asarray(all_teacher_scores, dtype=np.float32)
+    student_scores_array = np.asarray(all_student_scores, dtype=np.float32)
     pooled_probability_mae = float(
         np.mean(np.abs(student_scores_array - teacher_scores_array))
     )
@@ -1084,6 +1575,9 @@ def leave_one_participant_out_evaluation(
 
     return {
         "evaluation_type": "leave_one_participant_out_distillation",
+        "model_type": model_type,
+        "teacher_model_type": model_type,
+        "student_model_type": model_type,
         "num_participants": len(participants),
         "participants": participants,
         "num_folds": len(fold_results),
@@ -1126,6 +1620,7 @@ def main():
         default=False,
     )
     parser.add_argument("--confidence", type=float, default=0.15)
+    parser.add_argument("--model-type", type=str, choices=MODEL_TYPES, default="mlp", help="Matched teacher/student model family: mlp, xgboost, or tabm.")
     parser.add_argument("--teacher-features-type", type=str, choices=TEACHER_FEATURES_TYPE, default="keypoints")
     parser.add_argument("--student-features-type", type=str, choices=STUDENT_FEATURES_TYPE, default="keypoints")
     parser.add_argument("--participant", type=str, default=None, help="Filter to one participant ID, e.g. 1 or P01")
@@ -1134,30 +1629,42 @@ def main():
     parser.add_argument("--hand", type=str, choices=["left", "right"], default=None, help="Filter to one hand")
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--mlp-epochs", type=int, default=30)
-    parser.add_argument("--mlp-batch-size", type=int, default=32)
-    parser.add_argument("--mlp-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--student-epochs", "--mlp-epochs", dest="student_epochs", type=int, default=30)
+    parser.add_argument("--student-batch-size", "--mlp-batch-size", dest="student_batch_size", type=int, default=32)
     parser.add_argument(
+        "--student-learning-rate",
+        "--mlp-learning-rate",
+        dest="student_learning_rate",
+        type=float,
+        default=None,
+        help="Student learning rate. Default: 1e-3 for MLP, 2e-3 for TabM; unused by XGBoost.",
+    )
+    parser.add_argument("--tabm-weight-decay", type=float, default=3e-4)
+    parser.add_argument("--tabm-k", type=int, default=32)
+    parser.add_argument(
+        "--logit-loss-weight",
         "--mlp-logit-loss-weight",
+        dest="logit_loss_weight",
         type=float,
         default=1.0,
-        help=(
-            "Weight applied to the SmoothL1 teacher-student logit matching "
-            "loss. Set to 0.0 to recover the original BCE-only training."
-        ),
+        help="Logit-matching weight for neural students. Ignored by XGBoost.",
     )
     parser.add_argument(
+        "--hidden-loss-weight",
         "--mlp-hidden-loss-weight",
+        dest="hidden_loss_weight",
         type=float,
         default=0.1,
-        help=(
-            "Weight applied to the SmoothL1 teacher-student penultimate-hidden "
-            "representation matching loss. Set to 0.0 to disable hidden-state "
-            "distillation."
-        ),
+        help="Penultimate-hidden matching weight. Used only for MLP -> MLP.",
     )
-    parser.add_argument("--mlp-random-state", type=int, default=0)
-    parser.add_argument("--mlp-output-path", type=str, default=None)
+    parser.add_argument("--student-random-state", "--mlp-random-state", dest="student_random_state", type=int, default=0)
+    parser.add_argument("--student-output-path", "--mlp-output-path", dest="student_output_path", type=str, default=None)
+    parser.add_argument(
+        "--teacher-weights-path",
+        type=str,
+        default=None,
+        help="Optional explicit teacher checkpoint/joblib path. Otherwise a model-type-specific default is used.",
+    )
     parser.add_argument("--decision-threshold", type=float, default=0.5)
     parser.add_argument(
         "--eval-output-dir",
@@ -1165,7 +1672,7 @@ def main():
         default=None,
         help=(
             "Root directory for evaluation bundles. Defaults to "
-            "MODEL_IMPL_ROOT/outputs/eval_results."
+            "MODEL_IMPL_ROOT/outputs/eval_results/<model-type>."
         ),
     )
     parser.add_argument(
@@ -1223,21 +1730,59 @@ def main():
 
     resnet_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
 
-    HAND_INTENT_WEIGHTS_PATH = REPO_ROOT / "model_training_and_implementation" / "outputs" / "hand_intent_mlp_weights" / ("features-"+str(args.teacher_features_type)+"__crop-"+str(args.crop_around_object)) / "MLP.pth"
-
-    checkpoint = torch.load(
-    HAND_INTENT_WEIGHTS_PATH,
-    map_location="cpu",
-    weights_only=True,
+    teacher_variation_name = (
+        "features-"
+        + str(args.teacher_features_type)
+        + "__crop-"
+        + str(args.crop_around_object)
     )
 
-    model = HandIntentMLP(
-        input_size=checkpoint["input_dim"],
-        output_size=1,
+    if args.teacher_weights_path is not None:
+        HAND_INTENT_WEIGHTS_PATH = Path(args.teacher_weights_path)
+    elif args.model_type == "mlp":
+        HAND_INTENT_WEIGHTS_PATH = (
+            REPO_ROOT
+            / "model_training_and_implementation"
+            / "outputs"
+            / "hand_intent_mlp_weights"
+            / teacher_variation_name
+            / "MLP.pth"
+        )
+    elif args.model_type == "xgboost":
+        HAND_INTENT_WEIGHTS_PATH = (
+            REPO_ROOT
+            / "model_training_and_implementation"
+            / "outputs"
+            / "hand_intent_classical_models"
+            / teacher_variation_name
+            / "xgboost.joblib"
+        )
+    elif args.model_type == "tabm":
+        HAND_INTENT_WEIGHTS_PATH = (
+            REPO_ROOT
+            / "model_training_and_implementation"
+            / "outputs"
+            / "hand_intent_tabm"
+            / teacher_variation_name
+            / "TabM.pth"
+        )
+    else:
+        raise ValueError(f"Unsupported model_type={args.model_type}")
+
+    if not HAND_INTENT_WEIGHTS_PATH.is_file():
+        raise FileNotFoundError(
+            f"Teacher weights do not exist: {HAND_INTENT_WEIGHTS_PATH}"
+        )
+
+    model = load_teacher_model(
+        model_type=args.model_type,
+        weights_path=HAND_INTENT_WEIGHTS_PATH,
     )
 
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    print(
+        f"Loaded {args.model_type} teacher from: "
+        f"{HAND_INTENT_WEIGHTS_PATH}"
+    )
 
     y_true, rows, skipped_unreadable, skipped_no_object, skipped_no_people = organize_samples(
         samples=samples,
@@ -1252,16 +1797,19 @@ def main():
     lopo_evaluation = leave_one_participant_out_evaluation(
         rows=rows,
         teacher_model=model,
-        learning_rate=args.mlp_learning_rate,
-        logit_loss_weight=args.mlp_logit_loss_weight,
-        hidden_loss_weight=args.mlp_hidden_loss_weight,
-        batch_size=args.mlp_batch_size,
-        epochs=args.mlp_epochs,
-        random_state=args.mlp_random_state,
+        model_type=args.model_type,
+        learning_rate=args.student_learning_rate,
+        weight_decay=args.tabm_weight_decay,
+        logit_loss_weight=args.logit_loss_weight,
+        hidden_loss_weight=args.hidden_loss_weight,
+        batch_size=args.student_batch_size,
+        epochs=args.student_epochs,
+        tabm_k=args.tabm_k,
+        random_state=args.student_random_state,
         device="auto",
         threshold=args.decision_threshold,
         include_rotations=args.include_quest_joint_rotations,
-        student_features_type=args.student_features_type
+        student_features_type=args.student_features_type,
     )
 
     print("\nQuest student LOPO evaluation complete")
@@ -1333,38 +1881,60 @@ def main():
                 f"{teacher_metrics['accuracy']:.4f}"
             )
 
-    final_output_path = args.mlp_output_path
+    final_output_path = args.student_output_path
     if final_output_path is None:
-        final_output_path = (
-            MODEL_IMPL_ROOT
-            / "outputs"
-            / "quest_hand_intent_mlp_weights"
-            / sanitize_path_component(variation_name)
-            / f"MLP.pth"
-        )
+        if args.model_type == "mlp":
+            final_output_path = (
+                MODEL_IMPL_ROOT
+                / "outputs"
+                / "quest_hand_intent_mlp_weights"
+                / sanitize_path_component(variation_name)
+                / "MLP.pth"
+            )
+        elif args.model_type == "tabm":
+            final_output_path = (
+                MODEL_IMPL_ROOT
+                / "outputs"
+                / "quest_hand_intent_tabm"
+                / sanitize_path_component(variation_name)
+                / "TabM.pth"
+            )
+        elif args.model_type == "xgboost":
+            final_output_path = (
+                MODEL_IMPL_ROOT
+                / "outputs"
+                / "quest_hand_intent_xgboost"
+                / sanitize_path_component(variation_name)
+                / "xgboost.joblib"
+            )
+        else:
+            raise ValueError(f"Unsupported model_type={args.model_type}")
     else:
         final_output_path = Path(final_output_path)
 
-    final_model, final_train_summary = train_quest_student_mlp(
+    final_model, final_train_summary = train_quest_student(
         rows=rows,
         teacher_model=model,
-        learning_rate=args.mlp_learning_rate,
-        logit_loss_weight=args.mlp_logit_loss_weight,
-        hidden_loss_weight=args.mlp_hidden_loss_weight,
-        batch_size=args.mlp_batch_size,
-        epochs=args.mlp_epochs,
-        random_state=args.mlp_random_state,
+        model_type=args.model_type,
+        student_features_type=args.student_features_type,
+        learning_rate=args.student_learning_rate,
+        weight_decay=args.tabm_weight_decay,
+        logit_loss_weight=args.logit_loss_weight,
+        hidden_loss_weight=args.hidden_loss_weight,
+        batch_size=args.student_batch_size,
+        epochs=args.student_epochs,
+        tabm_k=args.tabm_k,
+        random_state=args.student_random_state,
         device="auto",
         threshold=args.decision_threshold,
         include_rotations=args.include_quest_joint_rotations,
-        student_features_type=args.student_features_type,
         output_path=final_output_path,
     )
-
     print(f"\nFinal Quest student saved to: {final_output_path}")
     print("Final training summary:", final_train_summary)
 
     dataset_summary = {
+        "model_type": args.model_type,
         "num_samples_after_discovery_filters_and_slicing": int(len(samples)),
         "num_rows_after_feature_organization": int(len(rows)),
         "num_labels_returned": int(len(y_true)),
