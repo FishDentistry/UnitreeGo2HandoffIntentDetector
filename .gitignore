@@ -55,10 +55,8 @@ wandb/
 *.mp4
 
 # Model weights / pretrained files
-*.pkl
 *.pickle
 *.pt
-*.pth
 *.ckpt
 *.onnx
 
