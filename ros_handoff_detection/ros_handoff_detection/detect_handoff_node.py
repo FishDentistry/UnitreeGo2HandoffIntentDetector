@@ -177,6 +177,7 @@ class HandoffInferenceNode(Node):
         self.get_logger().info(
             "Servo controller connected successfully."
         )
+        self.servo.send_command(0)
 
         # ---------------------------------------------------------
         # Model
