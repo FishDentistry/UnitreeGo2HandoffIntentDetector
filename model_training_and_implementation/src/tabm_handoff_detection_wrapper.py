@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import torch
 
+from .dino_detector import DINOObjectDetector
 from .rtmpose_keypoints import RTMPoseKeypointDetector
 from .rtmpose_headpose import RTMPoseHeadPoseEstimator
 from .hand_intent_tabm import HandIntentTabM
@@ -180,17 +181,21 @@ class HandoffDetector:
         )
 
         # ---------------------------------------------------------
-        # DINO compatibility
+        # DINO object detector
         # ---------------------------------------------------------
-        # Kept only so existing call signatures do not need to
-        # change. DINO is no longer loaded or used.
         self.object_detector = None
 
-        if self.features_type == "keypoints_headpose_dino":
-            raise ValueError(
-                'features_type="keypoints_headpose_dino" '
-                "requires DINO object-centroid features and is "
-                "not supported when DINO is disabled."
+        if (
+            self.crop_around_object
+            or self.features_type
+            == "keypoints_headpose_dino"
+        ):
+            self.object_detector = DINOObjectDetector(
+                model_id=(
+                    "IDEA-Research/"
+                    "grounding-dino-base"
+                ),
+                confidence=confidence,
             )
 
         # ---------------------------------------------------------
@@ -291,59 +296,44 @@ class HandoffDetector:
         self,
         image,
         depth_image,
-        people=None,
     ):
         """
         Crop RGB and depth images around the same detected
         region, matching the training preprocessing.
-
-        If RTMPose results are supplied, reuse them so the
-        keypoint detector does not need to run a second time.
         """
-        if people is None:
-            people = self.keypoint_detector.predict(
-                image
-            )
-
-        if len(people) != 1:
-            raise RuntimeError(
-                "Expected exactly one person for cropping, "
-                f"found {len(people)}."
-            )
-
-        keypoints = np.asarray(
-            people[0]["keypoints"],
-            dtype=np.float32,
+        detections = self.object_detector.predict(
+            image,
+            class_names=self.crop_object,
         )
 
-        xy = keypoints[:, :2]
-        valid = np.isfinite(xy).all(axis=1)
-        valid &= ~np.all(xy == 0, axis=1)
+        matching = [
+            detection
+            for detection in detections
+            if detection["label"].strip(".")
+            == self.crop_object.strip(".")
+        ]
 
-        if not np.any(valid):
-            raise RuntimeError(
-                "Could not determine person crop from "
-                "RTMPose keypoints."
+        if not matching:
+            return None, None
+
+        # Match training behavior: select largest
+        # matching detection.
+        detection = max(
+            matching,
+            key=lambda d: (
+                d["box_xyxy"][2]
+                - d["box_xyxy"][0]
             )
+            * (
+                d["box_xyxy"][3]
+                - d["box_xyxy"][1]
+            ),
+        )
 
-        valid_xy = xy[valid]
-
-        x1 = float(np.min(valid_xy[:, 0]))
-        y1 = float(np.min(valid_xy[:, 1]))
-        x2 = float(np.max(valid_xy[:, 0]))
-        y2 = float(np.max(valid_xy[:, 1]))
-
-        # Expand the keypoint extent to approximate the
-        # person detector box previously supplied by DINO.
-        box_width = x2 - x1
-        box_height = y2 - y1
-        padding_x = 0.15 * box_width
-        padding_y = 0.15 * box_height
-
-        x1 = int(x1 - padding_x)
-        y1 = int(y1 - padding_y)
-        x2 = int(x2 + padding_x)
-        y2 = int(y2 + padding_y)
+        x1, y1, x2, y2 = map(
+            int,
+            detection["box_xyxy"],
+        )
 
         rgb_height, rgb_width = image.shape[:2]
         depth_height, depth_width = (
@@ -405,21 +395,6 @@ class HandoffDetector:
                 "Crop produced an empty depth image."
             )
 
-        # The RTMPose result was produced in full-image RGB
-        # coordinates. Shift all keypoints into the cropped
-        # RGB-image coordinate system so the same detection can
-        # be reused for feature extraction, depth lookup, and
-        # head-pose estimation.
-        for person in people:
-            shifted_keypoints = np.asarray(
-                person["keypoints"],
-                dtype=np.float32,
-            ).copy()
-
-            shifted_keypoints[:, 0] -= x1
-            shifted_keypoints[:, 1] -= y1
-            person["keypoints"] = shifted_keypoints
-
         return image, depth_image
 
     def _extract_features(
@@ -450,12 +425,43 @@ class HandoffDetector:
 
         depth_image = np.asarray(depth_image)
 
+
+        # ---------------------------------------------------------
+        # Optional DINO crop
+        # ---------------------------------------------------------
+        # This intentionally happens BEFORE RTMPose, head pose, and
+        # ResNet so runtime preprocessing matches training.
+        if self.crop_around_object:
+            image, depth_image = self._crop_images(
+                image,
+                depth_image,
+            )
+
+            if image is None:
+                return None
+
+        # ---------------------------------------------------------
+        # Optional DINO object feature
+        # ---------------------------------------------------------
+        objects = []
+
+        if (
+            self.features_type
+            == "keypoints_headpose_dino"
+        ):
+            objects = self.object_detector.predict(
+                image,
+                class_names=self.dino_classes,
+            )
+
+            if len(objects) != 1:
+                return None
+
         # ---------------------------------------------------------
         # Person keypoints
         # ---------------------------------------------------------
-        # Run RTMPose exactly once. If cropping is enabled, these
-        # same detections are reused to establish the crop and are
-        # shifted into crop-relative coordinates by _crop_images().
+        # RTMPose runs on the same (possibly DINO-cropped) image
+        # used during training.
         people = self.keypoint_detector.predict(
             image
         )
@@ -471,18 +477,6 @@ class HandoffDetector:
 
         if not self._is_valid_person(people[0]):
             return None
-
-        # ---------------------------------------------------------
-        # Optional crop
-        # ---------------------------------------------------------
-        if self.crop_around_object:
-            image, depth_image = (
-                self._crop_images(
-                    image,
-                    depth_image,
-                    people=people,
-                )
-            )
 
         keypoints = np.asarray(
             people[0]["keypoints"][:11],
@@ -577,6 +571,23 @@ class HandoffDetector:
                 .reshape(-1)
                 .tolist()
             )
+
+        # ---------------------------------------------------------
+        # DINO object centroid
+        # ---------------------------------------------------------
+        if (
+            self.features_type
+            == "keypoints_headpose_dino"
+        ):
+            x1, y1, x2, y2 = map(
+                float,
+                objects[0]["box_xyxy"],
+            )
+
+            feature_vector += [
+                (x1 + x2) / 2.0,
+                (y1 + y2) / 2.0,
+            ]
 
         # ---------------------------------------------------------
         # ResNet embedding

@@ -59,7 +59,7 @@ class HandoffInferenceNode(Node):
 
         self.declare_parameter(
             "servo_hold_seconds",
-            5.0,
+            10.0,
         )
 
         self.get_logger().info(
