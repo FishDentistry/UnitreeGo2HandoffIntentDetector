@@ -93,6 +93,16 @@ class HandoffDetector:
         self.crop_around_object = bool(crop_around_object)
         self.crop_object = crop_object
         self.dino_classes = dino_classes
+        self.keypoint_confidence = float(confidence)
+
+        # RTMPose may occasionally return a weak false-positive pose even
+        # when no person is actually present. Use a slightly stricter
+        # confidence threshold only for deciding whether a person exists.
+        # This does not change the feature values supplied to TabM.
+        self.person_presence_confidence = max(
+            self.keypoint_confidence,
+            0.30,
+        )
 
         if self.depth_patch_radius < 0:
             raise ValueError(
@@ -216,6 +226,66 @@ class HandoffDetector:
                     l2_normalize=True,
                 )
             )
+
+    def _is_valid_person(
+        self,
+        person,
+    ):
+        """
+        Return True only when RTMPose produced a sufficiently
+        confident upper-body pose to treat the frame as containing
+        a real person.
+
+        The handoff model depends primarily on shoulders, elbows,
+        and wrists, so use those joints for the presence check.
+        """
+        keypoints = np.asarray(
+            person.get("keypoints", []),
+            dtype=np.float32,
+        )
+
+        if (
+            keypoints.ndim != 2
+            or keypoints.shape[0] < 11
+            or keypoints.shape[1] < 2
+        ):
+            return False
+
+        upper_body = keypoints[5:11]
+
+        if not np.isfinite(upper_body[:, :2]).all():
+            return False
+
+        # RTMPose results normally contain [x, y, confidence].
+        # If confidence values are unavailable, preserve backwards
+        # compatibility and accept the geometrically valid pose.
+        if keypoints.shape[1] < 3:
+            return True
+
+        scores = upper_body[:, 2]
+
+        if not np.isfinite(scores).all():
+            return False
+
+        threshold = self.person_presence_confidence
+
+        # Both shoulders should be confidently localized.
+        if scores[0] < threshold or scores[1] < threshold:
+            return False
+
+        # Require a coherent upper-body detection rather than one or
+        # two isolated high-confidence hallucinated joints.
+        confident_joint_count = int(
+            np.count_nonzero(scores >= threshold)
+        )
+
+        if confident_joint_count < 4:
+            return False
+
+        if float(np.mean(scores)) < threshold:
+            return False
+
+        return True
 
     def _crop_images(
         self,
@@ -390,11 +460,17 @@ class HandoffDetector:
             image
         )
 
+        if len(people) == 0:
+            return None
+
         if len(people) != 1:
             raise RuntimeError(
                 "Expected exactly one person, "
                 f"found {len(people)}."
             )
+
+        if not self._is_valid_person(people[0]):
+            return None
 
         # ---------------------------------------------------------
         # Optional crop
@@ -568,6 +644,13 @@ class HandoffDetector:
             rgb_image,
             depth_image,
         )
+
+        # No sufficiently confident person means a handoff is not
+        # possible. Return a normal negative prediction so ROS
+        # publishes a fresh state instead of retaining the previous
+        # classification after an exception.
+        if features is None:
+            return "not_handoff", 1.0
 
         input_tensor = (
             torch.from_numpy(features)
