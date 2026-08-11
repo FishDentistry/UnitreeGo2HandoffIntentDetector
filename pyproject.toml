@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 name = "unitree-go2-handoff-intent-detector"
 version = "0.1.0"
 description = "Unitree Go2 handoff intent detection and deployment system"
-requires-python = ">=3.9,<3.10"
+requires-python = ">=3.8,<3.10"
 
 # Dependencies needed to RUN the deployed system:
 #   - ROS handoff detector's underlying Python model
