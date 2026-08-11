@@ -3,9 +3,11 @@ import math
 import os
 import re
 import tempfile
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -14,7 +16,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Robot Motion Alignment Server",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 
@@ -28,6 +30,27 @@ ROBOT_BUFFER_SECONDS = 300.0
 # This does not prevent saving. It is recorded as a warning/diagnostic if
 # interpolation has to bridge a larger-than-expected robot sampling gap.
 ALIGNMENT_GAP_WARNING_SECONDS = 0.25
+
+# Timestamps above this threshold are treated as Unix/wall-clock seconds.
+# Current Unix timestamps are comfortably above 1e9.
+UNIX_TIMESTAMP_THRESHOLD = 1.0e9
+
+# Number of recent Quest->Unix clock-offset observations retained per source.
+QUEST_OFFSET_HISTORY_SIZE = 100
+
+# Use a low percentile rather than the mean because receive/send latency can
+# only make an arrival-based offset estimate later, not earlier.
+QUEST_OFFSET_PERCENTILE = 10.0
+
+# If a new offset candidate suddenly differs from the current estimate by this
+# much, assume Unity restarted or the clock domain changed and reset the
+# offset estimator for that Quest source.
+QUEST_CLOCK_RESET_THRESHOLD_SECONDS = 5.0
+
+# Sanity check for the raw Quest timestamp span versus
+# time_from_window_start/window_duration_seconds.
+QUEST_WINDOW_SPAN_ABSOLUTE_TOLERANCE_SECONDS = 0.50
+QUEST_WINDOW_SPAN_RELATIVE_TOLERANCE = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +102,15 @@ class RobotMotionSample(BaseModel):
     """
     Quest-estimated robot motion sample.
 
-    timestamp must use the same absolute time base as the robot
-    ground-truth timestamps, preferably Unix seconds.
+    `timestamp` may be either:
+      1. Unix seconds, or
+      2. Unity/Quest monotonic elapsed seconds.
+
+    If it is monotonic elapsed time, this server automatically rebases it
+    into Unix time before aligning against robot ground truth.
+
+    `time_from_window_start` remains the relative time within the motion
+    window and is never rebased.
     """
     timestamp: float
     time_from_window_start: float
@@ -100,6 +130,9 @@ class RobotMotionHistoryWindow(BaseModel):
     # ground-truth sender uses the default "unitree_go2".
     robot_source_id: str = "unitree_go2"
 
+    # If Unity already sends a real Unix timestamp here, it is preferred as
+    # the clock-offset reference because it avoids network receive latency.
+    # If it does not look like Unix time, the server's receive time is used.
     sent_at_unix_seconds: float
 
     window_duration_seconds: float
@@ -112,11 +145,11 @@ class RobotGroundTruthSample(BaseModel):
     """
     Ground-truth robot pose sample.
 
-    timestamp must use the same absolute time base as the Quest timestamps,
-    preferably Unix seconds.
+    timestamp must be Unix/wall-clock seconds in the same clock domain as
+    the server-rebased Quest timestamps.
 
-    heading should be the robot/camera forward vector in the robot
-    ground-truth world frame.
+    heading should be the robot/camera forward vector in the ground-truth
+    world frame.
     """
     timestamp: float
     position: Vector3
@@ -131,7 +164,29 @@ class RobotGroundTruthBatch(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# In-memory alignment state
+# Internal Quest-window representation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PreparedQuestWindow:
+    """
+    Quest window after timestamp normalization.
+
+    The Pydantic `window` retains the original payload unchanged.
+    """
+    window: RobotMotionHistoryWindow
+
+    original_timestamps: np.ndarray
+    aligned_timestamps: np.ndarray
+
+    timestamp_mode: str
+    clock_offset_seconds: float
+    clock_offset_candidate_seconds: float
+    clock_offset_reference: str
+
+
+# ---------------------------------------------------------------------------
+# In-memory state
 # ---------------------------------------------------------------------------
 
 # Ground-truth samples are buffered independently for each robot source.
@@ -143,7 +198,37 @@ robot_ground_truth_buffers: Dict[
 # Quest windows that arrived before sufficient robot ground-truth coverage.
 pending_quest_windows: Dict[
     Tuple[str, str],
-    RobotMotionHistoryWindow,
+    PreparedQuestWindow,
+] = {}
+
+# Recent Quest monotonic->Unix offset candidates, per Quest source.
+quest_clock_offset_candidates: Dict[
+    str,
+    Deque[float],
+] = defaultdict(
+    lambda: deque(
+        maxlen=QUEST_OFFSET_HISTORY_SIZE
+    )
+)
+
+quest_clock_offset_estimates: Dict[
+    str,
+    float,
+] = {}
+
+quest_clock_last_raw_timestamp: Dict[
+    str,
+    float,
+] = {}
+
+quest_clock_last_candidate: Dict[
+    str,
+    float,
+] = {}
+
+quest_clock_last_reference: Dict[
+    str,
+    str,
 ] = {}
 
 state_lock = asyncio.Lock()
@@ -204,8 +289,8 @@ def normalize_horizontal_headings(
     Normalize X/Z heading components.
 
     Returns:
-        (N, 3), with Y preserved as zero because the current trajectory/FoV
-        model uses ground-plane heading.
+        (N, 3), with Y set to zero because the current trajectory/FoV model
+        uses ground-plane heading.
     """
     hx = headings[:, 0]
     hz = headings[:, 2]
@@ -366,6 +451,423 @@ def interpolation_bracket_gaps(
 
 
 # ---------------------------------------------------------------------------
+# Quest clock normalization
+# ---------------------------------------------------------------------------
+
+def looks_like_unix_timestamp(
+    timestamp: float,
+) -> bool:
+    return (
+        math.isfinite(timestamp)
+        and timestamp >= UNIX_TIMESTAMP_THRESHOLD
+    )
+
+
+def validate_quest_window_timing(
+    window: RobotMotionHistoryWindow,
+    raw_timestamps: np.ndarray,
+) -> None:
+    if len(raw_timestamps) < 2:
+        raise ValueError(
+            "Quest motion window must contain at "
+            "least two samples."
+        )
+
+    if not np.all(
+        np.isfinite(raw_timestamps)
+    ):
+        raise ValueError(
+            "Quest timestamps contain non-finite values."
+        )
+
+    if np.any(
+        np.diff(raw_timestamps) <= 0.0
+    ):
+        raise ValueError(
+            "Quest motion-window timestamps must be "
+            "strictly increasing."
+        )
+
+    relative_times = np.asarray(
+        [
+            sample.time_from_window_start
+            for sample in window.samples
+        ],
+        dtype=np.float64,
+    )
+
+    if not np.all(
+        np.isfinite(relative_times)
+    ):
+        raise ValueError(
+            "Quest time_from_window_start contains "
+            "non-finite values."
+        )
+
+    if np.any(
+        np.diff(relative_times) <= 0.0
+    ):
+        raise ValueError(
+            "Quest time_from_window_start values must "
+            "be strictly increasing."
+        )
+
+    raw_span = float(
+        raw_timestamps[-1]
+        - raw_timestamps[0]
+    )
+
+    relative_span = float(
+        relative_times[-1]
+        - relative_times[0]
+    )
+
+    expected_duration = float(
+        window.window_duration_seconds
+    )
+
+    tolerance = max(
+        QUEST_WINDOW_SPAN_ABSOLUTE_TOLERANCE_SECONDS,
+        QUEST_WINDOW_SPAN_RELATIVE_TOLERANCE
+        * max(
+            relative_span,
+            expected_duration,
+            1.0,
+        ),
+    )
+
+    if (
+        abs(
+            raw_span
+            - relative_span
+        )
+        > tolerance
+    ):
+        raise ValueError(
+            "Quest raw timestamp span does not agree "
+            "with time_from_window_start. "
+            f"raw_span={raw_span:.3f}s, "
+            f"relative_span={relative_span:.3f}s, "
+            f"tolerance={tolerance:.3f}s."
+        )
+
+    if (
+        expected_duration > 0.0
+        and abs(
+            expected_duration
+            - relative_span
+        )
+        > tolerance
+    ):
+        raise ValueError(
+            "Quest window_duration_seconds does not "
+            "agree with time_from_window_start. "
+            f"reported={expected_duration:.3f}s, "
+            f"relative_span={relative_span:.3f}s, "
+            f"tolerance={tolerance:.3f}s."
+        )
+
+
+def reset_quest_clock_estimator(
+    source_id: str,
+) -> None:
+    quest_clock_offset_candidates[
+        source_id
+    ].clear()
+
+    quest_clock_offset_estimates.pop(
+        source_id,
+        None,
+    )
+
+    quest_clock_last_candidate.pop(
+        source_id,
+        None,
+    )
+
+    quest_clock_last_reference.pop(
+        source_id,
+        None,
+    )
+
+
+def current_quest_offset_estimate(
+    source_id: str,
+) -> Optional[float]:
+    candidates = quest_clock_offset_candidates.get(
+        source_id
+    )
+
+    if not candidates:
+        return None
+
+    values = np.asarray(
+        list(candidates),
+        dtype=np.float64,
+    )
+
+    estimate = float(
+        np.percentile(
+            values,
+            QUEST_OFFSET_PERCENTILE,
+        )
+    )
+
+    quest_clock_offset_estimates[
+        source_id
+    ] = estimate
+
+    return estimate
+
+
+def rebase_pending_windows_for_quest_source(
+    source_id: str,
+) -> None:
+    """
+    If the learned clock offset changes slightly as more Quest windows arrive,
+    update pending windows from the same Quest source to the newest estimate.
+    """
+    estimate = quest_clock_offset_estimates.get(
+        source_id
+    )
+
+    if estimate is None:
+        return
+
+    for prepared in (
+        pending_quest_windows.values()
+    ):
+        if (
+            prepared.window.source_id
+            != source_id
+        ):
+            continue
+
+        if (
+            prepared.timestamp_mode
+            != "rebased_monotonic"
+        ):
+            continue
+
+        prepared.clock_offset_seconds = (
+            estimate
+        )
+
+        prepared.aligned_timestamps = (
+            prepared.original_timestamps
+            + estimate
+        )
+
+
+def prepare_quest_window(
+    window: RobotMotionHistoryWindow,
+    server_receive_unix_seconds: float,
+) -> PreparedQuestWindow:
+    """
+    Convert a Quest window to the Unix clock domain used by robot ground truth.
+
+    If the Quest sample timestamps already look like Unix seconds, they are
+    used directly.
+
+    Otherwise, a persistent offset is learned:
+
+        unix_time ~= unity_monotonic_time + offset
+
+    Preferred offset reference:
+        window.sent_at_unix_seconds
+
+    Fallback:
+        FastAPI server receive time
+
+    The server retains a rolling history of offset candidates and uses a low
+    percentile to reduce positive send/network-latency bias.
+    """
+    raw_timestamps = np.asarray(
+        [
+            sample.timestamp
+            for sample in window.samples
+        ],
+        dtype=np.float64,
+    )
+
+    validate_quest_window_timing(
+        window,
+        raw_timestamps,
+    )
+
+    # Already in Unix time: no rebasing necessary.
+    if looks_like_unix_timestamp(
+        float(
+            np.median(
+                raw_timestamps
+            )
+        )
+    ):
+        quest_clock_last_raw_timestamp[
+            window.source_id
+        ] = float(
+            raw_timestamps[-1]
+        )
+
+        return PreparedQuestWindow(
+            window=window,
+            original_timestamps=(
+                raw_timestamps.copy()
+            ),
+            aligned_timestamps=(
+                raw_timestamps.copy()
+            ),
+            timestamp_mode="unix",
+            clock_offset_seconds=0.0,
+            clock_offset_candidate_seconds=0.0,
+            clock_offset_reference=(
+                "quest_sample_timestamp"
+            ),
+        )
+
+    # Unity/Quest elapsed clock may reset when the application restarts.
+    previous_raw_end = (
+        quest_clock_last_raw_timestamp.get(
+            window.source_id
+        )
+    )
+
+    if (
+        previous_raw_end is not None
+        and raw_timestamps[0]
+        < previous_raw_end - 1.0
+    ):
+        print(
+            "Quest monotonic clock appears to have "
+            f"reset for source '{window.source_id}'. "
+            "Resetting Quest->Unix offset estimator."
+        )
+
+        reset_quest_clock_estimator(
+            window.source_id
+        )
+
+    # Prefer the Unix timestamp generated by the Quest sender itself if it
+    # is valid. That avoids network receive latency.
+    if looks_like_unix_timestamp(
+        float(
+            window.sent_at_unix_seconds
+        )
+    ):
+        unix_reference = float(
+            window.sent_at_unix_seconds
+        )
+
+        reference_name = (
+            "window.sent_at_unix_seconds"
+        )
+    else:
+        unix_reference = float(
+            server_receive_unix_seconds
+        )
+
+        reference_name = (
+            "server_receive_unix_seconds"
+        )
+
+    # The final sample is normally immediately before the window POST.
+    candidate = (
+        unix_reference
+        - float(
+            raw_timestamps[-1]
+        )
+    )
+
+    previous_estimate = (
+        quest_clock_offset_estimates.get(
+            window.source_id
+        )
+    )
+
+    if (
+        previous_estimate is not None
+        and abs(
+            candidate
+            - previous_estimate
+        )
+        > QUEST_CLOCK_RESET_THRESHOLD_SECONDS
+    ):
+        print(
+            "Large Quest clock-offset change detected "
+            f"for source '{window.source_id}': "
+            f"old={previous_estimate:.6f}s, "
+            f"candidate={candidate:.6f}s. "
+            "Resetting offset estimator."
+        )
+
+        reset_quest_clock_estimator(
+            window.source_id
+        )
+
+    quest_clock_offset_candidates[
+        window.source_id
+    ].append(
+        candidate
+    )
+
+    estimate = current_quest_offset_estimate(
+        window.source_id
+    )
+
+    if estimate is None:
+        raise ValueError(
+            "Could not estimate Quest->Unix clock offset."
+        )
+
+    quest_clock_last_raw_timestamp[
+        window.source_id
+    ] = float(
+        raw_timestamps[-1]
+    )
+
+    quest_clock_last_candidate[
+        window.source_id
+    ] = candidate
+
+    quest_clock_last_reference[
+        window.source_id
+    ] = reference_name
+
+    # Keep pending windows from this same Unity clock on the newest
+    # persistent estimate.
+    rebase_pending_windows_for_quest_source(
+        window.source_id
+    )
+
+    aligned_timestamps = (
+        raw_timestamps
+        + estimate
+    )
+
+    return PreparedQuestWindow(
+        window=window,
+        original_timestamps=(
+            raw_timestamps.copy()
+        ),
+        aligned_timestamps=(
+            aligned_timestamps
+        ),
+        timestamp_mode=(
+            "rebased_monotonic"
+        ),
+        clock_offset_seconds=(
+            estimate
+        ),
+        clock_offset_candidate_seconds=(
+            candidate
+        ),
+        clock_offset_reference=(
+            reference_name
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Ground-truth buffer helpers
 # ---------------------------------------------------------------------------
 
@@ -419,17 +921,24 @@ def prune_ground_truth_buffer(
         - ROBOT_BUFFER_SECONDS
     )
 
-    # Do not prune data that may still be required by an existing pending
-    # Quest window for this robot source.
+    # Do not prune robot data that a VALID rebased pending Quest window may
+    # still need.
     pending_start_times = []
 
-    for window in pending_quest_windows.values():
+    for prepared in (
+        pending_quest_windows.values()
+    ):
         if (
-            window.robot_source_id == source_id
-            and window.samples
+            prepared.window.robot_source_id
+            == source_id
+            and len(
+                prepared.aligned_timestamps
+            ) > 0
         ):
             pending_start_times.append(
-                window.samples[0].timestamp
+                float(
+                    prepared.aligned_timestamps[0]
+                )
             )
 
     if pending_start_times:
@@ -466,8 +975,10 @@ def prune_ground_truth_buffer(
 # ---------------------------------------------------------------------------
 
 def has_ground_truth_coverage(
-    window: RobotMotionHistoryWindow,
+    prepared: PreparedQuestWindow,
 ) -> bool:
+    window = prepared.window
+
     samples = robot_ground_truth_buffers.get(
         window.robot_source_id,
         [],
@@ -476,18 +987,21 @@ def has_ground_truth_coverage(
     if len(samples) < 2:
         return False
 
-    quest_start = min(
-        sample.timestamp
-        for sample in window.samples
+    quest_start = float(
+        prepared.aligned_timestamps[0]
     )
 
-    quest_end = max(
-        sample.timestamp
-        for sample in window.samples
+    quest_end = float(
+        prepared.aligned_timestamps[-1]
     )
 
-    robot_start = samples[0].timestamp
-    robot_end = samples[-1].timestamp
+    robot_start = float(
+        samples[0].timestamp
+    )
+
+    robot_end = float(
+        samples[-1].timestamp
+    )
 
     return (
         robot_start <= quest_start
@@ -496,19 +1010,23 @@ def has_ground_truth_coverage(
 
 
 def align_robot_ground_truth_to_quest(
-    window: RobotMotionHistoryWindow,
+    prepared: PreparedQuestWindow,
 ) -> dict:
     """
-    Interpolate robot ground-truth pose to every Quest sample timestamp.
+    Interpolate robot ground-truth pose to every REBASED Quest timestamp.
 
     Position is linearly interpolated.
 
     Heading is converted to yaw, unwrapped, linearly interpolated in yaw,
     then converted back to a normalized X/Z heading vector.
     """
-    robot_samples = robot_ground_truth_buffers.get(
-        window.robot_source_id,
-        [],
+    window = prepared.window
+
+    robot_samples = (
+        robot_ground_truth_buffers.get(
+            window.robot_source_id,
+            [],
+        )
     )
 
     if len(robot_samples) < 2:
@@ -518,10 +1036,7 @@ def align_robot_ground_truth_to_quest(
         )
 
     quest_times = np.asarray(
-        [
-            sample.timestamp
-            for sample in window.samples
-        ],
+        prepared.aligned_timestamps,
         dtype=np.float64,
     )
 
@@ -539,7 +1054,7 @@ def align_robot_ground_truth_to_quest(
     ):
         raise ValueError(
             "Robot ground-truth buffer does not cover "
-            "the full Quest window."
+            "the full rebased Quest window."
         )
 
     robot_positions = vector3_list_to_array(
@@ -585,18 +1100,24 @@ def align_robot_ground_truth_to_quest(
         )
     )
 
-    nearest_errors = nearest_timestamp_errors(
-        quest_times,
-        robot_times,
+    nearest_errors = (
+        nearest_timestamp_errors(
+            quest_times,
+            robot_times,
+        )
     )
 
-    bracket_gaps = interpolation_bracket_gaps(
-        quest_times,
-        robot_times,
+    bracket_gaps = (
+        interpolation_bracket_gaps(
+            quest_times,
+            robot_times,
+        )
     )
 
     max_bracket_gap = float(
-        np.max(bracket_gaps)
+        np.max(
+            bracket_gaps
+        )
     )
 
     # Save the subset of raw robot samples surrounding this Quest window.
@@ -639,15 +1160,27 @@ def align_robot_ground_truth_to_quest(
     )
 
     return {
-        "aligned_positions": aligned_positions,
-        "aligned_headings": aligned_headings,
+        "aligned_positions": (
+            aligned_positions
+        ),
+        "aligned_headings": (
+            aligned_headings
+        ),
         "aligned_yaw": aligned_yaw,
-        "nearest_timestamp_errors": nearest_errors,
+        "nearest_timestamp_errors": (
+            nearest_errors
+        ),
         "bracket_gaps": bracket_gaps,
-        "max_bracket_gap": max_bracket_gap,
+        "max_bracket_gap": (
+            max_bracket_gap
+        ),
         "source_times": source_times,
-        "source_positions": source_positions,
-        "source_headings": source_headings,
+        "source_positions": (
+            source_positions
+        ),
+        "source_headings": (
+            source_headings
+        ),
     }
 
 
@@ -656,19 +1189,23 @@ def align_robot_ground_truth_to_quest(
 # ---------------------------------------------------------------------------
 
 def save_aligned_motion_window(
-    window: RobotMotionHistoryWindow,
+    prepared: PreparedQuestWindow,
     alignment: dict,
 ) -> Path:
+    window = prepared.window
+
     output_path = get_window_file_path(
         source_id=window.source_id,
         window_id=window.window_id,
     )
 
+    quest_original_timestamps = np.asarray(
+        prepared.original_timestamps,
+        dtype=np.float64,
+    )
+
     quest_timestamps = np.asarray(
-        [
-            sample.timestamp
-            for sample in window.samples
-        ],
+        prepared.aligned_timestamps,
         dtype=np.float64,
     )
 
@@ -715,7 +1252,9 @@ def save_aligned_motion_window(
     ].astype(np.float32)
 
     max_bracket_gap = float(
-        alignment["max_bracket_gap"]
+        alignment[
+            "max_bracket_gap"
+        ]
     )
 
     alignment_warning = (
@@ -728,7 +1267,9 @@ def save_aligned_motion_window(
         suffix=".npz",
         delete=False,
     ) as temp_file:
-        temp_path = Path(temp_file.name)
+        temp_path = Path(
+            temp_file.name
+        )
 
     try:
         np.savez_compressed(
@@ -769,14 +1310,43 @@ def save_aligned_motion_window(
             ),
 
             # -----------------------------------------------------------
+            # Quest clock diagnostics
+            # -----------------------------------------------------------
+            quest_original_timestamps=(
+                quest_original_timestamps
+            ),
+
+            quest_timestamp_mode=np.asarray(
+                prepared.timestamp_mode
+            ),
+
+            quest_timestamp_was_rebased=np.asarray(
+                prepared.timestamp_mode
+                == "rebased_monotonic",
+                dtype=np.bool_,
+            ),
+
+            quest_clock_offset_seconds=np.asarray(
+                prepared.clock_offset_seconds,
+                dtype=np.float64,
+            ),
+
+            quest_clock_offset_candidate_seconds=(
+                np.asarray(
+                    prepared.clock_offset_candidate_seconds,
+                    dtype=np.float64,
+                )
+            ),
+
+            quest_clock_offset_reference=np.asarray(
+                prepared.clock_offset_reference
+            ),
+
+            # -----------------------------------------------------------
             # Backward-compatible Quest keys.
             #
-            # Existing scripts that read:
-            #   timestamps
-            #   positions
-            #   headings
-            #
-            # will continue to receive the Quest-estimated values.
+            # `timestamps` now means the normalized/rebased Unix timeline,
+            # while positions/headings remain the Quest-estimated values.
             # -----------------------------------------------------------
             timestamps=quest_timestamps,
             time_from_window_start=(
@@ -894,10 +1464,12 @@ def save_aligned_motion_window(
 
 
 def print_alignment_summary(
-    window: RobotMotionHistoryWindow,
+    prepared: PreparedQuestWindow,
     alignment: dict,
     saved_path: Path,
 ) -> None:
+    window = prepared.window
+
     nearest_errors = alignment[
         "nearest_timestamp_errors"
     ]
@@ -907,16 +1479,48 @@ def print_alignment_summary(
     ]
 
     print()
-    print("Saved aligned robot-motion window")
-    print("---------------------------------")
-    print(f"Window ID: {window.window_id}")
-    print(f"Quest source: {window.source_id}")
+    print(
+        "Saved aligned robot-motion window"
+    )
+    print(
+        "---------------------------------"
+    )
+    print(
+        f"Window ID: {window.window_id}"
+    )
+    print(
+        f"Quest source: {window.source_id}"
+    )
     print(
         "Robot GT source: "
         f"{window.robot_source_id}"
     )
     print(
         f"Samples: {window.sample_count}"
+    )
+    print(
+        "Quest timestamp mode: "
+        f"{prepared.timestamp_mode}"
+    )
+
+    if (
+        prepared.timestamp_mode
+        == "rebased_monotonic"
+    ):
+        print(
+            "Quest->Unix offset: "
+            f"{prepared.clock_offset_seconds:.6f} s"
+        )
+        print(
+            "Offset reference: "
+            f"{prepared.clock_offset_reference}"
+        )
+
+    print(
+        "Aligned Quest range: "
+        f"{prepared.aligned_timestamps[0]:.6f} "
+        "-> "
+        f"{prepared.aligned_timestamps[-1]:.6f}"
     )
     print(
         "Mean nearest timestamp error: "
@@ -940,32 +1544,38 @@ def print_alignment_summary(
             "contains a relatively large sampling gap."
         )
 
-    print(f"Saved: {saved_path}")
-    print("---------------------------------")
+    print(
+        f"Saved: {saved_path}"
+    )
+    print(
+        "---------------------------------"
+    )
     print()
 
 
 def try_align_and_save_window(
-    window: RobotMotionHistoryWindow,
+    prepared: PreparedQuestWindow,
 ) -> Optional[Path]:
     if not has_ground_truth_coverage(
-        window
+        prepared
     ):
         return None
 
     alignment = (
         align_robot_ground_truth_to_quest(
-            window
+            prepared
         )
     )
 
-    saved_path = save_aligned_motion_window(
-        window,
-        alignment,
+    saved_path = (
+        save_aligned_motion_window(
+            prepared,
+            alignment,
+        )
     )
 
     print_alignment_summary(
-        window,
+        prepared,
         alignment,
         saved_path,
     )
@@ -980,18 +1590,20 @@ def try_save_pending_windows_for_robot(
 
     pending_keys = [
         key
-        for key, window
+        for key, prepared
         in pending_quest_windows.items()
         if (
-            window.robot_source_id
+            prepared.window.robot_source_id
             == robot_source_id
         )
     ]
 
     for key in pending_keys:
-        window = pending_quest_windows[
+        prepared = pending_quest_windows[
             key
         ]
+
+        window = prepared.window
 
         output_path = get_window_file_path(
             source_id=window.source_id,
@@ -999,11 +1611,15 @@ def try_save_pending_windows_for_robot(
         )
 
         if output_path.exists():
-            del pending_quest_windows[key]
+            del pending_quest_windows[
+                key
+            ]
             continue
 
-        saved_path = try_align_and_save_window(
-            window
+        saved_path = (
+            try_align_and_save_window(
+                prepared
+            )
         )
 
         if saved_path is not None:
@@ -1033,13 +1649,20 @@ async def health():
 
         return {
             "status": "ok",
-            "data_directory": str(DATA_DIR),
+            "data_directory": str(
+                DATA_DIR
+            ),
             "pending_quest_windows": len(
                 pending_quest_windows
             ),
             "robot_ground_truth_buffer_sizes": (
                 robot_buffer_sizes
             ),
+            "quest_clock_offset_estimates": {
+                source_id: estimate
+                for source_id, estimate
+                in quest_clock_offset_estimates.items()
+            },
         }
 
 
@@ -1052,8 +1675,12 @@ async def alignment_status():
             robot_ground_truth_buffers.items()
         ):
             if samples:
-                robot_sources[source_id] = {
-                    "sample_count": len(samples),
+                robot_sources[
+                    source_id
+                ] = {
+                    "sample_count": len(
+                        samples
+                    ),
                     "start_timestamp": (
                         samples[0].timestamp
                     ),
@@ -1066,37 +1693,112 @@ async def alignment_status():
                     ),
                 }
             else:
-                robot_sources[source_id] = {
+                robot_sources[
+                    source_id
+                ] = {
                     "sample_count": 0,
                 }
 
-        pending = [
-            {
-                "window_id": window.window_id,
-                "quest_source_id": (
-                    window.source_id
+        quest_clock_sources = {}
+
+        known_quest_sources = set(
+            quest_clock_offset_candidates.keys()
+        ) | set(
+            quest_clock_offset_estimates.keys()
+        )
+
+        for source_id in sorted(
+            known_quest_sources
+        ):
+            candidates = list(
+                quest_clock_offset_candidates.get(
+                    source_id,
+                    [],
+                )
+            )
+
+            quest_clock_sources[
+                source_id
+            ] = {
+                "offset_estimate_seconds": (
+                    quest_clock_offset_estimates.get(
+                        source_id
+                    )
                 ),
-                "robot_source_id": (
-                    window.robot_source_id
+                "candidate_count": len(
+                    candidates
                 ),
-                "start_timestamp": (
-                    window.samples[0].timestamp
-                    if window.samples
-                    else None
+                "last_candidate_seconds": (
+                    quest_clock_last_candidate.get(
+                        source_id
+                    )
                 ),
-                "end_timestamp": (
-                    window.samples[-1].timestamp
-                    if window.samples
-                    else None
+                "last_reference": (
+                    quest_clock_last_reference.get(
+                        source_id
+                    )
+                ),
+                "last_raw_timestamp": (
+                    quest_clock_last_raw_timestamp.get(
+                        source_id
+                    )
                 ),
             }
-            for window in (
-                pending_quest_windows.values()
+
+        pending = []
+
+        for prepared in (
+            pending_quest_windows.values()
+        ):
+            window = prepared.window
+
+            pending.append(
+                {
+                    "window_id": (
+                        window.window_id
+                    ),
+                    "quest_source_id": (
+                        window.source_id
+                    ),
+                    "robot_source_id": (
+                        window.robot_source_id
+                    ),
+                    "timestamp_mode": (
+                        prepared.timestamp_mode
+                    ),
+                    "clock_offset_seconds": (
+                        prepared.clock_offset_seconds
+                    ),
+                    "raw_start_timestamp": (
+                        float(
+                            prepared.original_timestamps[0]
+                        )
+                    ),
+                    "raw_end_timestamp": (
+                        float(
+                            prepared.original_timestamps[-1]
+                        )
+                    ),
+                    "aligned_start_timestamp": (
+                        float(
+                            prepared.aligned_timestamps[0]
+                        )
+                    ),
+                    "aligned_end_timestamp": (
+                        float(
+                            prepared.aligned_timestamps[-1]
+                        )
+                    ),
+                }
             )
-        ]
 
         return {
-            "robot_sources": robot_sources,
+            "robot_sources": (
+                robot_sources
+            ),
+            "quest_clock_sources": (
+                quest_clock_sources
+            ),
             "pending_windows": pending,
         }
 
@@ -1118,10 +1820,42 @@ async def receive_robot_ground_truth(
             ),
         )
 
+    if not batch.samples:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Robot ground-truth batch has "
+                "no samples."
+            ),
+        )
+
+    robot_timestamps = np.asarray(
+        [
+            sample.timestamp
+            for sample in batch.samples
+        ],
+        dtype=np.float64,
+    )
+
+    if not np.all(
+        np.isfinite(
+            robot_timestamps
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Robot ground-truth timestamps "
+                "contain non-finite values."
+            ),
+        )
+
     async with state_lock:
-        buffer = robot_ground_truth_buffers[
-            batch.source_id
-        ]
+        buffer = (
+            robot_ground_truth_buffers[
+                batch.source_id
+            ]
+        )
 
         buffer.extend(
             batch.samples
@@ -1148,12 +1882,16 @@ async def receive_robot_ground_truth(
         )
 
         if current_buffer:
-            buffer_start = (
-                current_buffer[0].timestamp
+            buffer_start = float(
+                current_buffer[
+                    0
+                ].timestamp
             )
 
-            buffer_end = (
-                current_buffer[-1].timestamp
+            buffer_end = float(
+                current_buffer[
+                    -1
+                ].timestamp
             )
         else:
             buffer_start = None
@@ -1185,6 +1923,10 @@ async def receive_robot_ground_truth(
 async def receive_robot_motion_history(
     window: RobotMotionHistoryWindow,
 ):
+    server_receive_unix_seconds = (
+        time.time()
+    )
+
     if (
         window.sample_count
         != len(window.samples)
@@ -1201,27 +1943,8 @@ async def receive_robot_motion_history(
     if not window.samples:
         raise HTTPException(
             status_code=400,
-            detail="Motion window has no samples.",
-        )
-
-    # Ensure the Quest samples themselves are ordered.
-    quest_timestamps = [
-        sample.timestamp
-        for sample in window.samples
-    ]
-
-    if any(
-        later <= earlier
-        for earlier, later in zip(
-            quest_timestamps,
-            quest_timestamps[1:],
-        )
-    ):
-        raise HTTPException(
-            status_code=400,
             detail=(
-                "Quest motion-window timestamps "
-                "must be strictly increasing."
+                "Motion window has no samples."
             ),
         )
 
@@ -1253,7 +1976,16 @@ async def receive_robot_motion_history(
                 ),
             }
 
-        if pending_key in pending_quest_windows:
+        if (
+            pending_key
+            in pending_quest_windows
+        ):
+            existing = (
+                pending_quest_windows[
+                    pending_key
+                ]
+            )
+
             return {
                 "accepted": True,
                 "duplicate": True,
@@ -1265,12 +1997,39 @@ async def receive_robot_motion_history(
                 "samples_received": len(
                     window.samples
                 ),
+                "timestamp_mode": (
+                    existing.timestamp_mode
+                ),
+                "aligned_start_timestamp": (
+                    float(
+                        existing.aligned_timestamps[0]
+                    )
+                ),
+                "aligned_end_timestamp": (
+                    float(
+                        existing.aligned_timestamps[-1]
+                    )
+                ),
             }
 
         try:
+            prepared = prepare_quest_window(
+                window,
+                server_receive_unix_seconds,
+            )
+
+            # A new offset estimate can slightly improve older pending windows
+            # from this Quest source. Try them again immediately against the
+            # currently buffered robot ground truth.
+            newly_saved_paths = (
+                try_save_pending_windows_for_robot(
+                    window.robot_source_id
+                )
+            )
+
             saved_path = (
                 try_align_and_save_window(
-                    window
+                    prepared
                 )
             )
 
@@ -1284,8 +2043,8 @@ async def receive_robot_motion_history(
             raise HTTPException(
                 status_code=500,
                 detail=(
-                    "Failed to align/save robot "
-                    "motion-history window."
+                    "Failed to normalize/align/save "
+                    "robot motion-history window."
                 ),
             ) from exc
 
@@ -1301,15 +2060,39 @@ async def receive_robot_motion_history(
                 "samples_received": len(
                     window.samples
                 ),
+                "timestamp_mode": (
+                    prepared.timestamp_mode
+                ),
+                "clock_offset_seconds": (
+                    prepared.clock_offset_seconds
+                ),
+                "clock_offset_reference": (
+                    prepared.clock_offset_reference
+                ),
+                "aligned_start_timestamp": (
+                    float(
+                        prepared.aligned_timestamps[0]
+                    )
+                ),
+                "aligned_end_timestamp": (
+                    float(
+                        prepared.aligned_timestamps[-1]
+                    )
+                ),
                 "saved_path": str(
                     saved_path
                 ),
+                "other_pending_windows_saved": (
+                    len(
+                        newly_saved_paths
+                    )
+                ),
             }
 
-        # Ground truth has not yet covered the entire Quest window.
+        # Ground truth has not yet covered the entire normalized Quest window.
         pending_quest_windows[
             pending_key
-        ] = window
+        ] = prepared
 
         return {
             "accepted": True,
@@ -1322,9 +2105,43 @@ async def receive_robot_motion_history(
             "samples_received": len(
                 window.samples
             ),
+            "timestamp_mode": (
+                prepared.timestamp_mode
+            ),
+            "clock_offset_seconds": (
+                prepared.clock_offset_seconds
+            ),
+            "clock_offset_reference": (
+                prepared.clock_offset_reference
+            ),
+            "raw_start_timestamp": (
+                float(
+                    prepared.original_timestamps[0]
+                )
+            ),
+            "raw_end_timestamp": (
+                float(
+                    prepared.original_timestamps[-1]
+                )
+            ),
+            "aligned_start_timestamp": (
+                float(
+                    prepared.aligned_timestamps[0]
+                )
+            ),
+            "aligned_end_timestamp": (
+                float(
+                    prepared.aligned_timestamps[-1]
+                )
+            ),
+            "other_pending_windows_saved": (
+                len(
+                    newly_saved_paths
+                )
+            ),
             "detail": (
-                "Quest window is buffered until "
-                "robot ground truth covers its "
-                "full timestamp range."
+                "Quest window timestamps were normalized. "
+                "The window is buffered until robot ground "
+                "truth covers its full aligned timestamp range."
             ),
         }

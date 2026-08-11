@@ -1,0 +1,12 @@
+numpy==1.26.4
+Pillow
+requests
+pyserial
+
+torch==2.4.1
+torchvision==0.19.1
+
+transformers==4.57.6
+rtmlib==0.0.15
+rtdl_num_embeddings==0.0.10
+typing_extensions

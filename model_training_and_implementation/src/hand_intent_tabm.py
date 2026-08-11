@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from tabm import TabM
+from .tabm_py38_modified.tabm_src_py38_modified import TabM
 
 
 class HandIntentTabM(nn.Module):

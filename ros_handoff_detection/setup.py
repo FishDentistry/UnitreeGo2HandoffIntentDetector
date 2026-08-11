@@ -28,7 +28,7 @@ setup(
     entry_points={
         "console_scripts": [
             "handoff_inference_node = "
-            "ros_handoff_detection.handoff_inference_node:main",
+            "ros_handoff_detection.detect_handoff_node:main",
 
             "robot_ground_truth_node = "
             "ros_handoff_detection.robot_ground_truth_node:main",

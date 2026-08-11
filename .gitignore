@@ -14,18 +14,16 @@ datasets/
 videos/
 frames/
 recordings/
-outputs/
 runs/
 test_data/
 test_videos/
 
 # Model files
-*.pth
 *.pt
 *.ckpt
 *.onnx
 checkpoints/
-weights/
+
 
 # Logs and caches
 *.log
@@ -66,7 +64,6 @@ wandb/
 
 # Project-specific artifacts
 model_training_and_implementation/handoff_dataset.zip
-model_training_and_implementation/kwan_pretrained_weights/
 model_training_and_implementation/test_data/
 model_training_and_implementation/result.jpg
 *.egg-info/

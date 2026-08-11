@@ -1,0 +1,51 @@
+{
+    "best_weights": "/home/christianfronk/HandoffIntent/UnitreeGo2HandoffIntentDetector/robot_fov_estimation/outputs/go2_yolo_det_weights/best.pt",
+    "dataset_yaml": "/home/christianfronk/HandoffIntent/UnitreeGo2HandoffIntentDetector/robot_fov_estimation/data/go2_yolo_det_data/data.yaml",
+    "device": "Quadro RTX 6000",
+    "validation": {
+        "precision": 0.9884609024836981,
+        "recall": 0.9863760217983651,
+        "map50": 0.9935462052568309,
+        "map75": 0.9816211886389972,
+        "map50_95": 0.8621126286743944,
+        "per_class_map50_95": [
+            0.8621126286743944
+        ],
+        "speed_ms_per_image": {
+            "preprocess": 3.0068001397786306,
+            "inference": 14.336147927679121,
+            "loss": 0.0038967552059825427,
+            "postprocess": 0.4960314885891498
+        },
+        "ultralytics_results": {
+            "metrics/precision(B)": 0.9884609024836981,
+            "metrics/recall(B)": 0.9863760217983651,
+            "metrics/mAP50(B)": 0.9935462052568309,
+            "metrics/mAP50-95(B)": 0.8621126286743944,
+            "fitness": 0.8621126286743944
+        }
+    },
+    "test": {
+        "precision": 0.9945148361093064,
+        "recall": 0.9950980392156863,
+        "map50": 0.9948039215686276,
+        "map75": 0.9474527563719255,
+        "map50_95": 0.8652300810204586,
+        "per_class_map50_95": [
+            0.8652300810204586
+        ],
+        "speed_ms_per_image": {
+            "preprocess": 3.426299966259362,
+            "inference": 14.759110303842313,
+            "loss": 0.004493316729046983,
+            "postprocess": 0.6935848858734789
+        },
+        "ultralytics_results": {
+            "metrics/precision(B)": 0.9945148361093064,
+            "metrics/recall(B)": 0.9950980392156863,
+            "metrics/mAP50(B)": 0.9948039215686276,
+            "metrics/mAP50-95(B)": 0.8652300810204586,
+            "fitness": 0.8652300810204586
+        }
+    }
+}

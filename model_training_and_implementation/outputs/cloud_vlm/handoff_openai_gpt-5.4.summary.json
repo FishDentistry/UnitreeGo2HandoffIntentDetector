@@ -1,0 +1,127 @@
+{
+  "evaluation_type": "zero_shot_cloud_vlm",
+  "provider": "openai",
+  "model": "gpt-5.4",
+  "dataset_root": "/home/christianfronk/HandoffIntent/UnitreeGo2HandoffIntentDetector/data/handoff_dataset",
+  "prompt": "You are a binary visual classifier running on a robot's front-facing camera.\n\nDetermine whether the image depicts a person who is CURRENTLY TRYING TO\nINITIATE A HANDOFF OF AN OBJECT TO THE CAMERA/ROBOT.\n\nReturn 1 only when:\n- A person is holding an identifiable object, and\n- The person is intentionally presenting, offering, or extending that object\n  toward the camera/robot as though expecting the robot to take it.\n\nMerely holding, carrying, using, examining, or displaying an object is not\nnecessarily a handoff. A hand extended without an object is not an object\nhandoff. Passing an object to another visible person is not a handoff to the\ncamera/robot. Use arm posture, object position, body orientation, and direction\nof presentation as evidence. If the situation is unclear, return 0.\n\nOutput exactly one character and no explanation:\n1 = handoff initiation\n0 = not a handoff initiation",
+  "prompt_sha256": "bf2905588c9ff9564e57d8ffec753edbdac402e6aa78982dcc049a4cf77059ce",
+  "filters": {
+    "participant": null,
+    "label": null,
+    "condition": null,
+    "hand": null,
+    "start_index": 0,
+    "max_samples": 5
+  },
+  "counts": {
+    "selected": 5,
+    "successful": 5,
+    "errors": 0,
+    "true_labels": [
+      0,
+      5
+    ],
+    "predicted_labels": [
+      0,
+      5
+    ]
+  },
+  "latency_seconds": {
+    "mean": 1.2331754580140113,
+    "median": 0.9357457151636481,
+    "p95": 2.0453067449852824,
+    "total": 6.165877290070057
+  },
+  "pooled_metrics": {
+    "total": 5,
+    "accuracy": 1.0,
+    "balanced_accuracy": null,
+    "precision": 1.0,
+    "recall": 1.0,
+    "specificity": null,
+    "f1": 1.0,
+    "tn": 0,
+    "fp": 0,
+    "fn": 0,
+    "tp": 5,
+    "confusion_matrix": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        5
+      ]
+    ]
+  },
+  "participants": [
+    {
+      "participant_id": "1",
+      "metrics": {
+        "total": 5,
+        "accuracy": 1.0,
+        "balanced_accuracy": null,
+        "precision": 1.0,
+        "recall": 1.0,
+        "specificity": null,
+        "f1": 1.0,
+        "tn": 0,
+        "fp": 0,
+        "fn": 0,
+        "tp": 5,
+        "confusion_matrix": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            5
+          ]
+        ]
+      }
+    }
+  ],
+  "participant_metric_summary": {
+    "accuracy": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "balanced_accuracy": {
+      "mean": null,
+      "std": null
+    },
+    "precision": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "recall": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "specificity": {
+      "mean": null,
+      "std": null
+    },
+    "f1": {
+      "mean": 1.0,
+      "std": 0.0
+    }
+  },
+  "errors": [],
+  "y_true": [
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "y_pred": [
+    1,
+    1,
+    1,
+    1,
+    1
+  ]
+}
