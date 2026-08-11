@@ -1,4 +1,3 @@
-
 import rclpy
 from rclpy.node import Node
 
@@ -6,6 +5,8 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32, String
 from message_filters import Subscriber, ApproximateTimeSynchronizer
+
+from .control_box_servo import ServoController
 
 
 MODEL_TYPES = ("mlp", "tabm")
@@ -46,6 +47,21 @@ class HandoffInferenceNode(Node):
             0.5,
         )
 
+        self.declare_parameter(
+            "servo_port",
+            "COM3",
+        )
+
+        self.declare_parameter(
+            "servo_baud_rate",
+            9600,
+        )
+
+        self.declare_parameter(
+            "servo_hold_seconds",
+            5.0,
+        )
+
         self.get_logger().info(
             "Reading ROS parameters..."
         )
@@ -76,6 +92,24 @@ class HandoffInferenceNode(Node):
             .double_value
         )
 
+        servo_port = (
+            self.get_parameter("servo_port")
+            .get_parameter_value()
+            .string_value
+        )
+
+        servo_baud_rate = (
+            self.get_parameter("servo_baud_rate")
+            .get_parameter_value()
+            .integer_value
+        )
+
+        servo_hold_seconds = (
+            self.get_parameter("servo_hold_seconds")
+            .get_parameter_value()
+            .double_value
+        )
+
         self.get_logger().info(
             "Parameters:"
         )
@@ -96,6 +130,18 @@ class HandoffInferenceNode(Node):
             f"  threshold={threshold}"
         )
 
+        self.get_logger().info(
+            f"  servo_port={servo_port}"
+        )
+
+        self.get_logger().info(
+            f"  servo_baud_rate={servo_baud_rate}"
+        )
+
+        self.get_logger().info(
+            f"  servo_hold_seconds={servo_hold_seconds}"
+        )
+
         if model_type not in MODEL_TYPES:
             raise ValueError(
                 f"Unsupported model_type '{model_type}'. "
@@ -103,6 +149,34 @@ class HandoffInferenceNode(Node):
             )
 
         self.model_type = model_type
+
+        # ---------------------------------------------------------
+        # Servo controller
+        # ---------------------------------------------------------
+        self.servo_hold_seconds = float(servo_hold_seconds)
+        self._servo_active = False
+        self._servo_reset_timer = None
+        self._last_classification = None
+
+        self.get_logger().info(
+            f"Connecting to servo controller on {servo_port}..."
+        )
+
+        try:
+            self.servo = ServoController(
+                port=servo_port,
+                baud_rate=int(servo_baud_rate),
+            )
+            self.servo.connect()
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to connect to servo controller: {exc}"
+            )
+            raise
+
+        self.get_logger().info(
+            "Servo controller connected successfully."
+        )
 
         # ---------------------------------------------------------
         # Model
@@ -343,6 +417,21 @@ class HandoffInferenceNode(Node):
                 f"(confidence={confidence:.3f})"
             )
 
+            # -----------------------------------------------------
+            # Servo trigger
+            # -----------------------------------------------------
+            # Trigger only on the transition into "handoff". This
+            # prevents every handoff-classified camera frame from
+            # repeatedly sending command 1.
+            if (
+                classification == "handoff"
+                and self._last_classification != "handoff"
+                and not self._servo_active
+            ):
+                self._activate_servo_for_handoff()
+
+            self._last_classification = classification
+
         except Exception as exc:
             self.get_logger().warning(
                 "Handoff inference failed "
@@ -356,6 +445,75 @@ class HandoffInferenceNode(Node):
             self.get_logger().warning(
                 f"Exception: {exc}"
             )
+
+    def _activate_servo_for_handoff(self):
+        """Send command 1 now and schedule command 0 after the hold time."""
+        try:
+            self.servo.send_command(1)
+            self._servo_active = True
+
+            self.get_logger().info(
+                "Handoff detected: sent servo command 1."
+            )
+
+            # create_timer() is periodic, so the reset callback cancels
+            # and destroys it after its first invocation to make it a
+            # one-shot timer. This avoids blocking inference with sleep().
+            self._servo_reset_timer = self.create_timer(
+                self.servo_hold_seconds,
+                self._reset_servo_after_handoff,
+            )
+
+        except Exception as exc:
+            self._servo_active = False
+            self.get_logger().error(
+                f"Failed to send servo command 1: {exc}"
+            )
+
+    def _reset_servo_after_handoff(self):
+        """Return the servo to command 0 and stop the one-shot timer."""
+        try:
+            self.servo.send_command(0)
+            self.get_logger().info(
+                "Servo hold complete: sent servo command 0."
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to send servo command 0: {exc}"
+            )
+        finally:
+            self._servo_active = False
+
+            if self._servo_reset_timer is not None:
+                timer = self._servo_reset_timer
+                self._servo_reset_timer = None
+                timer.cancel()
+                self.destroy_timer(timer)
+
+    def destroy_node(self):
+        """Safely return the servo to 0 and close the serial port."""
+        if self._servo_reset_timer is not None:
+            timer = self._servo_reset_timer
+            self._servo_reset_timer = None
+            timer.cancel()
+            self.destroy_timer(timer)
+
+        if hasattr(self, "servo"):
+            try:
+                self.servo.send_command(0)
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"Could not reset servo during shutdown: {exc}"
+                )
+
+            try:
+                self.servo.close()
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"Could not close servo serial connection: {exc}"
+                )
+
+        return super().destroy_node()
 
 
 def main(args=None):
