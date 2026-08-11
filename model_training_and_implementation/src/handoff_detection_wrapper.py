@@ -4,7 +4,6 @@ import cv2
 import numpy as np
 import torch
 
-from .dino_detector import DINOObjectDetector
 from .rtmpose_keypoints import RTMPoseKeypointDetector
 from .rtmpose_headpose import RTMPoseHeadPoseEstimator
 from .hand_intent_mlp import HandIntentMLP
@@ -169,21 +168,17 @@ class HandoffDetector:
         )
 
         # ---------------------------------------------------------
-        # DINO object detector
+        # DINO compatibility
         # ---------------------------------------------------------
+        # Kept only so existing call signatures do not need to
+        # change. DINO is no longer loaded or used.
         self.object_detector = None
 
-        if (
-            self.crop_around_object
-            or self.features_type
-            == "keypoints_headpose_dino"
-        ):
-            self.object_detector = DINOObjectDetector(
-                model_id=(
-                    "IDEA-Research/"
-                    "grounding-dino-base"
-                ),
-                confidence=confidence,
+        if self.features_type == "keypoints_headpose_dino":
+            raise ValueError(
+                'features_type="keypoints_headpose_dino" '
+                "requires DINO object-centroid features and is "
+                "not supported when DINO is disabled."
             )
 
         # ---------------------------------------------------------
@@ -229,42 +224,49 @@ class HandoffDetector:
         Crop RGB and depth images around the same detected
         region, matching the training preprocessing.
         """
-        detections = self.object_detector.predict(
-            image,
-            class_names=self.crop_object,
+        people = self.keypoint_detector.predict(
+            image
         )
 
-        matching = [
-            detection
-            for detection in detections
-            if detection["label"].strip(".")
-            == self.crop_object.strip(".")
-        ]
-
-        if not matching:
+        if len(people) != 1:
             raise RuntimeError(
-                f"No crop object detected: "
-                f"{self.crop_object}"
+                "Expected exactly one person for cropping, "
+                f"found {len(people)}."
             )
 
-        # Match training behavior: select largest
-        # matching detection.
-        detection = max(
-            matching,
-            key=lambda d: (
-                d["box_xyxy"][2]
-                - d["box_xyxy"][0]
-            )
-            * (
-                d["box_xyxy"][3]
-                - d["box_xyxy"][1]
-            ),
+        keypoints = np.asarray(
+            people[0]["keypoints"],
+            dtype=np.float32,
         )
 
-        x1, y1, x2, y2 = map(
-            int,
-            detection["box_xyxy"],
-        )
+        xy = keypoints[:, :2]
+        valid = np.isfinite(xy).all(axis=1)
+        valid &= ~np.all(xy == 0, axis=1)
+
+        if not np.any(valid):
+            raise RuntimeError(
+                "Could not determine person crop from "
+                "RTMPose keypoints."
+            )
+
+        valid_xy = xy[valid]
+
+        x1 = float(np.min(valid_xy[:, 0]))
+        y1 = float(np.min(valid_xy[:, 1]))
+        x2 = float(np.max(valid_xy[:, 0]))
+        y2 = float(np.max(valid_xy[:, 1]))
+
+        # Expand the keypoint extent to approximate the
+        # person detector box previously supplied by DINO.
+        box_width = x2 - x1
+        box_height = y2 - y1
+        padding_x = 0.15 * box_width
+        padding_y = 0.15 * box_height
+
+        x1 = int(x1 - padding_x)
+        y1 = int(y1 - padding_y)
+        x2 = int(x2 + padding_x)
+        y2 = int(y2 + padding_y)
 
         rgb_height, rgb_width = image.shape[:2]
         depth_height, depth_width = (
@@ -366,26 +368,6 @@ class HandoffDetector:
                     depth_image,
                 )
             )
-
-        # ---------------------------------------------------------
-        # Optional DINO object feature
-        # ---------------------------------------------------------
-        objects = []
-
-        if (
-            self.features_type
-            == "keypoints_headpose_dino"
-        ):
-            objects = self.object_detector.predict(
-                image,
-                class_names=self.dino_classes,
-            )
-
-            if len(objects) != 1:
-                raise RuntimeError(
-                    "Expected exactly one target "
-                    f"object, found {len(objects)}."
-                )
 
         # ---------------------------------------------------------
         # Person keypoints
@@ -493,23 +475,6 @@ class HandoffDetector:
                 .reshape(-1)
                 .tolist()
             )
-
-        # ---------------------------------------------------------
-        # DINO object centroid
-        # ---------------------------------------------------------
-        if (
-            self.features_type
-            == "keypoints_headpose_dino"
-        ):
-            x1, y1, x2, y2 = map(
-                float,
-                objects[0]["box_xyxy"],
-            )
-
-            feature_vector += [
-                (x1 + x2) / 2.0,
-                (y1 + y2) / 2.0,
-            ]
 
         # ---------------------------------------------------------
         # ResNet embedding
