@@ -219,14 +219,19 @@ class HandoffDetector:
         self,
         image,
         depth_image,
+        people=None,
     ):
         """
         Crop RGB and depth images around the same detected
         region, matching the training preprocessing.
+
+        If RTMPose results are supplied, reuse them so the
+        keypoint detector does not need to run a second time.
         """
-        people = self.keypoint_detector.predict(
-            image
-        )
+        if people is None:
+            people = self.keypoint_detector.predict(
+                image
+            )
 
         if len(people) != 1:
             raise RuntimeError(
@@ -328,6 +333,21 @@ class HandoffDetector:
                 "Crop produced an empty depth image."
             )
 
+        # The RTMPose result was produced in full-image RGB
+        # coordinates. Shift all keypoints into the cropped
+        # RGB-image coordinate system so the same detection can
+        # be reused for feature extraction, depth lookup, and
+        # head-pose estimation.
+        for person in people:
+            shifted_keypoints = np.asarray(
+                person["keypoints"],
+                dtype=np.float32,
+            ).copy()
+
+            shifted_keypoints[:, 0] -= x1
+            shifted_keypoints[:, 1] -= y1
+            person["keypoints"] = shifted_keypoints
+
         return image, depth_image
 
     def _extract_features(
@@ -359,19 +379,11 @@ class HandoffDetector:
         depth_image = np.asarray(depth_image)
 
         # ---------------------------------------------------------
-        # Optional crop
-        # ---------------------------------------------------------
-        if self.crop_around_object:
-            image, depth_image = (
-                self._crop_images(
-                    image,
-                    depth_image,
-                )
-            )
-
-        # ---------------------------------------------------------
         # Person keypoints
         # ---------------------------------------------------------
+        # Run RTMPose exactly once. If cropping is enabled, these
+        # same detections are reused to establish the crop and are
+        # shifted into crop-relative coordinates by _crop_images().
         people = self.keypoint_detector.predict(
             image
         )
@@ -380,6 +392,18 @@ class HandoffDetector:
             raise RuntimeError(
                 "Expected exactly one person, "
                 f"found {len(people)}."
+            )
+
+        # ---------------------------------------------------------
+        # Optional crop
+        # ---------------------------------------------------------
+        if self.crop_around_object:
+            image, depth_image = (
+                self._crop_images(
+                    image,
+                    depth_image,
+                    people=people,
+                )
             )
 
         keypoints = np.asarray(

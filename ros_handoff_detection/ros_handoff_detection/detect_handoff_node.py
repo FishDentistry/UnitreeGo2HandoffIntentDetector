@@ -156,7 +156,7 @@ class HandoffInferenceNode(Node):
 
         self.get_logger().info(
             "Detector construction may initialize the classifier, "
-            "RTMPose, DINO, head-pose model, and/or ResNet depending "
+            "RTMPose, head-pose model, and/or ResNet depending "
             "on the selected parameters."
         )
 
