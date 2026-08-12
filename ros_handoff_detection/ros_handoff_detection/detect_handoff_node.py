@@ -1,3 +1,4 @@
+import cv2
 import rclpy
 from rclpy.node import Node
 
@@ -48,6 +49,11 @@ class HandoffInferenceNode(Node):
         )
 
         self.declare_parameter(
+            "show_output_window",
+            False,
+        )
+
+        self.declare_parameter(
             "servo_port",
             "/dev/ttyACM0",
         )
@@ -92,6 +98,12 @@ class HandoffInferenceNode(Node):
             .double_value
         )
 
+        show_output_window = (
+            self.get_parameter("show_output_window")
+            .get_parameter_value()
+            .bool_value
+        )
+
         servo_port = (
             self.get_parameter("servo_port")
             .get_parameter_value()
@@ -131,6 +143,10 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
+            f"  show_output_window={show_output_window}"
+        )
+
+        self.get_logger().info(
             f"  servo_port={servo_port}"
         )
 
@@ -149,6 +165,8 @@ class HandoffInferenceNode(Node):
             )
 
         self.model_type = model_type
+        self.show_output_window = bool(show_output_window)
+        self.output_window_name = "Handoff Classification"
 
         # ---------------------------------------------------------
         # Servo controller
@@ -419,6 +437,37 @@ class HandoffInferenceNode(Node):
             )
 
             # -----------------------------------------------------
+            # Optional output window
+            # -----------------------------------------------------
+            if self.show_output_window:
+                display_image = cv2.cvtColor(
+                    rgb_image,
+                    cv2.COLOR_RGB2BGR,
+                )
+
+                label = (
+                    f"{classification} "
+                    f"({confidence:.3f})"
+                )
+
+                cv2.putText(
+                    display_image,
+                    label,
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                cv2.imshow(
+                    self.output_window_name,
+                    display_image,
+                )
+                cv2.waitKey(1)
+
+            # -----------------------------------------------------
             # Servo trigger
             # -----------------------------------------------------
             # Trigger only on the transition into "handoff". This
@@ -493,6 +542,13 @@ class HandoffInferenceNode(Node):
 
     def destroy_node(self):
         """Safely return the servo to 0 and close the serial port."""
+        if self.show_output_window:
+            try:
+                cv2.destroyWindow(self.output_window_name)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
+
         if self._servo_reset_timer is not None:
             timer = self._servo_reset_timer
             self._servo_reset_timer = None
