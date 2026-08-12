@@ -44,7 +44,7 @@ class HandoffInferenceNode(Node):
 
         self.declare_parameter(
             "threshold",
-            0.5,
+            0.65,
         )
 
         self.declare_parameter(
