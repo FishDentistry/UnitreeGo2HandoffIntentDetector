@@ -87,6 +87,9 @@ class HandoffDetector:
         device="auto",
         reject_back_facing=True,
         back_facing_min_torso_ratio=0.15,
+        reject_side_without_forward_wrist=True,
+        side_facing_max_torso_ratio=0.35,
+        side_wrist_forward_depth_fraction=0.05,
     ):
         self.features_type = features_type
         self.threshold = float(threshold)
@@ -107,6 +110,29 @@ class HandoffDetector:
         if self.back_facing_min_torso_ratio < 0.0:
             raise ValueError(
                 "back_facing_min_torso_ratio must be >= 0.0."
+            )
+
+        # Optional deployment-only side-view safeguard. A clearly side-on
+        # person is allowed through only when at least one wrist is
+        # sufficiently closer to the camera than the shoulder midpoint.
+        self.reject_side_without_forward_wrist = bool(
+            reject_side_without_forward_wrist
+        )
+        self.side_facing_max_torso_ratio = float(
+            side_facing_max_torso_ratio
+        )
+        self.side_wrist_forward_depth_fraction = float(
+            side_wrist_forward_depth_fraction
+        )
+
+        if self.side_facing_max_torso_ratio < 0.0:
+            raise ValueError(
+                "side_facing_max_torso_ratio must be >= 0.0."
+            )
+
+        if self.side_wrist_forward_depth_fraction < 0.0:
+            raise ValueError(
+                "side_wrist_forward_depth_fraction must be >= 0.0."
             )
 
         # Keep RTMPose crop generation identical to the updated training
@@ -423,6 +449,121 @@ class HandoffDetector:
             and hip_back_ratio >= min_ratio
         )
 
+    def _is_side_facing(
+        self,
+        person,
+    ):
+        """
+        Return True only for a clearly side-on torso.
+
+        The apparent horizontal shoulder and hip widths are normalized by
+        torso length. When BOTH widths are small, the torso is treated as
+        side-facing. This intentionally leaves oblique views alone.
+
+        This gate is independent of the left/right ordering used by the
+        back-facing filter.
+        """
+        if not self.reject_side_without_forward_wrist:
+            return False
+
+        keypoints = np.asarray(
+            person.get("keypoints", []),
+            dtype=np.float32,
+        )
+
+        if (
+            keypoints.ndim != 2
+            or keypoints.shape[0] < 13
+            or keypoints.shape[1] < 2
+        ):
+            return False
+
+        left_shoulder = keypoints[5]
+        right_shoulder = keypoints[6]
+        left_hip = keypoints[11]
+        right_hip = keypoints[12]
+
+        torso_points = np.stack(
+            [
+                left_shoulder[:2],
+                right_shoulder[:2],
+                left_hip[:2],
+                right_hip[:2],
+            ]
+        )
+
+        if not np.isfinite(torso_points).all():
+            return False
+
+        # Avoid deciding orientation from weak torso keypoints.
+        if keypoints.shape[1] >= 3:
+            confidence_threshold = (
+                self.person_presence_confidence
+            )
+
+            torso_scores = np.asarray(
+                [
+                    left_shoulder[2],
+                    right_shoulder[2],
+                    left_hip[2],
+                    right_hip[2],
+                ],
+                dtype=np.float32,
+            )
+
+            if not np.isfinite(torso_scores).all():
+                return False
+
+            if np.any(
+                torso_scores < confidence_threshold
+            ):
+                return False
+
+        shoulder_midpoint = (
+            left_shoulder[:2] + right_shoulder[:2]
+        ) / 2.0
+        hip_midpoint = (
+            left_hip[:2] + right_hip[:2]
+        ) / 2.0
+
+        torso_length = float(
+            np.linalg.norm(
+                shoulder_midpoint - hip_midpoint
+            )
+        )
+
+        if torso_length <= 1e-6:
+            return False
+
+        shoulder_width_ratio = (
+            abs(
+                float(
+                    left_shoulder[0]
+                    - right_shoulder[0]
+                )
+            )
+            / torso_length
+        )
+
+        hip_width_ratio = (
+            abs(
+                float(
+                    left_hip[0]
+                    - right_hip[0]
+                )
+            )
+            / torso_length
+        )
+
+        max_ratio = self.side_facing_max_torso_ratio
+
+        # Requiring BOTH pairs to look narrow makes this deliberately
+        # conservative: only strong side views activate the extra gate.
+        return (
+            shoulder_width_ratio <= max_ratio
+            and hip_width_ratio <= max_ratio
+        )
+
     def _crop_images(
         self,
         image,
@@ -661,10 +802,17 @@ class HandoffDetector:
         if not self._is_valid_person(people[0]):
             return None
 
-        # Reject only clear back-facing views before constructing any
-        # handoff features. Side/ambiguous views continue to the model.
+        # Reject clear back-facing views before constructing any
+        # handoff features.
         if self._is_facing_away(people[0]):
             return None
+
+        # A strong side view is not rejected automatically. Instead, after
+        # depth lookup below, it must show evidence that at least one wrist
+        # is actually extended toward the camera.
+        side_facing = self._is_side_facing(
+            people[0]
+        )
 
         keypoints = np.asarray(
             people[0]["keypoints"][:11],
@@ -722,6 +870,92 @@ class HandoffDetector:
                 absolute_depth
                 - shoulder_midpoint_depth
             )
+
+        # ---------------------------------------------------------
+        # Side-view wrist-depth safeguard
+        # ---------------------------------------------------------
+        if (
+            side_facing
+            and self.reject_side_without_forward_wrist
+        ):
+            # relative_joint_depths corresponds to COCO joints 5..10:
+            #   0,1 = shoulders
+            #   2,3 = elbows
+            #   4,5 = wrists
+            #
+            # Negative relative depth means the joint is closer to the
+            # camera than the shoulder midpoint.
+            left_wrist_relative_depth = float(
+                relative_joint_depths[4]
+            )
+            right_wrist_relative_depth = float(
+                relative_joint_depths[5]
+            )
+
+            # Use a fraction of shoulder depth instead of a fixed value so
+            # the test works whether the depth image is expressed in
+            # millimeters, meters, or another consistent distance unit.
+            required_forward_depth = (
+                self.side_wrist_forward_depth_fraction
+                * shoulder_midpoint_depth
+            )
+
+            wrist_scores_reliable = True
+
+            if keypoints.shape[1] >= 3:
+                left_wrist_score = float(
+                    keypoints[9, 2]
+                )
+                right_wrist_score = float(
+                    keypoints[10, 2]
+                )
+
+                confidence_threshold = (
+                    self.person_presence_confidence
+                )
+
+                left_wrist_reliable = (
+                    np.isfinite(left_wrist_score)
+                    and left_wrist_score
+                    >= confidence_threshold
+                )
+                right_wrist_reliable = (
+                    np.isfinite(right_wrist_score)
+                    and right_wrist_score
+                    >= confidence_threshold
+                )
+
+                wrist_scores_reliable = (
+                    left_wrist_reliable
+                    or right_wrist_reliable
+                )
+            else:
+                left_wrist_reliable = True
+                right_wrist_reliable = True
+
+            if not wrist_scores_reliable:
+                return None
+
+            left_wrist_forward = (
+                left_wrist_reliable
+                and left_wrist_relative_depth
+                <= -required_forward_depth
+            )
+
+            right_wrist_forward = (
+                right_wrist_reliable
+                and right_wrist_relative_depth
+                <= -required_forward_depth
+            )
+
+            # For a clear side view, reject the frame unless at least one
+            # reliable wrist is meaningfully closer to the camera than the
+            # person's shoulder plane.
+            if not (
+                left_wrist_forward
+                or right_wrist_forward
+            ):
+                return None
 
         # ---------------------------------------------------------
         # Normalize 2D keypoints
@@ -827,8 +1061,9 @@ class HandoffDetector:
             depth_image,
         )
 
-        # No sufficiently confident person, or a clear back-facing person,
-        # means a handoff is rejected. Return a normal negative prediction
+        # No sufficiently confident person, a clear back-facing person,
+        # or a side-facing person without forward wrist extension means
+        # a handoff is rejected. Return a normal negative prediction
         # so ROS publishes a fresh state instead of retaining the previous
         # classification after an exception.
         if features is None:
