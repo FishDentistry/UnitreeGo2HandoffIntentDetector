@@ -85,6 +85,8 @@ class HandoffDetector:
         dino_classes="cup",
         head_pose_weights=None,
         device="auto",
+        reject_back_facing=True,
+        back_facing_min_torso_ratio=0.15,
     ):
         self.features_type = features_type
         self.threshold = float(threshold)
@@ -94,6 +96,18 @@ class HandoffDetector:
         self.crop_object = crop_object
         self.dino_classes = dino_classes
         self.keypoint_confidence = float(confidence)
+
+        # Optional deployment-only gate for obvious back-facing views.
+        # This does not alter the feature vector or the trained TabM model.
+        self.reject_back_facing = bool(reject_back_facing)
+        self.back_facing_min_torso_ratio = float(
+            back_facing_min_torso_ratio
+        )
+
+        if self.back_facing_min_torso_ratio < 0.0:
+            raise ValueError(
+                "back_facing_min_torso_ratio must be >= 0.0."
+            )
 
         # Keep RTMPose crop generation identical to the updated training
         # pipeline. The full-frame RTMPose pass uses the normal detector
@@ -294,6 +308,120 @@ class HandoffDetector:
             return False
 
         return True
+
+    def _is_facing_away(
+        self,
+        person,
+    ):
+        """
+        Return True only for a clear back-facing pose.
+
+        RTMPose uses COCO anatomical left/right labels:
+          5, 6   = left/right shoulder
+          11, 12 = left/right hip
+
+        In an ordinary, unmirrored image:
+          front-facing: anatomical left is to image-right
+          back-facing:  anatomical left is to image-left
+
+        A frame is rejected only when BOTH the shoulder pair and hip pair
+        confidently have the back-facing ordering. The horizontal
+        separations are normalized by torso length so that the test is
+        approximately scale-invariant. Near-side views have small lateral
+        separation and therefore remain ambiguous rather than being
+        rejected.
+        """
+        if not self.reject_back_facing:
+            return False
+
+        keypoints = np.asarray(
+            person.get("keypoints", []),
+            dtype=np.float32,
+        )
+
+        # Standard COCO pose output has 17 keypoints. We specifically need
+        # shoulders (5, 6) and hips (11, 12) for a conservative back-view
+        # decision.
+        if (
+            keypoints.ndim != 2
+            or keypoints.shape[0] < 13
+            or keypoints.shape[1] < 2
+        ):
+            return False
+
+        left_shoulder = keypoints[5]
+        right_shoulder = keypoints[6]
+        left_hip = keypoints[11]
+        right_hip = keypoints[12]
+
+        torso_points = np.stack(
+            [
+                left_shoulder[:2],
+                right_shoulder[:2],
+                left_hip[:2],
+                right_hip[:2],
+            ]
+        )
+
+        if not np.isfinite(torso_points).all():
+            return False
+
+        # Do not make a front/back decision from weak torso keypoints.
+        if keypoints.shape[1] >= 3:
+            confidence_threshold = (
+                self.person_presence_confidence
+            )
+
+            torso_scores = np.asarray(
+                [
+                    left_shoulder[2],
+                    right_shoulder[2],
+                    left_hip[2],
+                    right_hip[2],
+                ],
+                dtype=np.float32,
+            )
+
+            if not np.isfinite(torso_scores).all():
+                return False
+
+            if np.any(
+                torso_scores < confidence_threshold
+            ):
+                return False
+
+        shoulder_midpoint = (
+            left_shoulder[:2] + right_shoulder[:2]
+        ) / 2.0
+        hip_midpoint = (
+            left_hip[:2] + right_hip[:2]
+        ) / 2.0
+
+        torso_length = float(
+            np.linalg.norm(
+                shoulder_midpoint - hip_midpoint
+            )
+        )
+
+        if torso_length <= 1e-6:
+            return False
+
+        # Positive values correspond to the anatomical left/right ordering
+        # expected when the person is facing away from the camera.
+        shoulder_back_ratio = float(
+            right_shoulder[0] - left_shoulder[0]
+        ) / torso_length
+
+        hip_back_ratio = float(
+            right_hip[0] - left_hip[0]
+        ) / torso_length
+
+        min_ratio = self.back_facing_min_torso_ratio
+
+        return (
+            shoulder_back_ratio >= min_ratio
+            and hip_back_ratio >= min_ratio
+        )
 
     def _crop_images(
         self,
@@ -533,6 +661,11 @@ class HandoffDetector:
         if not self._is_valid_person(people[0]):
             return None
 
+        # Reject only clear back-facing views before constructing any
+        # handoff features. Side/ambiguous views continue to the model.
+        if self._is_facing_away(people[0]):
+            return None
+
         keypoints = np.asarray(
             people[0]["keypoints"][:11],
             dtype=np.float32,
@@ -694,9 +827,9 @@ class HandoffDetector:
             depth_image,
         )
 
-        # No sufficiently confident person means a handoff is not
-        # possible. Return a normal negative prediction so ROS
-        # publishes a fresh state instead of retaining the previous
+        # No sufficiently confident person, or a clear back-facing person,
+        # means a handoff is rejected. Return a normal negative prediction
+        # so ROS publishes a fresh state instead of retaining the previous
         # classification after an exception.
         if features is None:
             return "not_handoff", 1.0
