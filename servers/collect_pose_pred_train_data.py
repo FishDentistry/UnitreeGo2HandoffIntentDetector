@@ -1,7 +1,11 @@
 import asyncio
+import base64
+import binascii
+import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 from collections import defaultdict, deque
@@ -16,7 +20,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Robot Motion Alignment Server",
-    version="3.0.0",
+    version="3.2.0",
 )
 
 
@@ -51,6 +55,11 @@ QUEST_CLOCK_RESET_THRESHOLD_SECONDS = 5.0
 # time_from_window_start/window_duration_seconds.
 QUEST_WINDOW_SPAN_ABSOLUTE_TOLERANCE_SECONDS = 0.50
 QUEST_WINDOW_SPAN_RELATIVE_TOLERANCE = 0.10
+
+# Image-payload safety limits.
+# A normal 1280px Quest JPEG should be far below this per-frame limit.
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGES_PER_WINDOW = 500
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +96,16 @@ DATA_DIR.mkdir(
     exist_ok=True,
 )
 
+IMAGE_DATA_DIR = (
+    DATA_DIR
+    / "images"
+)
+
+IMAGE_DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -96,6 +115,14 @@ class Vector3(BaseModel):
     x: float
     y: float
     z: float
+
+
+class QuaternionValue(BaseModel):
+    """Quaternion serialized in Unity x, y, z, w component order."""
+    x: float
+    y: float
+    z: float
+    w: float
 
 
 class RobotMotionSample(BaseModel):
@@ -111,12 +138,40 @@ class RobotMotionSample(BaseModel):
 
     `time_from_window_start` remains the relative time within the motion
     window and is never rebased.
+
+    Image fields are backward compatible:
+      - motion-only senders may omit them;
+      - image-enabled senders use `image_frame_id` to reference one entry
+        in the top-level `images` array.
     """
     timestamp: float
     time_from_window_start: float
 
     position: Vector3
     heading: Vector3
+
+    has_image: bool = False
+    image_frame_id: int = -1
+
+
+class RobotMotionImage(BaseModel):
+    """One unique JPEG frame referenced by one or more motion samples."""
+    frame_id: int = Field(ge=0)
+
+    mime_type: str = "image/jpeg"
+
+    image_width: int = Field(gt=0)
+    image_height: int = Field(gt=0)
+
+    capture_timestamp_unix: float
+    capture_realtime_seconds: float
+
+    # Quest-world camera pose captured with this RGB frame. Optional only
+    # so older image-enabled clients remain accepted.
+    camera_position: Optional[Vector3] = None
+    camera_rotation: Optional[QuaternionValue] = None
+
+    jpeg_base64: str
 
 
 class RobotMotionHistoryWindow(BaseModel):
@@ -138,7 +193,15 @@ class RobotMotionHistoryWindow(BaseModel):
     window_duration_seconds: float
     sample_count: int = Field(ge=1)
 
+    # Backward-compatible image metadata. Motion-only payloads may omit all
+    # three fields and will therefore behave exactly as before.
+    includes_images: bool = False
+    image_count: int = Field(default=0, ge=0)
+
     samples: List[RobotMotionSample]
+    images: List[RobotMotionImage] = Field(
+        default_factory=list
+    )
 
 
 class RobotGroundTruthSample(BaseModel):
@@ -268,6 +331,36 @@ def get_window_file_path(
     )
 
     return DATA_DIR / filename
+
+
+def get_window_image_directory(
+    source_id: str,
+    window_id: str,
+) -> Path:
+    """
+    Directory containing JPEGs and a manifest for one Quest motion window.
+
+    Layout:
+        data/
+          images/
+            <source_id>/
+              <window_id>/
+                frame_<frame_id>.jpg
+                manifest.json
+    """
+    safe_source_id = sanitize_filename_component(
+        source_id
+    )
+
+    safe_window_id = sanitize_filename_component(
+        window_id
+    )
+
+    return (
+        IMAGE_DATA_DIR
+        / safe_source_id
+        / safe_window_id
+    )
 
 
 def vector3_list_to_array(
@@ -1185,6 +1278,566 @@ def align_robot_ground_truth_to_quest(
 
 
 # ---------------------------------------------------------------------------
+# Motion-window image validation / storage
+# ---------------------------------------------------------------------------
+
+def validate_and_decode_motion_images(
+    window: RobotMotionHistoryWindow,
+) -> Dict[int, bytes]:
+    """
+    Validate the optional image portion of a Quest motion-history payload.
+
+    Returns:
+        Dictionary mapping frame_id -> decoded JPEG bytes.
+
+    Motion-only payloads return an empty dictionary.
+    """
+    if window.image_count != len(window.images):
+        raise ValueError(
+            "image_count does not match the number "
+            "of images in the payload."
+        )
+
+    if len(window.images) > MAX_IMAGES_PER_WINDOW:
+        raise ValueError(
+            "Motion window contains too many images: "
+            f"{len(window.images)} > "
+            f"{MAX_IMAGES_PER_WINDOW}."
+        )
+
+    if window.includes_images and not window.images:
+        raise ValueError(
+            "includes_images is true but the payload "
+            "contains no images."
+        )
+
+    decoded_by_frame_id: Dict[int, bytes] = {}
+
+    for image in window.images:
+        if image.frame_id in decoded_by_frame_id:
+            raise ValueError(
+                "Duplicate image frame_id in payload: "
+                f"{image.frame_id}."
+            )
+
+        # Position and rotation should either both be supplied or both omitted.
+        if (image.camera_position is None) != (image.camera_rotation is None):
+            raise ValueError(
+                "Camera pose for image frame "
+                f"{image.frame_id} must contain both camera_position "
+                "and camera_rotation, or neither."
+            )
+
+        if image.camera_position is not None:
+            pose_values = [
+                image.camera_position.x,
+                image.camera_position.y,
+                image.camera_position.z,
+                image.camera_rotation.x,
+                image.camera_rotation.y,
+                image.camera_rotation.z,
+                image.camera_rotation.w,
+            ]
+
+            if not all(math.isfinite(float(value)) for value in pose_values):
+                raise ValueError(
+                    "Camera pose contains non-finite values for image frame "
+                    f"{image.frame_id}."
+                )
+
+            quaternion_norm = math.sqrt(
+                float(image.camera_rotation.x) ** 2
+                + float(image.camera_rotation.y) ** 2
+                + float(image.camera_rotation.z) ** 2
+                + float(image.camera_rotation.w) ** 2
+            )
+
+            if quaternion_norm < 1.0e-8:
+                raise ValueError(
+                    "Camera rotation quaternion has near-zero magnitude for "
+                    f"image frame {image.frame_id}."
+                )
+
+        if image.mime_type.lower() not in {
+            "image/jpeg",
+            "image/jpg",
+        }:
+            raise ValueError(
+                "Unsupported motion image MIME type "
+                f"for frame {image.frame_id}: "
+                f"{image.mime_type!r}. "
+                "Only JPEG images are accepted."
+            )
+
+        try:
+            jpeg_bytes = base64.b64decode(
+                image.jpeg_base64,
+                validate=True,
+            )
+        except (
+            binascii.Error,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                "Invalid Base64 JPEG data for frame "
+                f"{image.frame_id}."
+            ) from exc
+
+        if not jpeg_bytes:
+            raise ValueError(
+                "Decoded JPEG is empty for frame "
+                f"{image.frame_id}."
+            )
+
+        if len(jpeg_bytes) > MAX_IMAGE_BYTES:
+            raise ValueError(
+                "Decoded JPEG exceeds the per-image "
+                "size limit for frame "
+                f"{image.frame_id}: "
+                f"{len(jpeg_bytes)} bytes > "
+                f"{MAX_IMAGE_BYTES} bytes."
+            )
+
+        # JPEG files begin with the SOI marker FF D8.
+        if not jpeg_bytes.startswith(
+            b"\xff\xd8"
+        ):
+            raise ValueError(
+                "Decoded image does not look like a "
+                "JPEG for frame "
+                f"{image.frame_id}."
+            )
+
+        decoded_by_frame_id[
+            image.frame_id
+        ] = jpeg_bytes
+
+    referenced_frame_ids = set()
+
+    for sample_index, sample in enumerate(
+        window.samples
+    ):
+        if sample.has_image:
+            if sample.image_frame_id < 0:
+                raise ValueError(
+                    "Motion sample "
+                    f"{sample_index} has_image=true "
+                    "but image_frame_id is negative."
+                )
+
+            if (
+                sample.image_frame_id
+                not in decoded_by_frame_id
+            ):
+                raise ValueError(
+                    "Motion sample "
+                    f"{sample_index} references image "
+                    f"frame {sample.image_frame_id}, "
+                    "but that frame is not present in "
+                    "the top-level images array."
+                )
+
+            referenced_frame_ids.add(
+                sample.image_frame_id
+            )
+
+    unreferenced_frame_ids = (
+        set(decoded_by_frame_id.keys())
+        - referenced_frame_ids
+    )
+
+    if unreferenced_frame_ids:
+        raise ValueError(
+            "The payload contains image frames that "
+            "are not referenced by any motion sample: "
+            f"{sorted(unreferenced_frame_ids)}."
+        )
+
+    return decoded_by_frame_id
+
+
+def build_motion_image_metadata(
+    window: RobotMotionHistoryWindow,
+) -> dict:
+    """
+    Build fixed-size NumPy metadata arrays that can be stored in the aligned
+    .npz without embedding the JPEG bytes themselves.
+    """
+    sample_has_image = np.asarray(
+        [
+            bool(sample.has_image)
+            for sample in window.samples
+        ],
+        dtype=np.bool_,
+    )
+
+    sample_image_frame_ids = np.asarray(
+        [
+            (
+                int(sample.image_frame_id)
+                if sample.has_image
+                else -1
+            )
+            for sample in window.samples
+        ],
+        dtype=np.int64,
+    )
+
+    image_frame_ids = np.asarray(
+        [
+            int(image.frame_id)
+            for image in window.images
+        ],
+        dtype=np.int64,
+    )
+
+    image_widths = np.asarray(
+        [
+            int(image.image_width)
+            for image in window.images
+        ],
+        dtype=np.int32,
+    )
+
+    image_heights = np.asarray(
+        [
+            int(image.image_height)
+            for image in window.images
+        ],
+        dtype=np.int32,
+    )
+
+    image_capture_timestamp_unix = np.asarray(
+        [
+            float(image.capture_timestamp_unix)
+            for image in window.images
+        ],
+        dtype=np.float64,
+    )
+
+    image_capture_realtime_seconds = np.asarray(
+        [
+            float(image.capture_realtime_seconds)
+            for image in window.images
+        ],
+        dtype=np.float64,
+    )
+
+    image_camera_positions = np.asarray(
+        [
+            (
+                [
+                    float(image.camera_position.x),
+                    float(image.camera_position.y),
+                    float(image.camera_position.z),
+                ]
+                if image.camera_position is not None
+                else [np.nan, np.nan, np.nan]
+            )
+            for image in window.images
+        ],
+        dtype=np.float32,
+    ).reshape((-1, 3))
+
+    # Unity Quaternion fields are serialized in x, y, z, w order.
+    image_camera_rotations_xyzw = np.asarray(
+        [
+            (
+                [
+                    float(image.camera_rotation.x),
+                    float(image.camera_rotation.y),
+                    float(image.camera_rotation.z),
+                    float(image.camera_rotation.w),
+                ]
+                if image.camera_rotation is not None
+                else [np.nan, np.nan, np.nan, np.nan]
+            )
+            for image in window.images
+        ],
+        dtype=np.float32,
+    ).reshape((-1, 4))
+
+    image_has_camera_pose = np.asarray(
+        [
+            image.camera_position is not None
+            and image.camera_rotation is not None
+            for image in window.images
+        ],
+        dtype=np.bool_,
+    )
+
+    safe_source_id = sanitize_filename_component(
+        window.source_id
+    )
+
+    safe_window_id = sanitize_filename_component(
+        window.window_id
+    )
+
+    image_relative_paths = np.asarray(
+        [
+            (
+                Path("images")
+                / safe_source_id
+                / safe_window_id
+                / (
+                    "frame_"
+                    f"{int(image.frame_id):020d}"
+                    ".jpg"
+                )
+            ).as_posix()
+            for image in window.images
+        ],
+        dtype=str,
+    )
+
+    return {
+        "sample_has_image": sample_has_image,
+        "sample_image_frame_ids": (
+            sample_image_frame_ids
+        ),
+        "image_frame_ids": image_frame_ids,
+        "image_widths": image_widths,
+        "image_heights": image_heights,
+        "image_capture_timestamp_unix": (
+            image_capture_timestamp_unix
+        ),
+        "image_capture_realtime_seconds": (
+            image_capture_realtime_seconds
+        ),
+        "image_has_camera_pose": (
+            image_has_camera_pose
+        ),
+        "image_camera_positions": (
+            image_camera_positions
+        ),
+        "image_camera_rotations_xyzw": (
+            image_camera_rotations_xyzw
+        ),
+        "image_relative_paths": (
+            image_relative_paths
+        ),
+    }
+
+
+def save_motion_window_images(
+    window: RobotMotionHistoryWindow,
+) -> Optional[Path]:
+    """
+    Save unique JPEG frames for one motion window and write manifest.json.
+
+    JPEGs are intentionally stored as normal image files rather than inside
+    the .npz. The .npz stores frame IDs and relative paths that link each
+    motion sample back to the correct JPEG.
+    """
+    decoded_by_frame_id = (
+        validate_and_decode_motion_images(
+            window
+        )
+    )
+
+    if not decoded_by_frame_id:
+        return None
+
+    final_directory = (
+        get_window_image_directory(
+            source_id=window.source_id,
+            window_id=window.window_id,
+        )
+    )
+
+    final_directory.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp_directory = Path(
+        tempfile.mkdtemp(
+            prefix=".motion_images_",
+            dir=final_directory.parent,
+        )
+    )
+
+    sample_indices_by_frame: Dict[
+        int,
+        List[int],
+    ] = defaultdict(list)
+
+    for sample_index, sample in enumerate(
+        window.samples
+    ):
+        if sample.has_image:
+            sample_indices_by_frame[
+                int(sample.image_frame_id)
+            ].append(
+                sample_index
+            )
+
+    manifest_images = []
+
+    try:
+        for image in window.images:
+            frame_id = int(
+                image.frame_id
+            )
+
+            filename = (
+                "frame_"
+                f"{frame_id:020d}"
+                ".jpg"
+            )
+
+            image_path = (
+                temp_directory
+                / filename
+            )
+
+            image_path.write_bytes(
+                decoded_by_frame_id[
+                    frame_id
+                ]
+            )
+
+            relative_path = (
+                Path("images")
+                / sanitize_filename_component(
+                    window.source_id
+                )
+                / sanitize_filename_component(
+                    window.window_id
+                )
+                / filename
+            ).as_posix()
+
+            manifest_images.append(
+                {
+                    "frame_id": frame_id,
+                    "file_name": filename,
+                    "relative_path": (
+                        relative_path
+                    ),
+                    "mime_type": (
+                        image.mime_type
+                    ),
+                    "image_width": (
+                        int(
+                            image.image_width
+                        )
+                    ),
+                    "image_height": (
+                        int(
+                            image.image_height
+                        )
+                    ),
+                    "capture_timestamp_unix": (
+                        float(
+                            image.capture_timestamp_unix
+                        )
+                    ),
+                    "capture_realtime_seconds": (
+                        float(
+                            image.capture_realtime_seconds
+                        )
+                    ),
+                    "camera_position": (
+                        {
+                            "x": float(image.camera_position.x),
+                            "y": float(image.camera_position.y),
+                            "z": float(image.camera_position.z),
+                        }
+                        if image.camera_position is not None
+                        else None
+                    ),
+                    "camera_rotation_xyzw": (
+                        {
+                            "x": float(image.camera_rotation.x),
+                            "y": float(image.camera_rotation.y),
+                            "z": float(image.camera_rotation.z),
+                            "w": float(image.camera_rotation.w),
+                        }
+                        if image.camera_rotation is not None
+                        else None
+                    ),
+                    "sample_indices": (
+                        sample_indices_by_frame[
+                            frame_id
+                        ]
+                    ),
+                    "byte_count": len(
+                        decoded_by_frame_id[
+                            frame_id
+                        ]
+                    ),
+                }
+            )
+
+        manifest = {
+            "schema_version": (
+                window.schema_version
+            ),
+            "window_id": (
+                window.window_id
+            ),
+            "source_id": (
+                window.source_id
+            ),
+            "sample_count": (
+                len(window.samples)
+            ),
+            "image_count": (
+                len(window.images)
+            ),
+            "sample_image_frame_ids": [
+                (
+                    int(
+                        sample.image_frame_id
+                    )
+                    if sample.has_image
+                    else -1
+                )
+                for sample in window.samples
+            ],
+            "images": manifest_images,
+        }
+
+        manifest_path = (
+            temp_directory
+            / "manifest.json"
+        )
+
+        manifest_path.write_text(
+            json.dumps(
+                manifest,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        # If a previous interrupted attempt left image files behind but no
+        # completed .npz, replace that stale directory with this validated one.
+        if final_directory.exists():
+            shutil.rmtree(
+                final_directory
+            )
+
+        os.replace(
+            temp_directory,
+            final_directory,
+        )
+
+    except Exception:
+        if temp_directory.exists():
+            shutil.rmtree(
+                temp_directory,
+                ignore_errors=True,
+            )
+
+        raise
+
+    return final_directory
+
+
+# ---------------------------------------------------------------------------
 # Saving
 # ---------------------------------------------------------------------------
 
@@ -1262,6 +1915,18 @@ def save_aligned_motion_window(
         > ALIGNMENT_GAP_WARNING_SECONDS
     )
 
+    image_metadata = (
+        build_motion_image_metadata(
+            window
+        )
+    )
+
+    image_directory = (
+        save_motion_window_images(
+            window
+        )
+    )
+
     with tempfile.NamedTemporaryFile(
         dir=DATA_DIR,
         suffix=".npz",
@@ -1310,6 +1975,89 @@ def save_aligned_motion_window(
             ),
 
             # -----------------------------------------------------------
+            # Optional Quest image metadata
+            #
+            # JPEG bytes themselves are saved under:
+            # data/images/<source_id>/<window_id>/
+            # -----------------------------------------------------------
+            quest_includes_images=np.asarray(
+                len(window.images) > 0,
+                dtype=np.bool_,
+            ),
+
+            quest_image_count=np.asarray(
+                len(window.images),
+                dtype=np.int32,
+            ),
+
+            quest_sample_has_image=(
+                image_metadata[
+                    "sample_has_image"
+                ]
+            ),
+
+            quest_sample_image_frame_ids=(
+                image_metadata[
+                    "sample_image_frame_ids"
+                ]
+            ),
+
+            quest_image_frame_ids=(
+                image_metadata[
+                    "image_frame_ids"
+                ]
+            ),
+
+            quest_image_widths=(
+                image_metadata[
+                    "image_widths"
+                ]
+            ),
+
+            quest_image_heights=(
+                image_metadata[
+                    "image_heights"
+                ]
+            ),
+
+            quest_image_capture_timestamp_unix=(
+                image_metadata[
+                    "image_capture_timestamp_unix"
+                ]
+            ),
+
+            quest_image_capture_realtime_seconds=(
+                image_metadata[
+                    "image_capture_realtime_seconds"
+                ]
+            ),
+
+            quest_image_has_camera_pose=(
+                image_metadata[
+                    "image_has_camera_pose"
+                ]
+            ),
+
+            quest_image_camera_positions=(
+                image_metadata[
+                    "image_camera_positions"
+                ]
+            ),
+
+            # Quaternion component order: x, y, z, w.
+            quest_image_camera_rotations_xyzw=(
+                image_metadata[
+                    "image_camera_rotations_xyzw"
+                ]
+            ),
+
+            quest_image_relative_paths=(
+                image_metadata[
+                    "image_relative_paths"
+                ]
+            ),
+
+            # -----------------------------------------------------------
             # Quest clock diagnostics
             # -----------------------------------------------------------
             quest_original_timestamps=(
@@ -1345,24 +2093,30 @@ def save_aligned_motion_window(
             # -----------------------------------------------------------
             # Backward-compatible Quest keys.
             #
-            # `timestamps` now means the normalized/rebased Unix timeline,
+            # `timestamps` means the normalized/rebased Unix timeline,
             # while positions/headings remain the Quest-estimated values.
             # -----------------------------------------------------------
             timestamps=quest_timestamps,
+
             time_from_window_start=(
                 quest_time_from_start
             ),
+
             positions=quest_positions,
+
             headings=quest_headings,
 
             # -----------------------------------------------------------
             # Explicit Quest-estimate keys
             # -----------------------------------------------------------
             quest_timestamps=quest_timestamps,
+
             quest_time_from_window_start=(
                 quest_time_from_start
             ),
+
             quest_positions=quest_positions,
+
             quest_headings=quest_headings,
 
             # -----------------------------------------------------------
@@ -1371,12 +2125,15 @@ def save_aligned_motion_window(
             robot_ground_truth_timestamps=(
                 quest_timestamps
             ),
+
             robot_ground_truth_positions=(
                 robot_positions
             ),
+
             robot_ground_truth_headings=(
                 robot_headings
             ),
+
             robot_ground_truth_yaw=(
                 robot_yaw
             ),
@@ -1457,6 +2214,17 @@ def save_aligned_motion_window(
     except Exception:
         if temp_path.exists():
             temp_path.unlink()
+
+        # Do not leave a seemingly valid image directory without its matching
+        # aligned .npz if the final motion save fails.
+        if (
+            image_directory is not None
+            and image_directory.exists()
+        ):
+            shutil.rmtree(
+                image_directory,
+                ignore_errors=True,
+            )
 
         raise
 
@@ -1919,6 +2687,7 @@ async def receive_robot_ground_truth(
     }
 
 
+@app.post("/robot-motion-history")
 @app.post("/robot_motion_history")
 async def receive_robot_motion_history(
     window: RobotMotionHistoryWindow,
@@ -1948,6 +2717,16 @@ async def receive_robot_motion_history(
             ),
         )
 
+    try:
+        validate_and_decode_motion_images(
+            window
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
     output_path = get_window_file_path(
         source_id=window.source_id,
         window_id=window.window_id,
@@ -1971,8 +2750,24 @@ async def receive_robot_motion_history(
                 "samples_received": len(
                     window.samples
                 ),
+                "images_received": len(
+                    window.images
+                ),
                 "saved_path": str(
                     output_path
+                ),
+                "image_directory": (
+                    str(
+                        get_window_image_directory(
+                            window.source_id,
+                            window.window_id,
+                        )
+                    )
+                    if get_window_image_directory(
+                        window.source_id,
+                        window.window_id,
+                    ).exists()
+                    else None
                 ),
             }
 
@@ -1996,6 +2791,9 @@ async def receive_robot_motion_history(
                 ),
                 "samples_received": len(
                     window.samples
+                ),
+                "images_received": len(
+                    existing.window.images
                 ),
                 "timestamp_mode": (
                     existing.timestamp_mode
@@ -2060,6 +2858,19 @@ async def receive_robot_motion_history(
                 "samples_received": len(
                     window.samples
                 ),
+                "images_received": len(
+                    window.images
+                ),
+                "image_directory": (
+                    str(
+                        get_window_image_directory(
+                            window.source_id,
+                            window.window_id,
+                        )
+                    )
+                    if window.images
+                    else None
+                ),
                 "timestamp_mode": (
                     prepared.timestamp_mode
                 ),
@@ -2104,6 +2915,9 @@ async def receive_robot_motion_history(
             ),
             "samples_received": len(
                 window.samples
+            ),
+            "images_received": len(
+                window.images
             ),
             "timestamp_mode": (
                 prepared.timestamp_mode

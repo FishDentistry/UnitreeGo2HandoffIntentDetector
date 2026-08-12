@@ -1,4 +1,9 @@
-#python -m quest_hand_intent_model_est.model_training.train_quest_hand_int_est_mlp --teacher-features-type keypoints --student-features-type keypoints_projections
+# python -m quest_hand_intent_model_est.model_training.train_quest_hand_int_est_mlp \
+#     --model-type tabm \
+#     --teacher-features-type keypoints_headpose_resnet \
+#     --student-features-type keypoints_projections \
+#     --crop-around-object \
+#     --tune-tabm
 import numpy as np
 from shared.util.extract_all_samples import discover_samples, organize_samples
 from pathlib import Path

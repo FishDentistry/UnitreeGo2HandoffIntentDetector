@@ -248,8 +248,9 @@ def format_robot_tracking_result(
         "replacement_candidate_count":
             result.replacement_candidate_count,
         "verification_misses": result.verification_misses,
+        "angle_between_cam_and_robot_forward": 0.0,
+        "angle_sin_cos": [0.0, 0.0],
     }
-
 
 def create_app(
     robot_obj_det_weights_path: str,
@@ -324,11 +325,15 @@ def create_app(
     app.state.robot_tracking_lock = threading.Lock()
     app.state.latest_robot_tracking_result = None
     app.state.last_robot_frame_id = -1
+    app.state.latest_robot_camera_position = None
+    app.state.latest_robot_camera_rotation = None
 
     def process_robot_frame(
         image_bytes: bytes,
         frame_id: int,
         capture_timestamp_unix: Optional[float],
+        camera_position: Optional[dict[str, float]],
+        camera_rotation: Optional[dict[str, float]],
     ) -> dict[str, Any]:
         """
         Decode and process one image.
@@ -429,6 +434,8 @@ def create_app(
 
             app.state.last_robot_frame_id = frame_id
             app.state.latest_robot_tracking_result = result
+            app.state.latest_robot_camera_position = camera_position
+            app.state.latest_robot_camera_rotation = camera_rotation
 
             res = {
                 "accepted": True,
@@ -556,6 +563,13 @@ def create_app(
                 "was captured."
             ),
         ),
+        camera_position_x: Optional[float] = Query(default=None),
+        camera_position_y: Optional[float] = Query(default=None),
+        camera_position_z: Optional[float] = Query(default=None),
+        camera_rotation_x: Optional[float] = Query(default=None),
+        camera_rotation_y: Optional[float] = Query(default=None),
+        camera_rotation_z: Optional[float] = Query(default=None),
+        camera_rotation_w: Optional[float] = Query(default=None),
     ):
         """
         Receive one encoded Quest RGB image and return robot tracking data.
@@ -566,9 +580,69 @@ def create_app(
         Required query parameter:
             frame_id
 
-        Optional query parameter:
+        Optional query parameters:
             capture_timestamp_unix
+
+            camera_position_x
+            camera_position_y
+            camera_position_z
+            camera_rotation_x
+            camera_rotation_y
+            camera_rotation_z
+            camera_rotation_w
+
+        Camera pose is optional, but when supplied all seven pose values must
+        be present. Position is in the Quest world frame. Rotation is the
+        CameraFrameCapture quaternion in Unity x/y/z/w order.
         """
+        camera_pose_values = [
+            camera_position_x,
+            camera_position_y,
+            camera_position_z,
+            camera_rotation_x,
+            camera_rotation_y,
+            camera_rotation_z,
+            camera_rotation_w,
+        ]
+
+        any_camera_pose_value = any(
+            value is not None
+            for value in camera_pose_values
+        )
+
+        all_camera_pose_values = all(
+            value is not None
+            for value in camera_pose_values
+        )
+
+        if any_camera_pose_value and not all_camera_pose_values:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Camera pose was only partially supplied. "
+                    "Provide all camera_position_x/y/z and "
+                    "camera_rotation_x/y/z/w values, or omit "
+                    "the camera pose entirely."
+                ),
+            )
+
+        camera_position = None
+        camera_rotation = None
+
+        if all_camera_pose_values:
+            camera_position = {
+                "x": float(camera_position_x),
+                "y": float(camera_position_y),
+                "z": float(camera_position_z),
+            }
+
+            camera_rotation = {
+                "x": float(camera_rotation_x),
+                "y": float(camera_rotation_y),
+                "z": float(camera_rotation_z),
+                "w": float(camera_rotation_w),
+            }
+
         image_bytes = await request.body()
 
         if not image_bytes:
@@ -582,6 +656,8 @@ def create_app(
             image_bytes,
             frame_id,
             capture_timestamp_unix,
+            camera_position,
+            camera_rotation,
         )
 
     # Optional endpoint for forcing a clean reacquisition.
@@ -595,6 +671,8 @@ def create_app(
             app.state.robot_tracker.reset()
             app.state.latest_robot_tracking_result = None
             app.state.last_robot_frame_id = -1
+            app.state.latest_robot_camera_position = None
+            app.state.latest_robot_camera_rotation = None
 
         return {
             "success": True,

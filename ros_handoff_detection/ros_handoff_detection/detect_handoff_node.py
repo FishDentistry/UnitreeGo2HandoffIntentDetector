@@ -49,7 +49,7 @@ class HandoffInferenceNode(Node):
 
         self.declare_parameter(
             "servo_port",
-            "COM3",
+            "/dev/ttyACM0",
         )
 
         self.declare_parameter(

@@ -8,6 +8,7 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
@@ -49,6 +50,155 @@ class SequenceConfig:
 
 
 # ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class FrameInvariantRobotPoseLSTM(RobotPoseLSTM):
+    """
+    Shared LSTM encoder with two heads:
+
+      1. Future trajectory head:
+         Predicts the robot's future pose sequence relative to the TRUE robot
+         pose at the prediction anchor.
+
+      2. Current relative-state head:
+         Predicts the TRUE robot motion from the start of the observed history
+         to the prediction anchor.
+
+    Both targets are expressed in locally normalized robot-relative frames.
+    No robot-map <-> Quest-world transform is estimated, stored, or assumed.
+    """
+
+    def __init__(
+        self,
+        input_size: int = 7,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        prediction_steps: int = 40,
+        decoder_hidden_size: int = 128,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            prediction_steps=prediction_steps,
+            decoder_hidden_size=decoder_hidden_size,
+            dropout=dropout,
+        )
+
+        self.current_state_decoder = nn.Sequential(
+            nn.Linear(
+                hidden_size,
+                decoder_hidden_size,
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(
+                decoder_hidden_size,
+                4,
+            ),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        Returns:
+            future_prediction:
+                (B, prediction_steps, 4)
+                [x, z, heading_x, heading_z]
+
+            current_state_prediction:
+                (B, 4)
+                true motion from history start -> current anchor:
+                [delta_x, delta_z, heading_x, heading_z]
+        """
+        _, (hidden, _) = self.lstm(x)
+
+        encoded = hidden[-1]
+
+        future_output = self.decoder(
+            encoded
+        )
+
+        future_output = future_output.view(
+            x.shape[0],
+            self.prediction_steps,
+            4,
+        )
+
+        future_position = (
+            future_output[..., :2]
+        )
+
+        future_heading = F.normalize(
+            future_output[..., 2:4],
+            p=2,
+            dim=-1,
+            eps=1e-8,
+        )
+
+        future_prediction = torch.cat(
+            [
+                future_position,
+                future_heading,
+            ],
+            dim=-1,
+        )
+
+        current_output = (
+            self.current_state_decoder(
+                encoded
+            )
+        )
+
+        current_position = (
+            current_output[..., :2]
+        )
+
+        current_heading = F.normalize(
+            current_output[..., 2:4],
+            p=2,
+            dim=-1,
+            eps=1e-8,
+        )
+
+        current_state_prediction = (
+            torch.cat(
+                [
+                    current_position,
+                    current_heading,
+                ],
+                dim=-1,
+            )
+        )
+
+        return (
+            future_prediction,
+            current_state_prediction,
+        )
+
+    def get_config(self) -> dict:
+        config = super().get_config()
+
+        config.update(
+            {
+                "model_type": (
+                    "frame_invariant_dual_head_lstm"
+                ),
+                "current_state_output_size": 4,
+            }
+        )
+
+        return config
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -56,7 +206,8 @@ class RobotTrajectoryDataset(Dataset):
     def __init__(
         self,
         inputs: np.ndarray,
-        targets: np.ndarray,
+        future_targets: np.ndarray,
+        current_state_targets: np.ndarray,
         input_mean: np.ndarray,
         input_std: np.ndarray,
     ) -> None:
@@ -65,7 +216,17 @@ class RobotTrajectoryDataset(Dataset):
             / input_std
         ).astype(np.float32)
 
-        self.targets = targets.astype(np.float32)
+        self.future_targets = (
+            future_targets.astype(
+                np.float32
+            )
+        )
+
+        self.current_state_targets = (
+            current_state_targets.astype(
+                np.float32
+            )
+        )
 
     def __len__(self) -> int:
         return len(self.inputs)
@@ -73,10 +234,23 @@ class RobotTrajectoryDataset(Dataset):
     def __getitem__(
         self,
         index: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         return (
-            torch.from_numpy(self.inputs[index]),
-            torch.from_numpy(self.targets[index]),
+            torch.from_numpy(
+                self.inputs[index]
+            ),
+            torch.from_numpy(
+                self.future_targets[index]
+            ),
+            torch.from_numpy(
+                self.current_state_targets[
+                    index
+                ]
+            ),
         )
 
 
@@ -472,40 +646,40 @@ def build_example(
     ground_truth_yaw_world: np.ndarray,
     anchor_time: float,
     config: SequenceConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
-    Build one supervised example centered around a prediction anchor.
+    Build one frame-invariant supervised example.
 
-    INPUT:
-        The previous `history_seconds` of QUEST-ESTIMATED robot motion.
+    INPUT
+    -----
+    The previous `history_seconds` of QUEST-ESTIMATED motion, normalized
+    relative to the Quest-estimated pose at the prediction anchor.
 
-        The Quest stream is transformed into a coordinate system in which
-        the Quest-estimated robot pose at anchor_time is:
+    FUTURE TARGET
+    -------------
+    The next `prediction_seconds` of ROBOT GROUND-TRUTH motion, normalized
+    relative to the TRUE robot pose at the same prediction anchor.
 
-            position = (0, 0)
-            heading  = +Z
+    CURRENT-STATE AUXILIARY TARGET
+    ------------------------------
+    The TRUE robot motion from the beginning of the observed history to the
+    prediction anchor, normalized relative to the TRUE robot pose at the
+    beginning of the history.
 
-    TARGET:
-        The next `prediction_seconds` of ROBOT GROUND-TRUTH motion.
+    QUEST CURRENT-STATE BASELINE
+    ----------------------------
+    The same start->current relative motion computed from Quest measurements.
+    This is used only for evaluation so we can ask whether the learned state
+    head improves on the raw Quest temporal estimate.
 
-        The ground-truth stream is independently transformed into a
-        coordinate system in which the TRUE robot pose at the SAME
-        anchor_time is:
-
-            position = (0, 0)
-            heading  = +Z
-
-    Why transform the streams independently?
-
-        The Quest world frame and robot map frame do not need to share the
-        same global origin or absolute orientation. The model learns:
-
-            noisy observer-side relative motion
-                        ->
-            true future robot-relative motion
-
-        rather than trying to learn an arbitrary transform between two
-        unrelated global coordinate frames.
+    Crucially, Quest and robot ground truth are normalized independently.
+    No absolute transform between their global coordinate systems is ever
+    computed or assumed.
     """
 
     dt = config.dt
@@ -534,9 +708,13 @@ def build_example(
         + future_relative_times
     )
 
+    history_start_time = float(
+        history_query_times[0]
+    )
+
     # ------------------------------------------------------------------
-    # Quest-estimated pose at the prediction anchor.
-    # This defines the coordinate frame of the LSTM input.
+    # Quest pose at CURRENT prediction anchor.
+    # Defines the LSTM input frame.
     # ------------------------------------------------------------------
 
     quest_anchor_x = float(
@@ -564,8 +742,8 @@ def build_example(
     )
 
     # ------------------------------------------------------------------
-    # True robot pose at the SAME prediction anchor.
-    # This independently defines the coordinate frame of the target.
+    # Robot GT pose at CURRENT prediction anchor.
+    # Defines the future-target frame.
     # ------------------------------------------------------------------
 
     ground_truth_anchor_x = float(
@@ -587,6 +765,59 @@ def build_example(
     ground_truth_anchor_yaw = float(
         np.interp(
             anchor_time,
+            times,
+            ground_truth_yaw_world,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Pose at the START of the observed history for both streams.
+    # These anchors are independent.
+    # ------------------------------------------------------------------
+
+    quest_history_start_x = float(
+        np.interp(
+            history_start_time,
+            times,
+            quest_positions[:, 0],
+        )
+    )
+
+    quest_history_start_z = float(
+        np.interp(
+            history_start_time,
+            times,
+            quest_positions[:, 2],
+        )
+    )
+
+    quest_history_start_yaw = float(
+        np.interp(
+            history_start_time,
+            times,
+            quest_yaw_world,
+        )
+    )
+
+    ground_truth_history_start_x = float(
+        np.interp(
+            history_start_time,
+            times,
+            ground_truth_positions[:, 0],
+        )
+    )
+
+    ground_truth_history_start_z = float(
+        np.interp(
+            history_start_time,
+            times,
+            ground_truth_positions[:, 2],
+        )
+    )
+
+    ground_truth_history_start_yaw = float(
+        np.interp(
+            history_start_time,
             times,
             ground_truth_yaw_world,
         )
@@ -615,7 +846,7 @@ def build_example(
     )
 
     # ------------------------------------------------------------------
-    # Resample robot-ground-truth FUTURE.
+    # Resample robot GT FUTURE.
     # ------------------------------------------------------------------
 
     future_ground_truth_x_world = np.interp(
@@ -637,7 +868,8 @@ def build_example(
     )
 
     # ------------------------------------------------------------------
-    # Quest history -> Quest-anchor-relative coordinates.
+    # Quest history -> Quest CURRENT-anchor-relative coordinates.
+    # Current estimated pose is therefore (0, 0, +Z).
     # ------------------------------------------------------------------
 
     (
@@ -665,7 +897,7 @@ def build_example(
     )
 
     # ------------------------------------------------------------------
-    # Ground-truth future -> TRUE-anchor-relative coordinates.
+    # Robot GT future -> TRUE CURRENT-anchor-relative coordinates.
     # ------------------------------------------------------------------
 
     (
@@ -697,6 +929,113 @@ def build_example(
     )
 
     # ------------------------------------------------------------------
+    # TRUE current relative state:
+    #
+    # Ground-truth motion from HISTORY START -> CURRENT ANCHOR,
+    # expressed in the GT frame at history start.
+    #
+    # This is invariant to arbitrary robot-map origin/orientation.
+    # ------------------------------------------------------------------
+
+    (
+        current_gt_x_rel_array,
+        current_gt_z_rel_array,
+    ) = world_positions_to_robot_frame(
+        world_x=np.asarray(
+            [ground_truth_anchor_x],
+            dtype=np.float64,
+        ),
+        world_z=np.asarray(
+            [ground_truth_anchor_z],
+            dtype=np.float64,
+        ),
+        anchor_x=(
+            ground_truth_history_start_x
+        ),
+        anchor_z=(
+            ground_truth_history_start_z
+        ),
+        anchor_yaw=(
+            ground_truth_history_start_yaw
+        ),
+    )
+
+    current_gt_yaw_rel = (
+        ground_truth_anchor_yaw
+        - ground_truth_history_start_yaw
+    )
+
+    current_state_target = np.asarray(
+        [
+            float(
+                current_gt_x_rel_array[0]
+            ),
+            float(
+                current_gt_z_rel_array[0]
+            ),
+            math.sin(
+                current_gt_yaw_rel
+            ),
+            math.cos(
+                current_gt_yaw_rel
+            ),
+        ],
+        dtype=np.float32,
+    )
+
+    # ------------------------------------------------------------------
+    # QUEST current-state baseline:
+    #
+    # Quest-estimated motion over the same HISTORY START -> CURRENT interval,
+    # expressed in the Quest frame at history start.
+    #
+    # This gives a directly comparable, frame-invariant baseline for the
+    # auxiliary state head.
+    # ------------------------------------------------------------------
+
+    (
+        current_quest_x_rel_array,
+        current_quest_z_rel_array,
+    ) = world_positions_to_robot_frame(
+        world_x=np.asarray(
+            [quest_anchor_x],
+            dtype=np.float64,
+        ),
+        world_z=np.asarray(
+            [quest_anchor_z],
+            dtype=np.float64,
+        ),
+        anchor_x=quest_history_start_x,
+        anchor_z=quest_history_start_z,
+        anchor_yaw=quest_history_start_yaw,
+    )
+
+    current_quest_yaw_rel = (
+        quest_anchor_yaw
+        - quest_history_start_yaw
+    )
+
+    quest_current_state_baseline = (
+        np.asarray(
+            [
+                float(
+                    current_quest_x_rel_array[0]
+                ),
+                float(
+                    current_quest_z_rel_array[0]
+                ),
+                math.sin(
+                    current_quest_yaw_rel
+                ),
+                math.cos(
+                    current_quest_yaw_rel
+                ),
+            ],
+            dtype=np.float32,
+        )
+    )
+
+    # ------------------------------------------------------------------
     # Derive observed motion features ONLY from the Quest history.
     # ------------------------------------------------------------------
 
@@ -715,13 +1054,6 @@ def build_example(
         dt,
     )
 
-    # ------------------------------------------------------------------
-    # LSTM input:
-    #
-    # Quest-estimated:
-    # [x, z, heading_x, heading_z, vx, vz, yaw_rate]
-    # ------------------------------------------------------------------
-
     inputs = np.stack(
         [
             history_x_rel,
@@ -735,14 +1067,7 @@ def build_example(
         axis=-1,
     )
 
-    # ------------------------------------------------------------------
-    # Supervision target:
-    #
-    # Robot ground truth:
-    # [x, z, heading_x, heading_z]
-    # ------------------------------------------------------------------
-
-    targets = np.stack(
+    future_targets = np.stack(
         [
             future_x_rel,
             future_z_rel,
@@ -754,13 +1079,22 @@ def build_example(
 
     return (
         inputs.astype(np.float32),
-        targets.astype(np.float32),
+        future_targets.astype(
+            np.float32
+        ),
+        current_state_target,
+        quest_current_state_baseline,
     )
 
 def extract_examples_from_file(
     path: Path,
     config: SequenceConfig,
-) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+) -> Tuple[
+    List[np.ndarray],
+    List[np.ndarray],
+    List[np.ndarray],
+    List[np.ndarray],
+]:
     (
         times,
         quest_positions,
@@ -809,10 +1143,16 @@ def extract_examples_from_file(
             f"required>={required_duration:.3f}s."
         )
 
-        return [], []
+        return [], [], [], []
 
     inputs: List[np.ndarray] = []
-    targets: List[np.ndarray] = []
+    future_targets: List[np.ndarray] = []
+    current_state_targets: List[
+        np.ndarray
+    ] = []
+    quest_current_state_baselines: List[
+        np.ndarray
+    ] = []
 
     anchor_time = first_anchor
 
@@ -821,7 +1161,12 @@ def extract_examples_from_file(
         <= last_anchor + 1e-9
     ):
         try:
-            x, y = build_example(
+            (
+                x,
+                future_y,
+                current_state_y,
+                quest_state_baseline,
+            ) = build_example(
                 times=times,
                 quest_positions=(
                     quest_positions
@@ -841,10 +1186,35 @@ def extract_examples_from_file(
 
             if (
                 np.all(np.isfinite(x))
-                and np.all(np.isfinite(y))
+                and np.all(
+                    np.isfinite(
+                        future_y
+                    )
+                )
+                and np.all(
+                    np.isfinite(
+                        current_state_y
+                    )
+                )
+                and np.all(
+                    np.isfinite(
+                        quest_state_baseline
+                    )
+                )
             ):
                 inputs.append(x)
-                targets.append(y)
+
+                future_targets.append(
+                    future_y
+                )
+
+                current_state_targets.append(
+                    current_state_y
+                )
+
+                quest_current_state_baselines.append(
+                    quest_state_baseline
+                )
 
         except ValueError as exc:
             print(
@@ -856,25 +1226,60 @@ def extract_examples_from_file(
             config.anchor_stride_seconds
         )
 
-    return inputs, targets
+    return (
+        inputs,
+        future_targets,
+        current_state_targets,
+        quest_current_state_baselines,
+    )
+
 
 def build_dataset_arrays(
     files: Sequence[Path],
     config: SequenceConfig,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     all_inputs: List[np.ndarray] = []
-    all_targets: List[np.ndarray] = []
+    all_future_targets: List[
+        np.ndarray
+    ] = []
+    all_current_state_targets: List[
+        np.ndarray
+    ] = []
+    all_quest_state_baselines: List[
+        np.ndarray
+    ] = []
 
     for path in files:
-        inputs, targets = (
-            extract_examples_from_file(
-                path,
-                config,
-            )
+        (
+            inputs,
+            future_targets,
+            current_state_targets,
+            quest_state_baselines,
+        ) = extract_examples_from_file(
+            path,
+            config,
         )
 
-        all_inputs.extend(inputs)
-        all_targets.extend(targets)
+        all_inputs.extend(
+            inputs
+        )
+
+        all_future_targets.extend(
+            future_targets
+        )
+
+        all_current_state_targets.extend(
+            current_state_targets
+        )
+
+        all_quest_state_baselines.extend(
+            quest_state_baselines
+        )
 
     if not all_inputs:
         raise RuntimeError(
@@ -883,8 +1288,18 @@ def build_dataset_arrays(
         )
 
     return (
-        np.stack(all_inputs),
-        np.stack(all_targets),
+        np.stack(
+            all_inputs
+        ),
+        np.stack(
+            all_future_targets
+        ),
+        np.stack(
+            all_current_state_targets
+        ),
+        np.stack(
+            all_quest_state_baselines
+        ),
     )
 
 
@@ -959,15 +1374,20 @@ def split_files(
 # Loss and metrics
 # ---------------------------------------------------------------------------
 
-def trajectory_loss(
+def pose_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
-    heading_weight: float,
+    heading_weight: float = 1.0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
 ]:
+    """
+    Loss for one pose or a sequence of poses represented as:
+
+        [x, z, heading_x, heading_z]
+    """
     position_loss = F.smooth_l1_loss(
         prediction[..., :2],
         target[..., :2],
@@ -991,12 +1411,14 @@ def trajectory_loss(
     ).sum(dim=-1)
 
     heading_loss = (
-        1.0 - cosine_similarity
+        1.0
+        - cosine_similarity
     ).mean()
 
     total_loss = (
         position_loss
-        + heading_weight * heading_loss
+        + heading_weight
+        * heading_loss
     )
 
     return (
@@ -1006,9 +1428,121 @@ def trajectory_loss(
     )
 
 
+def combined_loss(
+    future_prediction: torch.Tensor,
+    future_target: torch.Tensor,
+    current_state_prediction: torch.Tensor,
+    current_state_target: torch.Tensor,
+    future_heading_weight: float,
+    current_state_weight: float,
+    current_state_heading_weight: float,
+) -> dict:
+    (
+        future_loss,
+        future_position_loss,
+        future_heading_loss,
+    ) = pose_loss(
+        prediction=future_prediction,
+        target=future_target,
+        heading_weight=(
+            future_heading_weight
+        ),
+    )
+
+    (
+        current_state_loss,
+        current_state_position_loss,
+        current_state_heading_loss,
+    ) = pose_loss(
+        prediction=(
+            current_state_prediction
+        ),
+        target=current_state_target,
+        heading_weight=(
+            current_state_heading_weight
+        ),
+    )
+
+    total_loss = (
+        future_loss
+        + current_state_weight
+        * current_state_loss
+    )
+
+    return {
+        "loss": total_loss,
+        "future_loss": future_loss,
+        "future_position_loss": (
+            future_position_loss
+        ),
+        "future_heading_loss": (
+            future_heading_loss
+        ),
+        "current_state_loss": (
+            current_state_loss
+        ),
+        "current_state_position_loss": (
+            current_state_position_loss
+        ),
+        "current_state_heading_loss": (
+            current_state_heading_loss
+        ),
+    }
+
+
+def pose_error_arrays_torch(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+]:
+    position_error = (
+        torch.linalg.vector_norm(
+            prediction[..., :2]
+            - target[..., :2],
+            dim=-1,
+        )
+    )
+
+    predicted_heading = F.normalize(
+        prediction[..., 2:4],
+        dim=-1,
+        eps=1e-8,
+    )
+
+    target_heading = F.normalize(
+        target[..., 2:4],
+        dim=-1,
+        eps=1e-8,
+    )
+
+    cosine = (
+        predicted_heading
+        * target_heading
+    ).sum(dim=-1)
+
+    cosine = torch.clamp(
+        cosine,
+        -1.0,
+        1.0,
+    )
+
+    heading_error_degrees = (
+        torch.acos(cosine)
+        * 180.0
+        / math.pi
+    )
+
+    return (
+        position_error,
+        heading_error_degrees,
+    )
+
+
 @torch.no_grad()
 def compute_metrics(
-    model: RobotPoseLSTM,
+    model: FrameInvariantRobotPoseLSTM,
     loader: DataLoader,
     device: torch.device,
 ) -> dict:
@@ -1017,43 +1551,32 @@ def compute_metrics(
     all_position_errors = []
     all_heading_errors = []
 
-    for inputs, targets in loader:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-
-        predictions = model(inputs)
-
-        position_error = torch.linalg.vector_norm(
-            predictions[..., :2]
-            - targets[..., :2],
-            dim=-1,
+    for (
+        inputs,
+        future_targets,
+        _,
+    ) in loader:
+        inputs = inputs.to(
+            device
         )
 
-        predicted_heading = F.normalize(
-            predictions[..., 2:4],
-            dim=-1,
-            eps=1e-8,
+        future_targets = (
+            future_targets.to(
+                device
+            )
         )
 
-        target_heading = F.normalize(
-            targets[..., 2:4],
-            dim=-1,
-            eps=1e-8,
-        )
+        (
+            future_predictions,
+            _,
+        ) = model(inputs)
 
-        cosine = (
-            predicted_heading
-            * target_heading
-        ).sum(dim=-1)
-
-        cosine = torch.clamp(
-            cosine,
-            -1.0,
-            1.0,
-        )
-
-        heading_error_radians = torch.acos(
-            cosine
+        (
+            position_error,
+            heading_error_degrees,
+        ) = pose_error_arrays_torch(
+            future_predictions,
+            future_targets,
         )
 
         all_position_errors.append(
@@ -1061,7 +1584,7 @@ def compute_metrics(
         )
 
         all_heading_errors.append(
-            heading_error_radians.cpu()
+            heading_error_degrees.cpu()
         )
 
     position_errors = torch.cat(
@@ -1069,15 +1592,9 @@ def compute_metrics(
         dim=0,
     )
 
-    heading_errors = torch.cat(
+    heading_errors_degrees = torch.cat(
         all_heading_errors,
         dim=0,
-    )
-
-    heading_errors_degrees = (
-        heading_errors
-        * 180.0
-        / math.pi
     )
 
     return {
@@ -1098,7 +1615,7 @@ def compute_metrics(
 
 @torch.no_grad()
 def compute_horizon_metrics(
-    model: RobotPoseLSTM,
+    model: FrameInvariantRobotPoseLSTM,
     loader: DataLoader,
     device: torch.device,
     config: SequenceConfig,
@@ -1108,17 +1625,26 @@ def compute_horizon_metrics(
     predictions_all = []
     targets_all = []
 
-    for inputs, targets in loader:
-        inputs = inputs.to(device)
+    for (
+        inputs,
+        future_targets,
+        _,
+    ) in loader:
+        inputs = inputs.to(
+            device
+        )
 
-        predictions = model(inputs)
+        (
+            future_predictions,
+            _,
+        ) = model(inputs)
 
         predictions_all.append(
-            predictions.cpu()
+            future_predictions.cpu()
         )
 
         targets_all.append(
-            targets
+            future_targets
         )
 
     predictions = torch.cat(
@@ -1153,39 +1679,12 @@ def compute_horizon_metrics(
         if index >= config.prediction_steps:
             continue
 
-        position_error = torch.linalg.vector_norm(
-            predictions[:, index, :2]
-            - targets[:, index, :2],
-            dim=-1,
-        )
-
-        predicted_heading = F.normalize(
-            predictions[:, index, 2:4],
-            dim=-1,
-            eps=1e-8,
-        )
-
-        target_heading = F.normalize(
-            targets[:, index, 2:4],
-            dim=-1,
-            eps=1e-8,
-        )
-
-        cosine = (
-            predicted_heading
-            * target_heading
-        ).sum(dim=-1)
-
-        cosine = torch.clamp(
-            cosine,
-            -1.0,
-            1.0,
-        )
-
-        heading_error = (
-            torch.acos(cosine)
-            * 180.0
-            / math.pi
+        (
+            position_error,
+            heading_error,
+        ) = pose_error_arrays_torch(
+            predictions[:, index, :],
+            targets[:, index, :],
         )
 
         results[f"{seconds}s"] = {
@@ -1198,6 +1697,73 @@ def compute_horizon_metrics(
         }
 
     return results
+
+
+@torch.no_grad()
+def compute_current_state_metrics(
+    model: FrameInvariantRobotPoseLSTM,
+    loader: DataLoader,
+    device: torch.device,
+    quest_state_baselines: np.ndarray,
+    current_state_targets: np.ndarray,
+) -> dict:
+    """
+    Evaluate the auxiliary current-state head.
+
+    The learned prediction and the raw Quest baseline both estimate motion
+    from history start -> current anchor in their own locally normalized
+    frames, and both are compared against the GT relative-motion target.
+    """
+    model.eval()
+
+    predictions_all = []
+
+    for (
+        inputs,
+        _,
+        _,
+    ) in loader:
+        inputs = inputs.to(
+            device
+        )
+
+        (
+            _,
+            current_state_predictions,
+        ) = model(inputs)
+
+        predictions_all.append(
+            current_state_predictions.cpu()
+        )
+
+    predictions = torch.cat(
+        predictions_all,
+        dim=0,
+    ).numpy()
+
+    learned_metrics = (
+        compute_single_pose_array_metrics(
+            predictions=predictions,
+            targets=current_state_targets,
+        )
+    )
+
+    quest_metrics = (
+        compute_single_pose_array_metrics(
+            predictions=quest_state_baselines,
+            targets=current_state_targets,
+        )
+    )
+
+    return {
+        "history_interval_seconds": None,
+        "learned_state_head": (
+            learned_metrics
+        ),
+        "raw_quest_relative_motion": (
+            quest_metrics
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1400,6 +1966,111 @@ def predict_constant_turn_rate(
     )
 
 
+
+def compute_single_pose_array_metrics(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+) -> dict:
+    """
+    Metrics for arrays shaped (N, 4):
+        [x, z, heading_x, heading_z]
+    """
+    if (
+        predictions.ndim != 2
+        or predictions.shape[-1] != 4
+        or targets.shape != predictions.shape
+    ):
+        raise ValueError(
+            "Expected predictions and targets "
+            "with matching shape (N, 4)."
+        )
+
+    position_errors = np.linalg.norm(
+        predictions[:, :2]
+        - targets[:, :2],
+        axis=-1,
+    )
+
+    predicted_heading = (
+        predictions[:, 2:4]
+    )
+
+    target_heading = (
+        targets[:, 2:4]
+    )
+
+    predicted_heading = (
+        predicted_heading
+        / np.maximum(
+            np.linalg.norm(
+                predicted_heading,
+                axis=-1,
+                keepdims=True,
+            ),
+            1e-8,
+        )
+    )
+
+    target_heading = (
+        target_heading
+        / np.maximum(
+            np.linalg.norm(
+                target_heading,
+                axis=-1,
+                keepdims=True,
+            ),
+            1e-8,
+        )
+    )
+
+    cosine = np.sum(
+        predicted_heading
+        * target_heading,
+        axis=-1,
+    )
+
+    cosine = np.clip(
+        cosine,
+        -1.0,
+        1.0,
+    )
+
+    heading_errors_degrees = np.degrees(
+        np.arccos(cosine)
+    )
+
+    return {
+        "mean_position_error_meters": float(
+            position_errors.mean()
+        ),
+        "median_position_error_meters": float(
+            np.median(
+                position_errors
+            )
+        ),
+        "p90_position_error_meters": float(
+            np.percentile(
+                position_errors,
+                90.0,
+            )
+        ),
+        "mean_heading_error_degrees": float(
+            heading_errors_degrees.mean()
+        ),
+        "median_heading_error_degrees": float(
+            np.median(
+                heading_errors_degrees
+            )
+        ),
+        "p90_heading_error_degrees": float(
+            np.percentile(
+                heading_errors_degrees,
+                90.0,
+            )
+        ),
+    }
+
+
 def compute_array_metrics(
     predictions: np.ndarray,
     targets: np.ndarray,
@@ -1581,11 +2252,13 @@ def compute_array_horizon_metrics(
 # ---------------------------------------------------------------------------
 
 def run_epoch(
-    model: RobotPoseLSTM,
+    model: FrameInvariantRobotPoseLSTM,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    heading_weight: float,
+    future_heading_weight: float,
+    current_state_weight: float,
+    current_state_heading_weight: float,
     training: bool,
 ) -> dict:
     if training:
@@ -1593,35 +2266,80 @@ def run_epoch(
     else:
         model.eval()
 
-    total_loss_sum = 0.0
-    position_loss_sum = 0.0
-    heading_loss_sum = 0.0
+    sums = {
+        "loss": 0.0,
+        "future_loss": 0.0,
+        "future_position_loss": 0.0,
+        "future_heading_loss": 0.0,
+        "current_state_loss": 0.0,
+        "current_state_position_loss": 0.0,
+        "current_state_heading_loss": 0.0,
+    }
+
     example_count = 0
 
-    for inputs, targets in loader:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+    for (
+        inputs,
+        future_targets,
+        current_state_targets,
+    ) in loader:
+        inputs = inputs.to(
+            device
+        )
+
+        future_targets = (
+            future_targets.to(
+                device
+            )
+        )
+
+        current_state_targets = (
+            current_state_targets.to(
+                device
+            )
+        )
 
         if training:
             optimizer.zero_grad(
                 set_to_none=True
             )
 
-        with torch.set_grad_enabled(training):
-            predictions = model(inputs)
-
+        with torch.set_grad_enabled(
+            training
+        ):
             (
-                loss,
-                position_loss,
-                heading_loss,
-            ) = trajectory_loss(
-                prediction=predictions,
-                target=targets,
-                heading_weight=heading_weight,
+                future_predictions,
+                current_state_predictions,
+            ) = model(inputs)
+
+            losses = combined_loss(
+                future_prediction=(
+                    future_predictions
+                ),
+                future_target=(
+                    future_targets
+                ),
+                current_state_prediction=(
+                    current_state_predictions
+                ),
+                current_state_target=(
+                    current_state_targets
+                ),
+                future_heading_weight=(
+                    future_heading_weight
+                ),
+                current_state_weight=(
+                    current_state_weight
+                ),
+                current_state_heading_weight=(
+                    current_state_heading_weight
+                ),
             )
 
             if training:
-                loss.backward()
+                losses[
+                    "loss"
+                ].backward()
 
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
@@ -1632,36 +2350,23 @@ def run_epoch(
 
         batch_size = inputs.shape[0]
 
-        total_loss_sum += (
-            float(loss.item())
-            * batch_size
-        )
-
-        position_loss_sum += (
-            float(position_loss.item())
-            * batch_size
-        )
-
-        heading_loss_sum += (
-            float(heading_loss.item())
-            * batch_size
-        )
+        for name in sums:
+            sums[name] += (
+                float(
+                    losses[name].item()
+                )
+                * batch_size
+            )
 
         example_count += batch_size
 
     return {
-        "loss": (
-            total_loss_sum
+        name: (
+            value
             / example_count
-        ),
-        "position_loss": (
-            position_loss_sum
-            / example_count
-        ),
-        "heading_loss": (
-            heading_loss_sum
-            / example_count
-        ),
+        )
+        for name, value
+        in sums.items()
     }
 
 
@@ -1825,7 +2530,31 @@ def main() -> None:
     parser.add_argument(
         "--heading-weight",
         type=float,
+        default=1.0,
+        help=(
+            "Weight on future heading loss relative "
+            "to future position loss."
+        ),
+    )
+
+    parser.add_argument(
+        "--current-state-weight",
+        type=float,
         default=0.5,
+        help=(
+            "Weight of the auxiliary current relative-state "
+            "loss in the total training objective."
+        ),
+    )
+
+    parser.add_argument(
+        "--current-state-heading-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight on heading inside the auxiliary "
+            "current relative-state loss."
+        ),
     )
 
     parser.add_argument(
@@ -1922,11 +2651,16 @@ def main() -> None:
         "LSTM input:  Quest-estimated robot motion"
     )
     print(
-        "LSTM target: aligned robot ground truth"
+        "Future target: robot GT motion relative "
+        "to the true current anchor"
     )
     print(
-        "Frames:      each stream independently "
-        "normalized at the prediction anchor"
+        "Aux target:    robot GT motion from "
+        "history start -> current"
+    )
+    print(
+        "Frames:        Quest and robot GT are "
+        "normalized independently; no cross-frame transform"
     )
     print()
 
@@ -1955,25 +2689,34 @@ def main() -> None:
     print()
     print("Generating robot-relative examples...")
 
-    train_inputs, train_targets = (
-        build_dataset_arrays(
-            train_files,
-            config,
-        )
+    (
+        train_inputs,
+        train_targets,
+        train_current_state_targets,
+        train_quest_state_baselines,
+    ) = build_dataset_arrays(
+        train_files,
+        config,
     )
 
-    validation_inputs, validation_targets = (
-        build_dataset_arrays(
-            validation_files,
-            config,
-        )
+    (
+        validation_inputs,
+        validation_targets,
+        validation_current_state_targets,
+        validation_quest_state_baselines,
+    ) = build_dataset_arrays(
+        validation_files,
+        config,
     )
 
-    test_inputs, test_targets = (
-        build_dataset_arrays(
-            test_files,
-            config,
-        )
+    (
+        test_inputs,
+        test_targets,
+        test_current_state_targets,
+        test_quest_state_baselines,
+    ) = build_dataset_arrays(
+        test_files,
+        config,
     )
 
     print(
@@ -2010,21 +2753,30 @@ def main() -> None:
 
     train_dataset = RobotTrajectoryDataset(
         inputs=train_inputs,
-        targets=train_targets,
+        future_targets=train_targets,
+        current_state_targets=(
+            train_current_state_targets
+        ),
         input_mean=input_mean,
         input_std=input_std,
     )
 
     validation_dataset = RobotTrajectoryDataset(
         inputs=validation_inputs,
-        targets=validation_targets,
+        future_targets=validation_targets,
+        current_state_targets=(
+            validation_current_state_targets
+        ),
         input_mean=input_mean,
         input_std=input_std,
     )
 
     test_dataset = RobotTrajectoryDataset(
         inputs=test_inputs,
-        targets=test_targets,
+        future_targets=test_targets,
+        current_state_targets=(
+            test_current_state_targets
+        ),
         input_mean=input_mean,
         input_std=input_std,
     )
@@ -2060,7 +2812,7 @@ def main() -> None:
     print(f"Device: {device}")
     print()
 
-    model = RobotPoseLSTM(
+    model = FrameInvariantRobotPoseLSTM(
         input_size=7,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
@@ -2111,8 +2863,14 @@ def main() -> None:
             loader=train_loader,
             optimizer=optimizer,
             device=device,
-            heading_weight=(
+            future_heading_weight=(
                 args.heading_weight
+            ),
+            current_state_weight=(
+                args.current_state_weight
+            ),
+            current_state_heading_weight=(
+                args.current_state_heading_weight
             ),
             training=True,
         )
@@ -2122,8 +2880,14 @@ def main() -> None:
             loader=validation_loader,
             optimizer=optimizer,
             device=device,
-            heading_weight=(
+            future_heading_weight=(
                 args.heading_weight
+            ),
+            current_state_weight=(
+                args.current_state_weight
+            ),
+            current_state_heading_weight=(
+                args.current_state_heading_weight
             ),
             training=False,
         )
@@ -2142,8 +2906,9 @@ def main() -> None:
             f"Epoch {epoch:03d} | "
             f"train={train_result['loss']:.5f} | "
             f"val={validation_loss:.5f} | "
-            f"pos={validation_result['position_loss']:.5f} | "
-            f"heading={validation_result['heading_loss']:.5f} | "
+            f"f_pos={validation_result['future_position_loss']:.5f} | "
+            f"f_head={validation_result['future_heading_loss']:.5f} | "
+            f"state={validation_result['current_state_loss']:.5f} | "
             f"lr={current_lr:.2e}"
         )
 
@@ -2180,11 +2945,25 @@ def main() -> None:
                     "input": (
                         "quest_estimated_pose_history"
                     ),
-                    "target": (
+                    "future_target": (
                         "aligned_robot_ground_truth_future"
                     ),
+                    "current_state_target": (
+                        "ground_truth_motion_history_start_to_current"
+                    ),
                     "coordinate_normalization": (
-                        "independent_anchor_relative_frames"
+                        "independent_local_frames_no_cross_frame_transform"
+                    ),
+                },
+                "loss_config": {
+                    "future_heading_weight": (
+                        args.heading_weight
+                    ),
+                    "current_state_weight": (
+                        args.current_state_weight
+                    ),
+                    "current_state_heading_weight": (
+                        args.current_state_heading_weight
                     ),
                 },
                 "input_mean": (
@@ -2266,12 +3045,33 @@ def main() -> None:
         config=config,
     )
 
+    current_state_metrics = (
+        compute_current_state_metrics(
+            model=model,
+            loader=test_loader,
+            device=device,
+            quest_state_baselines=(
+                test_quest_state_baselines
+            ),
+            current_state_targets=(
+                test_current_state_targets
+            ),
+        )
+    )
+
+    current_state_metrics[
+        "history_interval_seconds"
+    ] = float(
+        (config.history_steps - 1)
+        * config.dt
+    )
+
     # ---------------------------------------------------------------
     # Constant-turn-rate kinematic baseline.
     #
     # IMPORTANT:
-    # Use the original UNNORMALIZED test_inputs here. The kinematic model
-    # operates directly in meters, meters/second, and radians/second.
+    # Use the original UNNORMALIZED Quest-derived test_inputs here. The
+    # kinematic baseline sees the same observer-side information as the LSTM.
     # ---------------------------------------------------------------
 
     kinematic_predictions = (
@@ -2363,6 +3163,66 @@ def main() -> None:
     )
     print()
 
+    print(
+        "Current relative-state estimation"
+    )
+    print(
+        "---------------------------------"
+    )
+    print(
+        "This evaluates motion from history start "
+        "to the current prediction anchor."
+    )
+    print(
+        f"{'Metric':<34}"
+        f"{'LSTM state':>14}"
+        f"{'Raw Quest':>14}"
+    )
+    print(
+        "-" * 62
+    )
+
+    learned_state_metrics = (
+        current_state_metrics[
+            "learned_state_head"
+        ]
+    )
+
+    quest_state_metrics = (
+        current_state_metrics[
+            "raw_quest_relative_motion"
+        ]
+    )
+
+    print(
+        f"{'Mean position error':<34}"
+        f"{learned_state_metrics['mean_position_error_meters']:>11.3f} m"
+        f"{quest_state_metrics['mean_position_error_meters']:>11.3f} m"
+    )
+
+    print(
+        f"{'Mean heading error':<34}"
+        f"{learned_state_metrics['mean_heading_error_degrees']:>10.2f} deg"
+        f"{quest_state_metrics['mean_heading_error_degrees']:>10.2f} deg"
+    )
+
+    print(
+        f"{'P90 position error':<34}"
+        f"{learned_state_metrics['p90_position_error_meters']:>11.3f} m"
+        f"{quest_state_metrics['p90_position_error_meters']:>11.3f} m"
+    )
+
+    print(
+        f"{'P90 heading error':<34}"
+        f"{learned_state_metrics['p90_heading_error_degrees']:>10.2f} deg"
+        f"{quest_state_metrics['p90_heading_error_degrees']:>10.2f} deg"
+    )
+
+    print(
+        "-" * 62
+    )
+    print()
+
     # ---------------------------------------------------------------
     # Save evaluation results.
     # ---------------------------------------------------------------
@@ -2373,11 +3233,25 @@ def main() -> None:
             "input": (
                 "quest_estimated_pose_history"
             ),
-            "target": (
+            "future_target": (
                 "aligned_robot_ground_truth_future"
             ),
+            "current_state_target": (
+                "ground_truth_motion_history_start_to_current"
+            ),
             "coordinate_normalization": (
-                "independent_anchor_relative_frames"
+                "independent_local_frames_no_cross_frame_transform"
+            ),
+        },
+        "loss_config": {
+            "future_heading_weight": (
+                args.heading_weight
+            ),
+            "current_state_weight": (
+                args.current_state_weight
+            ),
+            "current_state_heading_weight": (
+                args.current_state_heading_weight
             ),
         },
         "model_config": (
@@ -2391,6 +3265,9 @@ def main() -> None:
         "best_epoch": checkpoint["epoch"],
         "test_metrics": test_metrics,
         "horizon_metrics": horizon_metrics,
+        "current_state_metrics": (
+            current_state_metrics
+        ),
         "kinematic_baseline": {
             "type": (
                 "constant_body_velocity_"
