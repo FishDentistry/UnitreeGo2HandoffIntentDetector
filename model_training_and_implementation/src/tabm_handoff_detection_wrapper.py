@@ -4,7 +4,6 @@ import cv2
 import numpy as np
 import torch
 
-from .dino_detector import DINOObjectDetector
 from .rtmpose_keypoints import RTMPoseKeypointDetector
 from .rtmpose_headpose import RTMPoseHeadPoseEstimator
 from .hand_intent_tabm import HandIntentTabM
@@ -96,6 +95,12 @@ class HandoffDetector:
         self.dino_classes = dino_classes
         self.keypoint_confidence = float(confidence)
 
+        # Keep RTMPose crop generation identical to the updated training
+        # pipeline. The full-frame RTMPose pass uses the normal detector
+        # confidence to decide which keypoints define the person crop.
+        self.crop_keypoint_confidence = self.keypoint_confidence
+        self.crop_padding_fraction = 0.20
+
         # RTMPose may occasionally return a weak false-positive pose even
         # when no person is actually present. Use a slightly stricter
         # confidence threshold only for deciding whether a person exists.
@@ -181,21 +186,19 @@ class HandoffDetector:
         )
 
         # ---------------------------------------------------------
-        # DINO object detector
+        # DINO compatibility
         # ---------------------------------------------------------
+        # DINO is not loaded at deployment. Person cropping is performed
+        # with RTMPose using the same algorithm as the updated training
+        # pipeline. Keep the legacy constructor arguments only so existing
+        # callers do not need to change.
         self.object_detector = None
 
-        if (
-            self.crop_around_object
-            or self.features_type
-            == "keypoints_headpose_dino"
-        ):
-            self.object_detector = DINOObjectDetector(
-                model_id=(
-                    "IDEA-Research/"
-                    "grounding-dino-base"
-                ),
-                confidence=confidence,
+        if self.features_type == "keypoints_headpose_dino":
+            raise ValueError(
+                'features_type="keypoints_headpose_dino" requires DINO '
+                "object-centroid features and is not supported by the "
+                "RTMPose-crop deployment wrapper."
             )
 
         # ---------------------------------------------------------
@@ -298,47 +301,122 @@ class HandoffDetector:
         depth_image,
     ):
         """
-        Crop RGB and depth images around the same detected
-        region, matching the training preprocessing.
+        Crop RGB and depth images using the same RTMPose-based person
+        localization used by the updated training pipeline.
+
+        This is the first RTMPose pass. It is used only to determine the
+        crop. A second RTMPose pass is run later on the cropped image to
+        generate the actual model features.
         """
-        detections = self.object_detector.predict(
-            image,
-            class_names=self.crop_object,
+        crop_object_name = (
+            str(self.crop_object)
+            .strip()
+            .strip(".")
+            .lower()
         )
 
-        matching = [
-            detection
-            for detection in detections
-            if detection["label"].strip(".")
-            == self.crop_object.strip(".")
-        ]
+        if crop_object_name != "person":
+            raise ValueError(
+                "RTMPose-based cropping only supports "
+                "crop_object='person'. "
+                f"Received: {self.crop_object!r}"
+            )
 
-        if not matching:
+        crop_people = self.keypoint_detector.predict(image)
+
+        if len(crop_people) == 0:
             return None, None
 
-        # Match training behavior: select largest
-        # matching detection.
-        detection = max(
-            matching,
-            key=lambda d: (
-                d["box_xyxy"][2]
-                - d["box_xyxy"][0]
+        # Build one candidate crop box per detected person and choose the
+        # largest, matching the updated training function exactly.
+        crop_candidates = []
+
+        for crop_person in crop_people:
+            crop_keypoints = np.asarray(
+                crop_person.get("keypoints", []),
+                dtype=np.float32,
             )
-            * (
-                d["box_xyxy"][3]
-                - d["box_xyxy"][1]
-            ),
+
+            if (
+                crop_keypoints.ndim != 2
+                or crop_keypoints.shape[0] == 0
+                or crop_keypoints.shape[1] < 2
+            ):
+                continue
+
+            crop_xy = crop_keypoints[:, :2]
+
+            valid = np.isfinite(crop_xy).all(axis=1)
+            valid &= ~np.all(crop_xy == 0, axis=1)
+
+            if crop_keypoints.shape[1] >= 3:
+                crop_scores = crop_keypoints[:, 2]
+                valid &= np.isfinite(crop_scores)
+                valid &= (
+                    crop_scores >= self.crop_keypoint_confidence
+                )
+
+            # Match training: require at least four usable joints to form
+            # a crop candidate.
+            if int(np.count_nonzero(valid)) < 4:
+                continue
+
+            valid_xy = crop_xy[valid]
+
+            raw_x1 = float(np.min(valid_xy[:, 0]))
+            raw_y1 = float(np.min(valid_xy[:, 1]))
+            raw_x2 = float(np.max(valid_xy[:, 0]))
+            raw_y2 = float(np.max(valid_xy[:, 1]))
+
+            raw_width = raw_x2 - raw_x1
+            raw_height = raw_y2 - raw_y1
+
+            if raw_width <= 0.0 or raw_height <= 0.0:
+                continue
+
+            raw_area = raw_width * raw_height
+
+            crop_candidates.append(
+                (
+                    raw_area,
+                    raw_x1,
+                    raw_y1,
+                    raw_x2,
+                    raw_y2,
+                )
+            )
+
+        if not crop_candidates:
+            return None, None
+
+        (
+            _,
+            x1,
+            y1,
+            x2,
+            y2,
+        ) = max(
+            crop_candidates,
+            key=lambda candidate: candidate[0],
         )
 
-        x1, y1, x2, y2 = map(
-            int,
-            detection["box_xyxy"],
+        box_width = x2 - x1
+        box_height = y2 - y1
+
+        padding_x = (
+            self.crop_padding_fraction * box_width
         )
+        padding_y = (
+            self.crop_padding_fraction * box_height
+        )
+
+        x1 = int(np.floor(x1 - padding_x))
+        y1 = int(np.floor(y1 - padding_y))
+        x2 = int(np.ceil(x2 + padding_x))
+        y2 = int(np.ceil(y2 + padding_y))
 
         rgb_height, rgb_width = image.shape[:2]
-        depth_height, depth_width = (
-            depth_image.shape[:2]
-        )
+        depth_height, depth_width = depth_image.shape[:2]
 
         x1 = int(np.clip(x1, 0, rgb_width))
         x2 = int(np.clip(x2, 0, rgb_width))
@@ -347,11 +425,11 @@ class HandoffDetector:
 
         if x2 <= x1 or y2 <= y1:
             raise ValueError(
-                "Object detection produced an "
-                "invalid RGB crop."
+                "RTMPose produced an invalid RGB crop."
             )
 
-        # Map RGB crop coordinates into depth image.
+        # Map RGB crop coordinates into the depth image exactly as in
+        # training.
         depth_x1 = int(
             round(x1 * depth_width / rgb_width)
         )
@@ -378,24 +456,23 @@ class HandoffDetector:
             np.clip(depth_y2, 0, depth_height)
         )
 
-        image = image[y1:y2, x1:x2]
-
-        depth_image = depth_image[
+        cropped_image = image[y1:y2, x1:x2]
+        cropped_depth = depth_image[
             depth_y1:depth_y2,
             depth_x1:depth_x2,
         ]
 
-        if image.size == 0:
+        if cropped_image.size == 0:
             raise ValueError(
-                "Crop produced an empty RGB image."
+                "RTMPose crop produced an empty RGB image."
             )
 
-        if depth_image.size == 0:
+        if cropped_depth.size == 0:
             raise ValueError(
-                "Crop produced an empty depth image."
+                "RTMPose crop produced an empty depth image."
             )
 
-        return image, depth_image
+        return cropped_image, cropped_depth
 
     def _extract_features(
         self,
@@ -427,10 +504,11 @@ class HandoffDetector:
 
 
         # ---------------------------------------------------------
-        # Optional DINO crop
+        # Optional RTMPose crop
         # ---------------------------------------------------------
-        # This intentionally happens BEFORE RTMPose, head pose, and
-        # ResNet so runtime preprocessing matches training.
+        # First RTMPose pass: localize the person on the full frame and
+        # crop RGB/depth. The second RTMPose pass below runs on the crop
+        # and provides the actual model features, matching training.
         if self.crop_around_object:
             image, depth_image = self._crop_images(
                 image,
@@ -441,39 +519,16 @@ class HandoffDetector:
                 return None
 
         # ---------------------------------------------------------
-        # Optional DINO object feature
-        # ---------------------------------------------------------
-        objects = []
-
-        if (
-            self.features_type
-            == "keypoints_headpose_dino"
-        ):
-            objects = self.object_detector.predict(
-                image,
-                class_names=self.dino_classes,
-            )
-
-            if len(objects) != 1:
-                return None
-
-        # ---------------------------------------------------------
         # Person keypoints
         # ---------------------------------------------------------
-        # RTMPose runs on the same (possibly DINO-cropped) image
-        # used during training.
+        # Second RTMPose pass: this runs on the cropped image and is the
+        # detection used for model features, head pose, and depth lookup.
         people = self.keypoint_detector.predict(
             image
         )
 
-        if len(people) == 0:
-            return None
-
         if len(people) != 1:
-            raise RuntimeError(
-                "Expected exactly one person, "
-                f"found {len(people)}."
-            )
+            return None
 
         if not self._is_valid_person(people[0]):
             return None
@@ -571,23 +626,6 @@ class HandoffDetector:
                 .reshape(-1)
                 .tolist()
             )
-
-        # ---------------------------------------------------------
-        # DINO object centroid
-        # ---------------------------------------------------------
-        if (
-            self.features_type
-            == "keypoints_headpose_dino"
-        ):
-            x1, y1, x2, y2 = map(
-                float,
-                objects[0]["box_xyxy"],
-            )
-
-            feature_vector += [
-                (x1 + x2) / 2.0,
-                (y1 + y2) / 2.0,
-            ]
 
         # ---------------------------------------------------------
         # ResNet embedding
