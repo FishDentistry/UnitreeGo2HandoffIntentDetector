@@ -32,6 +32,9 @@ setup(
 
             "robot_ground_truth_node = "
             "ros_handoff_detection.robot_ground_truth_node:main",
+
+            "robot_patrol = "
+            "ros_handoff_detection.robot_patrol_pub_point_loop:main",
         ],
     },
 )
