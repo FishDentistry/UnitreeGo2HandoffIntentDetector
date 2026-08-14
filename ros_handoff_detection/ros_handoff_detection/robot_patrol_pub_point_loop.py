@@ -31,7 +31,7 @@ class RandomNav2Patrol(Node):
         # ------------------------------------------------------------
 
         self.declare_parameter('num_points', 5)
-        self.declare_parameter('point_topic', '/publish_point')
+        self.declare_parameter('point_topic', '/clicked_point')
         self.declare_parameter('nav_action', '/navigate_to_pose')
 
         # If true, continue to the next waypoint if Nav2 aborts/rejects
