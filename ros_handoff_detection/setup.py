@@ -35,6 +35,9 @@ setup(
 
             "robot_patrol = "
             "ros_handoff_detection.robot_patrol_pub_point_loop:main",
+
+            "post_marker = "
+            "ros_handoff_detection.post_robot_det_aruco:main",
         ],
     },
 )
