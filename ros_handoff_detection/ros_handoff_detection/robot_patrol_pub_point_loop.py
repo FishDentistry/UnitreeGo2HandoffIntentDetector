@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import math
 import random
 from dataclasses import dataclass
@@ -8,10 +6,12 @@ from typing import List, Optional
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PointStamped
 from nav2_msgs.action import NavigateToPose
+from std_msgs.msg import Bool
 
 
 @dataclass
@@ -33,6 +33,10 @@ class RandomNav2Patrol(Node):
         self.declare_parameter('num_points', 5)
         self.declare_parameter('point_topic', '/clicked_point')
         self.declare_parameter('nav_action', '/navigate_to_pose')
+        self.declare_parameter(
+            'handoff_pause_topic',
+            '/handoff_pause_patrol',
+        )
 
         # If true, continue to the next waypoint if Nav2 aborts/rejects
         # a goal. If false, patrol stops on the first failed goal.
@@ -52,6 +56,10 @@ class RandomNav2Patrol(Node):
 
         self.nav_action = str(
             self.get_parameter('nav_action').value
+        )
+
+        self.handoff_pause_topic = str(
+            self.get_parameter('handoff_pause_topic').value
         )
 
         self.continue_on_failure = bool(
@@ -94,6 +102,12 @@ class RandomNav2Patrol(Node):
 
         self.goal_in_progress = False
 
+        self.active_goal_handle = None
+
+        self.handoff_pause_requested = False
+
+        self.pause_cancel_requested = False
+
         self.frame_id: Optional[str] = None
 
         # ------------------------------------------------------------
@@ -105,6 +119,19 @@ class RandomNav2Patrol(Node):
             self.point_topic,
             self.point_callback,
             10,
+        )
+
+        # Receive temporary pause requests from the handoff detector.
+        # Match the detector's transient-local QoS so a newly started
+        # patrol node receives the most recent pause state.
+        pause_qos = QoSProfile(depth=1)
+        pause_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
+        self.handoff_pause_subscription = self.create_subscription(
+            Bool,
+            self.handoff_pause_topic,
+            self.handoff_pause_callback,
+            pause_qos,
         )
 
         # ------------------------------------------------------------
@@ -128,6 +155,90 @@ class RandomNav2Patrol(Node):
             f'Waiting for {self.num_points} points on '
             f'{self.point_topic}.'
         )
+
+    # ==================================================================
+    # Handoff pause / resume
+    # ==================================================================
+
+    def handoff_pause_callback(
+        self,
+        msg: Bool,
+    ) -> None:
+
+        should_pause = bool(msg.data)
+
+        if should_pause == self.handoff_pause_requested:
+            return
+
+        self.handoff_pause_requested = should_pause
+
+        if should_pause:
+            self.get_logger().info(
+                'Handoff pause requested. Temporarily stopping patrol.'
+            )
+            self.request_pause_cancel()
+            return
+
+        self.get_logger().info(
+            'Handoff pause released. Resuming patrol.'
+        )
+
+        # A pause-triggered cancellation may still be completing. In that
+        # case goal_result_callback() will resend the same waypoint once the
+        # cancellation result arrives.
+        if (
+            self.navigation_started
+            and not self.collecting_points
+            and not self.goal_in_progress
+        ):
+            self.send_current_goal()
+
+    def request_pause_cancel(self) -> None:
+        """Cancel the active Nav2 goal without advancing the patrol route."""
+
+        if not self.goal_in_progress:
+            return
+
+        # The goal may have been sent but not accepted yet. The goal-response
+        # callback will see the pause flag and cancel immediately after
+        # acceptance.
+        if self.active_goal_handle is None:
+            return
+
+        if self.pause_cancel_requested:
+            return
+
+        self.pause_cancel_requested = True
+
+        self.get_logger().info(
+            'Canceling current Nav2 goal for handoff pause.'
+        )
+
+        cancel_future = (
+            self.active_goal_handle.cancel_goal_async()
+        )
+
+        cancel_future.add_done_callback(
+            self.pause_cancel_response_callback
+        )
+
+    def pause_cancel_response_callback(
+        self,
+        future,
+    ) -> None:
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f'Error requesting handoff pause cancellation: {exc}'
+            )
+            return
+
+        if not response.goals_canceling:
+            self.get_logger().warning(
+                'Nav2 did not accept the handoff pause cancellation request.'
+            )
 
     # ==================================================================
     # Point collection
@@ -318,6 +429,9 @@ class RandomNav2Patrol(Node):
 
     def send_current_goal(self) -> None:
 
+        if self.handoff_pause_requested:
+            return
+
         if self.goal_in_progress:
             return
 
@@ -501,6 +615,8 @@ class RandomNav2Patrol(Node):
             'Goal accepted by Nav2.'
         )
 
+        self.active_goal_handle = goal_handle
+
         result_future = (
             goal_handle.get_result_async()
         )
@@ -509,12 +625,23 @@ class RandomNav2Patrol(Node):
             self.goal_result_callback
         )
 
+        # A pause request can arrive between send_goal_async() and this
+        # callback. Cancel immediately once the goal handle exists.
+        if self.handoff_pause_requested:
+            self.request_pause_cancel()
+
     def goal_result_callback(
         self,
         future,
     ) -> None:
 
         self.goal_in_progress = False
+        self.active_goal_handle = None
+
+        # Capture this before clearing it so we can distinguish a handoff
+        # pause from an ordinary Nav2 cancellation.
+        was_pause_cancel = self.pause_cancel_requested
+        self.pause_cancel_requested = False
 
         try:
             result = future.result()
@@ -549,7 +676,27 @@ class RandomNav2Patrol(Node):
 
             self.route_index += 1
 
+            # send_current_goal() will intentionally do nothing if a handoff
+            # pause is active. The pause callback will resume later.
             self.send_current_goal()
+
+            return
+
+        if (
+            status
+            == GoalStatus.STATUS_CANCELED
+            and was_pause_cancel
+        ):
+            self.get_logger().info(
+                f'Navigation to {label} paused for handoff. '
+                'The waypoint will not be skipped.'
+            )
+
+            # If the pause was already released while cancellation was in
+            # flight, resume the same waypoint now. Otherwise wait for the
+            # release message.
+            if not self.handoff_pause_requested:
+                self.send_current_goal()
 
             return
 

@@ -1,10 +1,11 @@
 import cv2
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32, String
+from std_msgs.msg import Bool, Float32, String
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 from .control_box_servo import ServoController
@@ -43,9 +44,16 @@ class HandoffInferenceNode(Node):
             True,
         )
 
+        # This is the handoff-confidence threshold used by the detector.
+        # A handoff decision at or above this threshold also pauses patrol.
         self.declare_parameter(
             "threshold",
-            0.65,
+            0.60,
+        )
+
+        self.declare_parameter(
+            "handoff_pause_topic",
+            "/handoff_pause_patrol",
         )
 
         self.declare_parameter(
@@ -103,6 +111,12 @@ class HandoffInferenceNode(Node):
             .double_value
         )
 
+        handoff_pause_topic = (
+            self.get_parameter("handoff_pause_topic")
+            .get_parameter_value()
+            .string_value
+        )
+
         show_output_window = (
             self.get_parameter("show_output_window")
             .get_parameter_value()
@@ -154,6 +168,10 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
+            f"  handoff_pause_topic={handoff_pause_topic}"
+        )
+
+        self.get_logger().info(
             f"  show_output_window={show_output_window}"
         )
 
@@ -180,6 +198,8 @@ class HandoffInferenceNode(Node):
             )
 
         self.model_type = model_type
+        self.handoff_stop_threshold = float(threshold)
+        self.handoff_pause_topic = str(handoff_pause_topic)
         self.show_output_window = bool(show_output_window)
         self.debug = bool(debug)
         self.output_window_name = "Handoff Classification"
@@ -189,8 +209,9 @@ class HandoffInferenceNode(Node):
         # ---------------------------------------------------------
         self.servo_hold_seconds = float(servo_hold_seconds)
         self._servo_active = False
-        self._servo_reset_timer = None
-        self._last_classification = None
+        self._handoff_active = False
+        self._handoff_reset_timer = None
+        self._last_handoff_stop_condition = False
 
         self.get_logger().info(
             f"Connecting to servo controller on {servo_port}..."
@@ -376,6 +397,20 @@ class HandoffInferenceNode(Node):
             10,
         )
 
+        # Transient-local durability makes the most recent pause state
+        # available if the patrol node starts after this node.
+        pause_qos = QoSProfile(depth=1)
+        pause_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
+        self.handoff_pause_pub = self.create_publisher(
+            Bool,
+            self.handoff_pause_topic,
+            pause_qos,
+        )
+
+        # Start in the non-paused state.
+        self._publish_handoff_pause(False)
+
         # Used only so that we can explicitly report when the first
         # synchronized frame reaches the callback.
         self._received_first_frame = False
@@ -485,20 +520,29 @@ class HandoffInferenceNode(Node):
                 cv2.waitKey(1)
 
             # -----------------------------------------------------
-            # Servo trigger
+            # Handoff interaction trigger
             # -----------------------------------------------------
-            # Trigger only on the transition into "handoff". This
-            # prevents every handoff-classified camera frame from
-            # repeatedly sending command 1.
-            if (
+            # The robot keeps patrolling normally until the detector
+            # confidently identifies a handoff. At that point, request
+            # that the patrol node stop and hold the stop for the same
+            # interval used by the handoff servo.
+            #
+            # Using the transition into this condition prevents repeated
+            # triggering on every camera frame while the person remains
+            # in a handoff pose.
+            handoff_stop_condition = (
                 classification == "handoff"
-                and self._last_classification != "handoff"
-                and not self._servo_active
-            ):
-                if(self.debug == False):
-                    self._activate_servo_for_handoff()
+                and float(confidence) >= self.handoff_stop_threshold
+            )
 
-            self._last_classification = classification
+            if (
+                handoff_stop_condition
+                and not self._last_handoff_stop_condition
+                and not self._handoff_active
+            ):
+                self._start_handoff_interaction()
+
+            self._last_handoff_stop_condition = handoff_stop_condition
 
         except Exception as exc:
             self.get_logger().warning(
@@ -514,49 +558,68 @@ class HandoffInferenceNode(Node):
                 f"Exception: {exc}"
             )
 
-    def _activate_servo_for_handoff(self):
-        """Send command 1 now and schedule command 0 after the hold time."""
-        try:
-            self.servo.send_command(1)
-            self._servo_active = True
+    def _publish_handoff_pause(self, should_pause: bool):
+        """Publish whether the patrol node should temporarily stop."""
+        msg = Bool()
+        msg.data = bool(should_pause)
+        self.handoff_pause_pub.publish(msg)
 
-            self.get_logger().info(
-                "Handoff detected: sent servo command 1."
-            )
+    def _start_handoff_interaction(self):
+        """Pause patrol, activate the servo, and schedule interaction end."""
+        self._handoff_active = True
+        self._publish_handoff_pause(True)
 
-            # create_timer() is periodic, so the reset callback cancels
-            # and destroys it after its first invocation to make it a
-            # one-shot timer. This avoids blocking inference with sleep().
-            self._servo_reset_timer = self.create_timer(
-                self.servo_hold_seconds,
-                self._reset_servo_after_handoff,
-            )
+        self.get_logger().info(
+            "Confident handoff detected: requesting patrol pause."
+        )
 
-        except Exception as exc:
-            self._servo_active = False
-            self.get_logger().error(
-                f"Failed to send servo command 1: {exc}"
-            )
+        if not self.debug:
+            try:
+                self.servo.send_command(1)
+                self._servo_active = True
 
-    def _reset_servo_after_handoff(self):
-        """Return the servo to command 0 and stop the one-shot timer."""
-        try:
-            self.servo.send_command(0)
-            self.get_logger().info(
-                "Servo hold complete: sent servo command 0."
-            )
-        except Exception as exc:
-            self.get_logger().error(
-                f"Failed to send servo command 0: {exc}"
-            )
-        finally:
-            self._servo_active = False
+                self.get_logger().info(
+                    "Handoff detected: sent servo command 1."
+                )
+            except Exception as exc:
+                self._servo_active = False
+                self.get_logger().error(
+                    f"Failed to send servo command 1: {exc}"
+                )
 
-            if self._servo_reset_timer is not None:
-                timer = self._servo_reset_timer
-                self._servo_reset_timer = None
-                timer.cancel()
-                self.destroy_timer(timer)
+        # create_timer() is periodic, so the callback below destroys it
+        # after its first invocation to make it a one-shot timer.
+        self._handoff_reset_timer = self.create_timer(
+            self.servo_hold_seconds,
+            self._finish_handoff_interaction,
+        )
+
+    def _finish_handoff_interaction(self):
+        """Finish the handoff interval and allow patrol to resume."""
+        if not self.debug and self._servo_active:
+            try:
+                self.servo.send_command(0)
+                self.get_logger().info(
+                    "Servo hold complete: sent servo command 0."
+                )
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Failed to send servo command 0: {exc}"
+                )
+
+        self._servo_active = False
+        self._handoff_active = False
+        self._publish_handoff_pause(False)
+
+        self.get_logger().info(
+            "Handoff interval complete: allowing patrol to resume."
+        )
+
+        if self._handoff_reset_timer is not None:
+            timer = self._handoff_reset_timer
+            self._handoff_reset_timer = None
+            timer.cancel()
+            self.destroy_timer(timer)
 
     def destroy_node(self):
         """Safely return the servo to 0 and close the serial port."""
@@ -567,11 +630,19 @@ class HandoffInferenceNode(Node):
             except cv2.error:
                 pass
 
-        if self._servo_reset_timer is not None:
-            timer = self._servo_reset_timer
-            self._servo_reset_timer = None
+        if self._handoff_reset_timer is not None:
+            timer = self._handoff_reset_timer
+            self._handoff_reset_timer = None
             timer.cancel()
             self.destroy_timer(timer)
+
+        if hasattr(self, "handoff_pause_pub"):
+            try:
+                self._publish_handoff_pause(False)
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"Could not release patrol pause during shutdown: {exc}"
+                )
 
         if hasattr(self, "servo"):
             try:
