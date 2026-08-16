@@ -1,4 +1,12 @@
 import cv2
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -81,6 +89,90 @@ class HandoffInferenceNode(Node):
             10.0,
         )
 
+        # ---------------------------------------------------------
+        # Aborted-handoff attempt logging
+        # ---------------------------------------------------------
+        # An "aborted attempt" is operationally defined as handoff
+        # probability rising into an incipient-attempt region, but then
+        # falling away again without ever reaching the committed handoff
+        # threshold above. This is intentionally robot-side only and does
+        # not require any synchronization with the AR headset.
+        self.declare_parameter(
+            "aborted_handoff_logging_enabled",
+            True,
+        )
+
+        self.declare_parameter(
+            "aborted_handoff_server_scheme",
+            "http",
+        )
+
+        self.declare_parameter(
+            "aborted_handoff_server_ip",
+            "10.237.193.186",
+        )
+
+        self.declare_parameter(
+            "aborted_handoff_server_port",
+            8001,
+        )
+
+        self.declare_parameter(
+            "aborted_handoff_server_endpoint",
+            "/aborted_handoff_counts",
+        )
+
+        self.declare_parameter(
+            "aborted_handoff_post_timeout_seconds",
+            2.0,
+        )
+
+        # ---------------------------------------------------------
+        # Robot reaction-time logging
+        # ---------------------------------------------------------
+        # Reaction time is measured entirely on the robot:
+        # first observed P(handoff) >= the attempt-start threshold
+        # through first observed P(handoff) >= the committed threshold.
+        self.declare_parameter(
+            "robot_reaction_time_logging_enabled",
+            True,
+        )
+
+        # Use the same server scheme/IP/port as aborted-handoff logging.
+        # Only the endpoint is separate.
+        self.declare_parameter(
+            "robot_reaction_time_server_endpoint",
+            "/indv_handoff_times",
+        )
+
+        # The attempt threshold must remain below the committed handoff
+        # threshold (0.60 by default).
+        self.declare_parameter(
+            "aborted_handoff_attempt_start_probability",
+            0.40,
+        )
+
+        # Hysteresis: once an incipient attempt begins, it is only treated
+        # as having ended after probability falls below this lower value.
+        self.declare_parameter(
+            "aborted_handoff_attempt_end_probability",
+            0.25,
+        )
+
+        # Require the signal to remain below the end threshold for this
+        # long before declaring the attempt abandoned.
+        self.declare_parameter(
+            "aborted_handoff_attempt_end_grace_seconds",
+            0.75,
+        )
+
+        # Very short probability spikes are discarded rather than counted
+        # as human handoff attempts.
+        self.declare_parameter(
+            "aborted_handoff_attempt_min_duration_seconds",
+            0.50,
+        )
+
         self.get_logger().info(
             "Reading ROS parameters..."
         )
@@ -147,6 +239,82 @@ class HandoffInferenceNode(Node):
             .double_value
         )
 
+        aborted_handoff_logging_enabled = (
+            self.get_parameter("aborted_handoff_logging_enabled")
+            .get_parameter_value()
+            .bool_value
+        )
+
+        aborted_handoff_server_scheme = (
+            self.get_parameter("aborted_handoff_server_scheme")
+            .get_parameter_value()
+            .string_value
+            .strip()
+        )
+
+        aborted_handoff_server_ip = (
+            self.get_parameter("aborted_handoff_server_ip")
+            .get_parameter_value()
+            .string_value
+            .strip()
+        )
+
+        aborted_handoff_server_port = (
+            self.get_parameter("aborted_handoff_server_port")
+            .get_parameter_value()
+            .integer_value
+        )
+
+        aborted_handoff_server_endpoint = (
+            self.get_parameter("aborted_handoff_server_endpoint")
+            .get_parameter_value()
+            .string_value
+            .strip()
+        )
+
+        aborted_handoff_post_timeout_seconds = (
+            self.get_parameter("aborted_handoff_post_timeout_seconds")
+            .get_parameter_value()
+            .double_value
+        )
+
+        robot_reaction_time_logging_enabled = (
+            self.get_parameter("robot_reaction_time_logging_enabled")
+            .get_parameter_value()
+            .bool_value
+        )
+
+        robot_reaction_time_server_endpoint = (
+            self.get_parameter("robot_reaction_time_server_endpoint")
+            .get_parameter_value()
+            .string_value
+            .strip()
+        )
+
+        aborted_handoff_attempt_start_probability = (
+            self.get_parameter("aborted_handoff_attempt_start_probability")
+            .get_parameter_value()
+            .double_value
+        )
+
+        aborted_handoff_attempt_end_probability = (
+            self.get_parameter("aborted_handoff_attempt_end_probability")
+            .get_parameter_value()
+            .double_value
+        )
+
+        aborted_handoff_attempt_end_grace_seconds = (
+            self.get_parameter("aborted_handoff_attempt_end_grace_seconds")
+            .get_parameter_value()
+            .double_value
+        )
+
+        aborted_handoff_attempt_min_duration_seconds = (
+            self.get_parameter("aborted_handoff_attempt_min_duration_seconds")
+            .get_parameter_value()
+            .double_value
+        )
+
         self.get_logger().info(
             "Parameters:"
         )
@@ -191,6 +359,52 @@ class HandoffInferenceNode(Node):
             f"  servo_hold_seconds={servo_hold_seconds}"
         )
 
+        self.get_logger().info(
+            "  aborted_handoff_logging_enabled="
+            f"{aborted_handoff_logging_enabled}"
+        )
+
+        self.get_logger().info(
+            "  aborted_handoff_server="
+            f"{aborted_handoff_server_scheme}://"
+            f"{aborted_handoff_server_ip}:"
+            f"{aborted_handoff_server_port}"
+            f"{aborted_handoff_server_endpoint}"
+        )
+
+        self.get_logger().info(
+            "  robot_reaction_time_logging_enabled="
+            f"{robot_reaction_time_logging_enabled}"
+        )
+
+        self.get_logger().info(
+            "  robot_reaction_time_server="
+            f"{aborted_handoff_server_scheme}://"
+            f"{aborted_handoff_server_ip}:"
+            f"{aborted_handoff_server_port}"
+            f"{robot_reaction_time_server_endpoint}"
+        )
+
+        self.get_logger().info(
+            "  aborted_handoff_attempt_start_probability="
+            f"{aborted_handoff_attempt_start_probability}"
+        )
+
+        self.get_logger().info(
+            "  aborted_handoff_attempt_end_probability="
+            f"{aborted_handoff_attempt_end_probability}"
+        )
+
+        self.get_logger().info(
+            "  aborted_handoff_attempt_end_grace_seconds="
+            f"{aborted_handoff_attempt_end_grace_seconds}"
+        )
+
+        self.get_logger().info(
+            "  aborted_handoff_attempt_min_duration_seconds="
+            f"{aborted_handoff_attempt_min_duration_seconds}"
+        )
+
         if model_type not in MODEL_TYPES:
             raise ValueError(
                 f"Unsupported model_type '{model_type}'. "
@@ -198,11 +412,110 @@ class HandoffInferenceNode(Node):
             )
 
         self.model_type = model_type
+        self.features_type = str(features_type)
+        self.crop_around_object = bool(crop_around_object)
         self.handoff_stop_threshold = float(threshold)
         self.handoff_pause_topic = str(handoff_pause_topic)
         self.show_output_window = bool(show_output_window)
         self.debug = bool(debug)
         self.output_window_name = "Handoff Classification"
+
+        # ---------------------------------------------------------
+        # Aborted-handoff logging configuration/state
+        # ---------------------------------------------------------
+        self.aborted_handoff_logging_enabled = bool(
+            aborted_handoff_logging_enabled
+        )
+        self.aborted_handoff_server_scheme = (
+            aborted_handoff_server_scheme or "http"
+        )
+        self.aborted_handoff_server_ip = aborted_handoff_server_ip
+        self.aborted_handoff_server_port = int(
+            aborted_handoff_server_port
+        )
+        self.aborted_handoff_server_endpoint = (
+            aborted_handoff_server_endpoint
+        )
+        self.aborted_handoff_post_timeout_seconds = float(
+            aborted_handoff_post_timeout_seconds
+        )
+        self.robot_reaction_time_logging_enabled = bool(
+            robot_reaction_time_logging_enabled
+        )
+        self.robot_reaction_time_server_endpoint = str(
+            robot_reaction_time_server_endpoint
+        )
+        self.aborted_handoff_attempt_start_probability = float(
+            aborted_handoff_attempt_start_probability
+        )
+        self.aborted_handoff_attempt_end_probability = float(
+            aborted_handoff_attempt_end_probability
+        )
+        self.aborted_handoff_attempt_end_grace_seconds = float(
+            aborted_handoff_attempt_end_grace_seconds
+        )
+        self.aborted_handoff_attempt_min_duration_seconds = float(
+            aborted_handoff_attempt_min_duration_seconds
+        )
+
+        if not (
+            0.0
+            <= self.aborted_handoff_attempt_end_probability
+            < self.aborted_handoff_attempt_start_probability
+            < self.handoff_stop_threshold
+            <= 1.0
+        ):
+            raise ValueError(
+                "Aborted-handoff thresholds must satisfy: "
+                "0 <= end_probability < start_probability < "
+                "handoff threshold <= 1."
+            )
+
+        if self.aborted_handoff_attempt_end_grace_seconds < 0.0:
+            raise ValueError(
+                "aborted_handoff_attempt_end_grace_seconds must be >= 0."
+            )
+
+        if self.aborted_handoff_attempt_min_duration_seconds < 0.0:
+            raise ValueError(
+                "aborted_handoff_attempt_min_duration_seconds must be >= 0."
+            )
+
+        if self.aborted_handoff_server_port <= 0:
+            raise ValueError(
+                "aborted_handoff_server_port must be > 0."
+            )
+
+        if self.aborted_handoff_post_timeout_seconds <= 0.0:
+            raise ValueError(
+                "aborted_handoff_post_timeout_seconds must be > 0."
+            )
+
+        if (
+            self.aborted_handoff_server_endpoint
+            and not self.aborted_handoff_server_endpoint.startswith("/")
+        ):
+            self.aborted_handoff_server_endpoint = (
+                "/" + self.aborted_handoff_server_endpoint
+            )
+
+        if (
+            self.robot_reaction_time_server_endpoint
+            and not self.robot_reaction_time_server_endpoint.startswith("/")
+        ):
+            self.robot_reaction_time_server_endpoint = (
+                "/" + self.robot_reaction_time_server_endpoint
+            )
+
+        self._aborted_attempt_active = False
+        self._aborted_attempt_detection_armed = True
+        self._aborted_attempt_start_monotonic = None
+        self._aborted_attempt_start_utc = None
+        self._aborted_attempt_peak_probability = 0.0
+        self._aborted_attempt_below_end_since = None
+        self._aborted_attempt_candidate_end_utc = None
+        self._aborted_attempt_count_since_start = 0
+        self._robot_reaction_time_count_since_start = 0
 
         # ---------------------------------------------------------
         # Servo controller
@@ -488,6 +801,22 @@ class HandoffInferenceNode(Node):
                 f"(confidence={confidence:.3f})"
             )
 
+            # The detector wrapper returns confidence in whichever class
+            # it selected. Convert that back to P(handoff) so a negative
+            # result with confidence 0.80 correctly means P(handoff)=0.20.
+            handoff_probability = self._handoff_probability_from_result(
+                classification,
+                float(confidence),
+            )
+
+            if (
+                self.aborted_handoff_logging_enabled
+                or self.robot_reaction_time_logging_enabled
+            ):
+                self._update_aborted_handoff_attempt_tracking(
+                    handoff_probability
+                )
+
             # -----------------------------------------------------
             # Optional output window
             # -----------------------------------------------------
@@ -532,7 +861,7 @@ class HandoffInferenceNode(Node):
             # in a handoff pose.
             handoff_stop_condition = (
                 classification == "handoff"
-                and float(confidence) >= self.handoff_stop_threshold
+                and handoff_probability >= self.handoff_stop_threshold
             )
 
             if (
@@ -556,6 +885,427 @@ class HandoffInferenceNode(Node):
 
             self.get_logger().warning(
                 f"Exception: {exc}"
+            )
+
+    @staticmethod
+    def _handoff_probability_from_result(
+        classification: str,
+        confidence: float,
+    ) -> float:
+        """
+        Convert detector output to P(handoff).
+
+        The detector returns confidence in the returned class:
+          handoff     -> confidence == P(handoff)
+          not_handoff -> confidence == P(not_handoff)
+        """
+        confidence = max(0.0, min(1.0, float(confidence)))
+
+        if classification == "handoff":
+            return confidence
+
+        if classification == "not_handoff":
+            return 1.0 - confidence
+
+        # Unknown labels should not create false attempt events.
+        return 0.0
+
+    def _reset_aborted_attempt_candidate(self):
+        """Clear the current incipient-attempt state."""
+        self._aborted_attempt_active = False
+        self._aborted_attempt_start_monotonic = None
+        self._aborted_attempt_start_utc = None
+        self._aborted_attempt_peak_probability = 0.0
+        self._aborted_attempt_below_end_since = None
+        self._aborted_attempt_candidate_end_utc = None
+
+    def _update_aborted_handoff_attempt_tracking(
+        self,
+        handoff_probability: float,
+    ):
+        """
+        Track incipient handoff behavior that disappears before commitment.
+
+        State logic:
+          1. P(handoff) >= start threshold begins a candidate attempt.
+          2. P(handoff) >= committed threshold means it became a real
+             detected handoff, so it is NOT counted as aborted.
+          3. Otherwise, if P(handoff) stays below the lower end threshold
+             for the configured grace period, the candidate is counted as
+             aborted (provided it lasted at least the minimum duration).
+          4. After a committed handoff, detection remains disarmed until
+             probability returns below the end threshold. This prevents one
+             long handoff from creating a false aborted attempt when the
+             10-second handoff interval finishes.
+        """
+        now_monotonic = time.monotonic()
+        handoff_probability = max(
+            0.0,
+            min(1.0, float(handoff_probability)),
+        )
+
+        # A committed handoff is never an aborted attempt. If an
+        # incipient attempt was already active, the elapsed time from its
+        # first threshold crossing to this committed threshold is the
+        # robot-side reaction/recognition time. If the probability jumps
+        # directly from below the attempt threshold to the committed
+        # threshold in one sample, the observable reaction time is 0.0 s.
+        if handoff_probability >= self.handoff_stop_threshold:
+            # A committed interaction disarms detection until the signal
+            # clears. This also ensures reaction time is recorded once,
+            # rather than on every frame that remains above 0.60.
+            if not self._aborted_attempt_detection_armed:
+                return
+
+            if self._aborted_attempt_active:
+                reaction_time_seconds = max(
+                    0.0,
+                    now_monotonic
+                    - self._aborted_attempt_start_monotonic,
+                )
+                reaction_start_utc = self._aborted_attempt_start_utc
+            else:
+                reaction_time_seconds = 0.0
+                reaction_start_utc = datetime.now(timezone.utc)
+
+            reaction_end_utc = datetime.now(timezone.utc)
+
+            if self.robot_reaction_time_logging_enabled:
+                self._record_robot_reaction_time(
+                    reaction_time_seconds=reaction_time_seconds,
+                    start_utc=(
+                        reaction_start_utc or reaction_end_utc
+                    ),
+                    end_utc=reaction_end_utc,
+                    committed_handoff_probability=handoff_probability,
+                    direct_commit=(not self._aborted_attempt_active),
+                )
+
+            if self._aborted_attempt_active:
+                self.get_logger().info(
+                    "Incipient handoff reached committed threshold; "
+                    "not counting it as aborted."
+                )
+
+            self._reset_aborted_attempt_candidate()
+            self._aborted_attempt_detection_armed = False
+            return
+
+        # After a committed handoff, require the signal to clear before
+        # allowing a new incipient attempt to begin.
+        if not self._aborted_attempt_detection_armed:
+            if (
+                handoff_probability
+                <= self.aborted_handoff_attempt_end_probability
+            ):
+                self._aborted_attempt_detection_armed = True
+
+            return
+
+        # Do not start/finish candidate attempts while the robot is already
+        # servicing a committed handoff.
+        if self._handoff_active:
+            return
+
+        if not self._aborted_attempt_active:
+            if (
+                handoff_probability
+                >= self.aborted_handoff_attempt_start_probability
+            ):
+                self._aborted_attempt_active = True
+                self._aborted_attempt_start_monotonic = now_monotonic
+                self._aborted_attempt_start_utc = datetime.now(
+                    timezone.utc
+                )
+                self._aborted_attempt_peak_probability = (
+                    handoff_probability
+                )
+                self._aborted_attempt_below_end_since = None
+                self._aborted_attempt_candidate_end_utc = None
+
+                self.get_logger().info(
+                    "Incipient handoff attempt detected: "
+                    f"P(handoff)={handoff_probability:.3f}."
+                )
+
+            return
+
+        # Candidate is active.
+        self._aborted_attempt_peak_probability = max(
+            self._aborted_attempt_peak_probability,
+            handoff_probability,
+        )
+
+        if (
+            handoff_probability
+            <= self.aborted_handoff_attempt_end_probability
+        ):
+            if self._aborted_attempt_below_end_since is None:
+                self._aborted_attempt_below_end_since = now_monotonic
+                self._aborted_attempt_candidate_end_utc = datetime.now(
+                    timezone.utc
+                )
+
+            below_duration = (
+                now_monotonic
+                - self._aborted_attempt_below_end_since
+            )
+
+            if (
+                below_duration
+                >= self.aborted_handoff_attempt_end_grace_seconds
+            ):
+                # Measure the attempt itself only until the signal first
+                # dropped below the end threshold. Do not include the
+                # debounce/grace period in the attempt duration.
+                attempt_duration = (
+                    self._aborted_attempt_below_end_since
+                    - self._aborted_attempt_start_monotonic
+                )
+
+                if (
+                    attempt_duration
+                    >= self.aborted_handoff_attempt_min_duration_seconds
+                ):
+                    if self.aborted_handoff_logging_enabled:
+                        self._record_aborted_handoff_attempt(
+                            attempt_duration_seconds=attempt_duration,
+                            end_utc=(
+                                self._aborted_attempt_candidate_end_utc
+                                or datetime.now(timezone.utc)
+                            ),
+                        )
+                else:
+                    self.get_logger().info(
+                        "Discarding short incipient-handoff spike "
+                        f"({attempt_duration:.3f} s)."
+                    )
+
+                self._reset_aborted_attempt_candidate()
+
+        else:
+            # Probability recovered before the grace period completed.
+            self._aborted_attempt_below_end_since = None
+            self._aborted_attempt_candidate_end_utc = None
+
+    def _record_aborted_handoff_attempt(
+        self,
+        attempt_duration_seconds: float,
+        end_utc: datetime,
+    ):
+        """Create an abort event and POST it without blocking inference."""
+        self._aborted_attempt_count_since_start += 1
+
+        event_id = str(uuid.uuid4())
+
+        start_utc = self._aborted_attempt_start_utc
+        if start_utc is None:
+            start_utc = end_utc
+
+        payload = {
+            "eventType": "aborted_handoff_attempt",
+            "eventId": event_id,
+            "eventNumberSinceNodeStart": (
+                self._aborted_attempt_count_since_start
+            ),
+            "attemptStartUtc": start_utc.isoformat(),
+            "attemptEndUtc": end_utc.isoformat(),
+            "durationSeconds": float(attempt_duration_seconds),
+            "peakHandoffProbability": float(
+                self._aborted_attempt_peak_probability
+            ),
+            "attemptStartProbabilityThreshold": float(
+                self.aborted_handoff_attempt_start_probability
+            ),
+            "attemptEndProbabilityThreshold": float(
+                self.aborted_handoff_attempt_end_probability
+            ),
+            "committedHandoffProbabilityThreshold": float(
+                self.handoff_stop_threshold
+            ),
+            "modelType": self.model_type,
+            "featuresType": self.features_type,
+            "cropAroundObject": self.crop_around_object,
+        }
+
+        self.get_logger().warning(
+            "Aborted handoff attempt detected: "
+            f"duration={attempt_duration_seconds:.3f}s, "
+            "peak P(handoff)="
+            f"{self._aborted_attempt_peak_probability:.3f}, "
+            f"event_id={event_id}."
+        )
+
+        thread = threading.Thread(
+            target=self._post_aborted_handoff_event,
+            args=(payload,),
+            daemon=True,
+        )
+        thread.start()
+
+    def _record_robot_reaction_time(
+        self,
+        reaction_time_seconds: float,
+        start_utc: datetime,
+        end_utc: datetime,
+        committed_handoff_probability: float,
+        direct_commit: bool,
+    ):
+        """POST one robot-side handoff reaction-time measurement."""
+        self._robot_reaction_time_count_since_start += 1
+
+        event_id = str(uuid.uuid4())
+
+        payload = {
+            "eventType": "robot_handoff_reaction_time",
+            "eventId": event_id,
+            "eventNumberSinceNodeStart": (
+                self._robot_reaction_time_count_since_start
+            ),
+            "reactionStartUtc": start_utc.isoformat(),
+            "reactionEndUtc": end_utc.isoformat(),
+            "reactionTimeSeconds": float(reaction_time_seconds),
+            "attemptStartProbabilityThreshold": float(
+                self.aborted_handoff_attempt_start_probability
+            ),
+            "committedHandoffProbabilityThreshold": float(
+                self.handoff_stop_threshold
+            ),
+            "committedHandoffProbability": float(
+                committed_handoff_probability
+            ),
+            "directCommit": bool(direct_commit),
+            "modelType": self.model_type,
+            "featuresType": self.features_type,
+            "cropAroundObject": self.crop_around_object,
+        }
+
+        self.get_logger().info(
+            "Robot handoff reaction time: "
+            f"{reaction_time_seconds:.3f}s, "
+            f"event_id={event_id}."
+        )
+
+        thread = threading.Thread(
+            target=self._post_robot_reaction_time_event,
+            args=(payload,),
+            daemon=True,
+        )
+        thread.start()
+
+    def _shared_server_url(self, endpoint: str) -> str:
+        """Construct a URL using the configured study server."""
+        return (
+            f"{self.aborted_handoff_server_scheme}://"
+            f"{self.aborted_handoff_server_ip}:"
+            f"{self.aborted_handoff_server_port}"
+            f"{endpoint}"
+        )
+
+    def _robot_reaction_time_server_url(self) -> str:
+        return self._shared_server_url(
+            self.robot_reaction_time_server_endpoint
+        )
+
+    def _post_robot_reaction_time_event(self, payload: dict):
+        """POST one reaction-time event without blocking inference."""
+        url = self._robot_reaction_time_server_url()
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+
+            request = urllib.request.Request(
+                url=url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+
+            with urllib.request.urlopen(
+                request,
+                timeout=self.aborted_handoff_post_timeout_seconds,
+            ) as response:
+                status = getattr(response, "status", None)
+
+            self.get_logger().info(
+                "Posted robot reaction time "
+                f"to {url} (HTTP {status})."
+            )
+
+        except urllib.error.HTTPError as exc:
+            self.get_logger().error(
+                "Server rejected robot reaction-time event: "
+                f"HTTP {exc.code} from {url}."
+            )
+
+        except urllib.error.URLError as exc:
+            self.get_logger().error(
+                "Could not POST robot reaction-time event "
+                f"to {url}: {exc.reason}"
+            )
+
+        except Exception as exc:
+            self.get_logger().error(
+                "Unexpected error posting robot reaction-time event "
+                f"to {url}: {type(exc).__name__}: {exc}"
+            )
+
+    def _aborted_handoff_server_url(self) -> str:
+        """Construct the configured aborted-handoff logging URL."""
+        return self._shared_server_url(
+            self.aborted_handoff_server_endpoint
+        )
+
+    def _post_aborted_handoff_event(self, payload: dict):
+        """
+        POST one aborted-handoff event.
+
+        Uses only the Python standard library so this does not introduce a
+        requests dependency on the ROS Foxy robot environment.
+        """
+        url = self._aborted_handoff_server_url()
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+
+            request = urllib.request.Request(
+                url=url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+
+            with urllib.request.urlopen(
+                request,
+                timeout=self.aborted_handoff_post_timeout_seconds,
+            ) as response:
+                status = getattr(response, "status", None)
+
+            self.get_logger().info(
+                "Posted aborted handoff attempt "
+                f"to {url} (HTTP {status})."
+            )
+
+        except urllib.error.HTTPError as exc:
+            self.get_logger().error(
+                "Server rejected aborted handoff event: "
+                f"HTTP {exc.code} from {url}."
+            )
+
+        except urllib.error.URLError as exc:
+            self.get_logger().error(
+                "Could not POST aborted handoff event "
+                f"to {url}: {exc.reason}"
+            )
+
+        except Exception as exc:
+            self.get_logger().error(
+                "Unexpected error posting aborted handoff event "
+                f"to {url}: {type(exc).__name__}: {exc}"
             )
 
     def _publish_handoff_pause(self, should_pause: bool):
