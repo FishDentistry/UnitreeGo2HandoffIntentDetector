@@ -90,7 +90,8 @@ class HandoffDetector:
         reject_side_without_forward_wrist=True,
         side_facing_max_torso_ratio=0.45,
         side_shoulder_depth_fraction=0.06,
-        side_wrist_forward_depth_fraction=0.12,
+        side_wrist_forward_depth_fraction=0.10,
+        side_wrist_beyond_elbow_depth_fraction=0.04,
     ):
         self.features_type = features_type
         self.threshold = float(threshold)
@@ -128,6 +129,9 @@ class HandoffDetector:
         self.side_wrist_forward_depth_fraction = float(
             side_wrist_forward_depth_fraction
         )
+        self.side_wrist_beyond_elbow_depth_fraction = float(
+            side_wrist_beyond_elbow_depth_fraction
+        )
 
         if self.side_facing_max_torso_ratio < 0.0:
             raise ValueError(
@@ -142,6 +146,11 @@ class HandoffDetector:
         if self.side_wrist_forward_depth_fraction < 0.0:
             raise ValueError(
                 "side_wrist_forward_depth_fraction must be >= 0.0."
+            )
+
+        if self.side_wrist_beyond_elbow_depth_fraction < 0.0:
+            raise ValueError(
+                "side_wrist_beyond_elbow_depth_fraction must be >= 0.0."
             )
 
         # Keep RTMPose crop generation identical to the updated training
@@ -906,6 +915,12 @@ class HandoffDetector:
             )
 
             if side_facing:
+                left_elbow_relative_depth = float(
+                    relative_joint_depths[2]
+                )
+                right_elbow_relative_depth = float(
+                    relative_joint_depths[3]
+                )
                 left_wrist_relative_depth = float(
                     relative_joint_depths[4]
                 )
@@ -937,7 +952,23 @@ class HandoffDetector:
                     - required_forward_depth
                 )
 
+                # In addition to being forward of the shoulders, require the
+                # wrist to be meaningfully closer to the camera than the
+                # elbow on the SAME arm. This rejects side-on neutral/hanging
+                # arm poses whose wrist happens to be somewhat forward simply
+                # because of body orientation.
+                required_wrist_beyond_elbow_depth = (
+                    self.side_wrist_beyond_elbow_depth_fraction
+                    * nearest_shoulder_depth
+                )
+
                 if keypoints.shape[1] >= 3:
+                    left_elbow_score = float(
+                        keypoints[7, 2]
+                    )
+                    right_elbow_score = float(
+                        keypoints[8, 2]
+                    )
                     left_wrist_score = float(
                         keypoints[9, 2]
                     )
@@ -949,6 +980,16 @@ class HandoffDetector:
                         self.person_presence_confidence
                     )
 
+                    left_elbow_reliable = (
+                        np.isfinite(left_elbow_score)
+                        and left_elbow_score
+                        >= confidence_threshold
+                    )
+                    right_elbow_reliable = (
+                        np.isfinite(right_elbow_score)
+                        and right_elbow_score
+                        >= confidence_threshold
+                    )
                     left_wrist_reliable = (
                         np.isfinite(left_wrist_score)
                         and left_wrist_score
@@ -960,27 +1001,48 @@ class HandoffDetector:
                         >= confidence_threshold
                     )
                 else:
+                    left_elbow_reliable = True
+                    right_elbow_reliable = True
                     left_wrist_reliable = True
                     right_wrist_reliable = True
 
-                # If neither wrist is reliable in a clear side view, there
-                # is not enough evidence to claim a handoff.
+                # A side-view handoff must have at least one arm for which
+                # both the elbow and wrist are trustworthy.
+                left_arm_reliable = (
+                    left_elbow_reliable
+                    and left_wrist_reliable
+                )
+                right_arm_reliable = (
+                    right_elbow_reliable
+                    and right_wrist_reliable
+                )
+
                 if not (
-                    left_wrist_reliable
-                    or right_wrist_reliable
+                    left_arm_reliable
+                    or right_arm_reliable
                 ):
                     return None
 
                 left_wrist_forward = (
-                    left_wrist_reliable
+                    left_arm_reliable
                     and left_wrist_relative_depth
                     <= required_wrist_relative_depth
+                    and left_wrist_relative_depth
+                    <= (
+                        left_elbow_relative_depth
+                        - required_wrist_beyond_elbow_depth
+                    )
                 )
 
                 right_wrist_forward = (
-                    right_wrist_reliable
+                    right_arm_reliable
                     and right_wrist_relative_depth
                     <= required_wrist_relative_depth
+                    and right_wrist_relative_depth
+                    <= (
+                        right_elbow_relative_depth
+                        - required_wrist_beyond_elbow_depth
+                    )
                 )
 
                 if not (
