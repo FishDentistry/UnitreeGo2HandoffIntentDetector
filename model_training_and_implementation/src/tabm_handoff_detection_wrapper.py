@@ -90,7 +90,7 @@ class HandoffDetector:
         reject_side_without_forward_wrist=True,
         side_facing_max_torso_ratio=0.45,
         side_shoulder_depth_fraction=0.06,
-        side_wrist_forward_depth_fraction=0.10,
+        side_wrist_forward_depth_fraction=0.12,
     ):
         self.features_type = features_type
         self.threshold = float(threshold)
