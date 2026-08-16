@@ -29,9 +29,11 @@ from quest_hand_intent_model_est.src.posefix_guidance import (
 )
 from shared.util.quest_joints_network_dat_str import QuestJointsPacket
 
-from model_training_and_implementation.src.dino_detector import DINOObjectDetector
 from model_training_and_implementation.src.resnet_encoder import ResNet18ImageEncoder
-from robot_fov_estimation.src.go2_yolo_det_wrapper import YOLOGo2Detector
+from robot_fov_estimation.src.orient_anything_forward_estimation_wrapper import (
+    OrientAnythingGo2ForwardEstimator,
+    OrientationEstimate,
+)
 from robot_fov_estimation.src.robot_detector_tracker import (
     RobotDetectorTracker,
     OSTrackAdapter,
@@ -219,12 +221,60 @@ def format_perturbation_response(
         "text_guidance": text_guidance,
     }
 
+def _orientation_angle_sin_cos(
+    orientation: Optional[OrientationEstimate],
+) -> list[float]:
+    """Return [sin(yaw), cos(yaw)] for the selected signed-yaw estimate."""
+    if (
+        orientation is None
+        or not orientation.robot_detected
+        or orientation.relative_yaw_deg is None
+    ):
+        return [0.0, 0.0]
+
+    angle_rad = np.deg2rad(float(orientation.relative_yaw_deg))
+    return [
+        float(np.sin(angle_rad)),
+        float(np.cos(angle_rad)),
+    ]
+
+
 def format_robot_tracking_result(
     result: Optional[RobotTrackResult],
+    orientation: Optional[OrientationEstimate] = None,
+    orientation_error: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Convert RobotTrackResult into a JSON-serializable dictionary."""
+    """Convert tracking + visual forward estimation into a JSON-safe result.
+
+    `angle_between_cam_and_robot_forward` is the Orient Anything wrapper's
+    signed relative yaw:
+
+        SignedAngle(camera_to_robot_planar, robot_forward_planar, +Y)
+
+    The legacy angle fields are preserved for Unity compatibility. Use
+    `forward_estimation_valid` before consuming them; [0, 0] is returned for
+    `angle_sin_cos` when no valid forward estimate is available.
+    """
     if result is None:
         return None
+
+    forward_valid = (
+        orientation is not None
+        and orientation.robot_detected
+        and orientation.relative_yaw_deg is not None
+    )
+
+    relative_yaw = (
+        float(orientation.relative_yaw_deg)
+        if forward_valid
+        else 0.0
+    )
+
+    orientation_payload = (
+        orientation.to_dict()
+        if orientation is not None
+        else None
+    )
 
     return {
         "found": result.found,
@@ -248,15 +298,25 @@ def format_robot_tracking_result(
         "replacement_candidate_count":
             result.replacement_candidate_count,
         "verification_misses": result.verification_misses,
-        "angle_between_cam_and_robot_forward": 0.0,
-        "angle_sin_cos": [0.0, 0.0],
+
+        # Existing fields, now populated by the fine-tuned OA model.
+        "forward_estimation_valid": bool(forward_valid),
+        "angle_between_cam_and_robot_forward": relative_yaw,
+        "angle_sin_cos": _orientation_angle_sin_cos(orientation),
+
+        # Rich diagnostics / optional Quest-world forward vector.
+        "forward_estimation": orientation_payload,
+        "forward_estimation_error": orientation_error,
     }
 
+
 def create_app(
-    robot_obj_det_weights_path: str,
+    robot_obj_det_weights_path: Optional[str],
     model_path: str,
     quest_model_type: str,
     quest_model_features_type: str,
+    robot_forward_estimator_path: Optional[str] = None,
+    robot_forward_decoder: str = "mean",
 ) -> FastAPI:
     app = FastAPI()
 
@@ -279,30 +339,49 @@ def create_app(
     configure_posefix_for_hand_guidance()
 
     # ------------------------------------------------------------------
-    # Robot detector/tracker initialization
+    # Quest-side image models
     # ------------------------------------------------------------------
-    #
-    # These objects are created once and reused by every /robot_frame
-    # request. Do not create DINO or CSRT separately inside the endpoint.
-    #
-    dino_detector = DINOObjectDetector(confidence=0.05)
-    resnet_encoder = ResNet18ImageEncoder(pretrained=True, device="cuda", l2_normalize=True)
+    resnet_encoder = None
+    if quest_model_features_type == "keypoints_resnet":
+        resnet_encoder = ResNet18ImageEncoder(
+            pretrained=True,
+            device="cuda",
+            l2_normalize=True,
+        )
 
-    if(robot_obj_det_weights_path is not None):
-        yolo_detector = YOLOGo2Detector(
-            confidence=0.05,
-            iou_threshold=0.50,
-            image_size=640,
-            device=0,
-            weights_path=robot_obj_det_weights_path
+    # Load the FINAL all-data Orient Anything checkpoint once. The wrapper
+    # restores the exact YOLO settings saved by the training script. If an
+    # explicit detector checkpoint is supplied to this server, it overrides
+    # the checkpoint-recorded YOLO path while retaining the saved confidence,
+    # IoU, image size, and padding settings.
+    robot_forward_estimator = OrientAnythingGo2ForwardEstimator(
+        checkpoint_path=robot_forward_estimator_path,
+        decoder=robot_forward_decoder,
+        yolo_weights_path=robot_obj_det_weights_path,
+    )
+
+    if not robot_forward_estimator.yolo_crop_enabled:
+        raise RuntimeError(
+            "The deployed forward-estimation checkpoint has YOLO cropping "
+            "disabled. This server expects the deployment-matched YOLO crop "
+            "pipeline used by the current training script."
         )
-    else:
-        yolo_detector = YOLOGo2Detector(
-            confidence=0.05,
-            iou_threshold=0.50,
-            image_size=960,
-            device=0,
+
+    if robot_forward_estimator.detector is None:
+        raise RuntimeError(
+            "OrientAnythingGo2ForwardEstimator did not create a YOLO detector."
         )
+
+    # IMPORTANT: share the wrapper's YOLO detector with RobotDetectorTracker.
+    # This avoids loading a second YOLO model and guarantees that tracking and
+    # orientation estimation use the checkpoint's deployment-matched detector.
+    yolo_detector = robot_forward_estimator.detector
+
+    print(
+        "Robot forward estimator configuration:",
+        robot_forward_estimator.checkpoint_summary(),
+        flush=True,
+    )
 
     ostrack = OSTrackAdapter()
     robot_tracker = RobotDetectorTracker(
@@ -324,9 +403,12 @@ def create_app(
     app.state.robot_tracker = robot_tracker
     app.state.robot_tracking_lock = threading.Lock()
     app.state.latest_robot_tracking_result = None
+    app.state.latest_robot_orientation_estimate = None
+    app.state.latest_robot_orientation_error = None
     app.state.last_robot_frame_id = -1
     app.state.latest_robot_camera_position = None
     app.state.latest_robot_camera_rotation = None
+    app.state.latest_robot_camera_intrinsics = None
 
     def process_robot_frame(
         image_bytes: bytes,
@@ -334,12 +416,14 @@ def create_app(
         capture_timestamp_unix: Optional[float],
         camera_position: Optional[dict[str, float]],
         camera_rotation: Optional[dict[str, float]],
+        camera_intrinsics: Optional[dict[str, float]],
     ) -> dict[str, Any]:
         """
         Decode and process one image.
 
-        This function runs in FastAPI/Starlette's thread pool so DINO and
-        OpenCV do not block the asyncio event loop.
+        This function runs in FastAPI/Starlette's thread pool so the tracker,
+        Orient Anything inference, and OpenCV work do not block the asyncio
+        event loop.
         """
         tracking_lock: threading.Lock = (
             app.state.robot_tracking_lock
@@ -354,7 +438,9 @@ def create_app(
                 "reason": "tracker_busy",
                 "submitted_frame_id": frame_id,
                 "result": format_robot_tracking_result(
-                    app.state.latest_robot_tracking_result
+                    app.state.latest_robot_tracking_result,
+                    app.state.latest_robot_orientation_estimate,
+                    app.state.latest_robot_orientation_error,
                 ),
             }
 
@@ -368,7 +454,9 @@ def create_app(
                     "last_processed_frame_id":
                         app.state.last_robot_frame_id,
                     "result": format_robot_tracking_result(
-                        app.state.latest_robot_tracking_result
+                        app.state.latest_robot_tracking_result,
+                        app.state.latest_robot_orientation_estimate,
+                        app.state.latest_robot_orientation_error,
                     ),
                 }
 
@@ -405,37 +493,96 @@ def create_app(
                 frame_id=frame_id,
                 frame_timestamp=frame_timestamp,
             )
+
+            # --------------------------------------------------------------
+            # Fine-tuned Orient Anything forward estimation
+            # --------------------------------------------------------------
+            #
+            # Reuse the tracker's current robot box. This avoids a second
+            # YOLO pass. The OA wrapper still applies the exact checkpoint-
+            # saved crop padding/JPEG round-trip/DINO preprocessing.
+            #
+            # Relative yaw requires only the Quest RGB frame + robot box.
+            # If Quest camera rotation + intrinsics are also supplied, the
+            # wrapper additionally back-projects the box center and returns a
+            # Quest-world robot_forward_world_unit vector. No robot-side pose
+            # or ground-truth forward vector is used.
+            orientation_estimate: Optional[OrientationEstimate] = None
+            orientation_error: Optional[str] = None
+
+            if result.found and result.bbox_xyxy is not None:
+                frame_rgb = cv2.cvtColor(
+                    frame_bgr,
+                    cv2.COLOR_BGR2RGB,
+                )
+
+                predict_kwargs: dict[str, Any] = {
+                    "robot_box_xyxy": result.bbox_xyxy,
+                }
+
+                if (
+                    camera_rotation is not None
+                    and camera_intrinsics is not None
+                ):
+                    predict_kwargs["camera_rotation_world_xyzw"] = (
+                        camera_rotation["x"],
+                        camera_rotation["y"],
+                        camera_rotation["z"],
+                        camera_rotation["w"],
+                    )
+                    predict_kwargs["camera_intrinsics"] = camera_intrinsics
+
+                try:
+                    orientation_estimate = robot_forward_estimator.predict(
+                        frame_rgb,
+                        **predict_kwargs,
+                    )
+                except Exception as exc:
+                    # Tracking should remain usable even if visual forward
+                    # estimation fails on one frame.
+                    orientation_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    print(
+                        "Robot forward estimation failed: "
+                        f"{orientation_error}",
+                        flush=True,
+                    )
+
             # result = app.state.robot_tracker.process_frame_detector_only(
             #         frame_bgr=frame_bgr,
             #         frame_id=frame_id,
             #         frame_timestamp=frame_timestamp,
             #     )
 
-            annotated_frame = draw_result(frame_bgr, result)
+            # annotated_frame = draw_result(frame_bgr, result)
 
-            output_path = (
-                Path(__file__).resolve().parent
-                / "latest_robot_detection.jpg"
-            )
+            # output_path = (
+            #     Path(__file__).resolve().parent
+            #     / "latest_robot_detection.jpg"
+            # )
 
-            saved = cv2.imwrite(
-                str(output_path),
-                annotated_frame,
-            )
+            # saved = cv2.imwrite(
+            #     str(output_path),
+            #     annotated_frame,
+            # )
 
-            print(
-                f"Annotated frame save: success={saved}, "
-                f"exists={output_path.exists()}, "
-                f"path={output_path}",
-                flush=True,
-            )
+            # print(
+            #     f"Annotated frame save: success={saved}, "
+            #     f"exists={output_path.exists()}, "
+            #     f"path={output_path}",
+            #     flush=True,
+            # )
 
 
 
             app.state.last_robot_frame_id = frame_id
             app.state.latest_robot_tracking_result = result
+            app.state.latest_robot_orientation_estimate = orientation_estimate
+            app.state.latest_robot_orientation_error = orientation_error
             app.state.latest_robot_camera_position = camera_position
             app.state.latest_robot_camera_rotation = camera_rotation
+            app.state.latest_robot_camera_intrinsics = camera_intrinsics
 
             res = {
                 "accepted": True,
@@ -443,7 +590,13 @@ def create_app(
                 "submitted_frame_id": frame_id,
                 "image_width": int(frame_bgr.shape[1]),
                 "image_height": int(frame_bgr.shape[0]),
-                "result": format_robot_tracking_result(result),
+                "camera_pose_received": camera_position is not None,
+                "camera_intrinsics_received": camera_intrinsics is not None,
+                "result": format_robot_tracking_result(
+                    result,
+                    orientation_estimate,
+                    orientation_error,
+                ),
             }
             print(res)
 
@@ -511,10 +664,12 @@ def create_app(
             joint_feat_vec=quest_features,
             target_intent=True,
             features_type=quest_model_features_type,
+            original_probability=original_prediction.probability,
             classification_weight=1000.0,
             reachability_weight=1000.0,
             probability_margin=0.05,
             max_iterations=100,
+            bin_search_iterations=5,
             object_arm="right"
         )
         perturbation_success = perturbed_result["reached_target"]
@@ -570,6 +725,16 @@ def create_app(
         camera_rotation_y: Optional[float] = Query(default=None),
         camera_rotation_z: Optional[float] = Query(default=None),
         camera_rotation_w: Optional[float] = Query(default=None),
+
+        # Optional Quest RGB-camera intrinsics. These are NOT needed for the
+        # signed relative-yaw estimate. They are only needed, together with
+        # camera rotation, if the caller wants robot_forward_world_unit.
+        camera_fx: Optional[float] = Query(default=None, gt=0.0),
+        camera_fy: Optional[float] = Query(default=None, gt=0.0),
+        camera_cx: Optional[float] = Query(default=None),
+        camera_cy: Optional[float] = Query(default=None),
+        camera_intrinsics_width: Optional[int] = Query(default=None, gt=0),
+        camera_intrinsics_height: Optional[int] = Query(default=None, gt=0),
     ):
         """
         Receive one encoded Quest RGB image and return robot tracking data.
@@ -591,9 +756,22 @@ def create_app(
             camera_rotation_z
             camera_rotation_w
 
+            camera_fx
+            camera_fy
+            camera_cx
+            camera_cy
+            camera_intrinsics_width
+            camera_intrinsics_height
+
         Camera pose is optional, but when supplied all seven pose values must
         be present. Position is in the Quest world frame. Rotation is the
         CameraFrameCapture quaternion in Unity x/y/z/w order.
+
+        Camera intrinsics are also optional. fx/fy/cx/cy must be supplied
+        together. Calibration width/height may either both be supplied or
+        both omitted. Intrinsics are only used to convert the visual relative
+        yaw into a Quest-world forward unit vector; the relative-yaw model
+        itself requires only the image and robot box.
         """
         camera_pose_values = [
             camera_position_x,
@@ -643,6 +821,81 @@ def create_app(
                 "w": float(camera_rotation_w),
             }
 
+        intrinsic_core_values = [
+            camera_fx,
+            camera_fy,
+            camera_cx,
+            camera_cy,
+        ]
+        any_intrinsic_core = any(
+            value is not None
+            for value in intrinsic_core_values
+        )
+        all_intrinsic_core = all(
+            value is not None
+            for value in intrinsic_core_values
+        )
+
+        if any_intrinsic_core and not all_intrinsic_core:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Camera intrinsics were only partially supplied. "
+                    "Provide camera_fx/fy/cx/cy together, or omit all four."
+                ),
+            )
+
+        any_intrinsic_size = (
+            camera_intrinsics_width is not None
+            or camera_intrinsics_height is not None
+        )
+        all_intrinsic_size = (
+            camera_intrinsics_width is not None
+            and camera_intrinsics_height is not None
+        )
+
+        if any_intrinsic_size and not all_intrinsic_size:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "camera_intrinsics_width and "
+                    "camera_intrinsics_height must be supplied together."
+                ),
+            )
+
+        if all_intrinsic_size and not all_intrinsic_core:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Intrinsics calibration resolution cannot be supplied "
+                    "without camera_fx/fy/cx/cy."
+                ),
+            )
+
+        if all_intrinsic_core and camera_rotation is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Camera intrinsics require the full camera pose because "
+                    "camera_rotation_x/y/z/w is needed to express the "
+                    "estimated robot forward direction in Quest world."
+                ),
+            )
+
+        camera_intrinsics = None
+
+        if all_intrinsic_core:
+            camera_intrinsics = {
+                "fx": float(camera_fx),
+                "fy": float(camera_fy),
+                "cx": float(camera_cx),
+                "cy": float(camera_cy),
+            }
+
+            if all_intrinsic_size:
+                camera_intrinsics["width"] = int(camera_intrinsics_width)
+                camera_intrinsics["height"] = int(camera_intrinsics_height)
+
         image_bytes = await request.body()
 
         if not image_bytes:
@@ -658,6 +911,7 @@ def create_app(
             capture_timestamp_unix,
             camera_position,
             camera_rotation,
+            camera_intrinsics,
         )
 
     # Optional endpoint for forcing a clean reacquisition.
@@ -670,9 +924,12 @@ def create_app(
         with tracking_lock:
             app.state.robot_tracker.reset()
             app.state.latest_robot_tracking_result = None
+            app.state.latest_robot_orientation_estimate = None
+            app.state.latest_robot_orientation_error = None
             app.state.last_robot_frame_id = -1
             app.state.latest_robot_camera_position = None
             app.state.latest_robot_camera_rotation = None
+            app.state.latest_robot_camera_intrinsics = None
 
         return {
             "success": True,
@@ -720,11 +977,39 @@ def main() -> None:
     )
 
     parser.add_argument(
-            "--robot-obj-det-weights-path",
-            type=str,
-            default=None,
-            help="Path to the trained robot object detection model weights if using YOLO or similar.",
-        )
+        "--robot-obj-det-weights-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit Go2 YOLO weights. When supplied, the same "
+            "weights are used by both RobotDetectorTracker and the forward "
+            "estimator. If omitted, the forward-estimation checkpoint's "
+            "saved/default YOLO configuration is used."
+        ),
+    )
+
+    parser.add_argument(
+        "--robot-forward-estimator-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit final all-data Orient Anything forward-"
+            "estimation checkpoint. If omitted, the deployment wrapper uses "
+            "its normal default under "
+            "robot_fov_estimation/outputs/"
+            "orient_anything_forward_estimation_weights/."
+        ),
+    )
+
+    parser.add_argument(
+        "--robot-forward-decoder",
+        type=str,
+        choices=("mean", "argmax"),
+        default="mean",
+        help=(
+            "Decoder for signed relative yaw. Defaults to circular mean."
+        ),
+    )
 
     parser.add_argument(
         "--host",
@@ -758,6 +1043,8 @@ def main() -> None:
         str(quest_estimator_path),
         args.quest_model_type,
         args.quest_model_features_type,
+        args.robot_forward_estimator_path,
+        args.robot_forward_decoder,
     )
 
     uvicorn.run(

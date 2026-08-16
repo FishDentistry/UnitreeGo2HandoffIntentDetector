@@ -1,12 +1,59 @@
-import asyncio
+"""
+Robot ground-truth + Quest image alignment server.
+
+Place this file at:
+
+    UnitreeGo2HandoffIntentDetector/
+        robot_pose_prediction/
+            data_collection_server.py
+
+Then run it from the repository root with:
+
+    python -m robot_pose_prediction.data_collection_server
+
+Optional:
+
+    python -m robot_pose_prediction.data_collection_server \
+        --host 0.0.0.0 \
+        --port 8000
+
+What this server does
+---------------------
+1. Receives small robot ground-truth batches at /robot_ground_truth.
+2. Keeps the robot data exactly in the coordinate convention sent by the robot.
+3. Accumulates and saves robot-only recordings.
+4. Receives Quest motion-history windows, optionally including JPEG images.
+5. Normalizes Quest timestamps into the robot timestamp clock domain.
+6. Buffers Quest windows until robot GT covers the complete required time range.
+7. Interpolates robot position + 3-D heading to:
+       - every Quest observation timestamp
+       - every Quest image capture timestamp
+8. Saves aligned .npz metadata and JPEG files.
+
+What it deliberately does NOT do
+--------------------------------
+- ROS -> Unity coordinate conversion
+- Quest <-> robot spatial-frame conversion
+- ArUco/shared-marker calibration
+- FoV logic
+- model inference
+
+Temporal alignment still requires the robot and Quest timestamps to be
+meaningfully related. If the Quest uses monotonic/realtime timestamps, the
+server estimates a Quest->Unix offset using sent_at_unix_seconds.
+"""
+
+from __future__ import annotations
+
+import argparse
 import base64
 import binascii
 import json
 import math
 import os
 import re
-import shutil
 import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -19,8 +66,8 @@ from pydantic import BaseModel, Field
 
 
 app = FastAPI(
-    title="Robot Motion Alignment Server",
-    version="3.2.0",
+    title="Robot Ground Truth + Quest Image Alignment Server",
+    version="1.0.0",
 )
 
 
@@ -28,51 +75,52 @@ app = FastAPI(
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Keep enough robot ground-truth history to cover delayed Quest windows.
-ROBOT_BUFFER_SECONDS = 300.0
+# Robot samples are kept in memory for temporal interpolation. Raw recordings
+# are also saved to disk, so this is only the live alignment buffer.
+ROBOT_BUFFER_SECONDS = 600.0
 
-# This does not prevent saving. It is recorded as a warning/diagnostic if
-# interpolation has to bridge a larger-than-expected robot sampling gap.
-ALIGNMENT_GAP_WARNING_SECONDS = 0.25
+# Backward-compatible sequence boundary for robot senders that do not provide
+# recording_id. A gap larger than this starts a new robot-only recording.
+LEGACY_RECORDING_BREAK_SECONDS = 2.0
 
-# Timestamps above this threshold are treated as Unix/wall-clock seconds.
-# Current Unix timestamps are comfortably above 1e9.
+# Quest clock normalization.
 UNIX_TIMESTAMP_THRESHOLD = 1.0e9
-
-# Number of recent Quest->Unix clock-offset observations retained per source.
 QUEST_OFFSET_HISTORY_SIZE = 100
-
-# Use a low percentile rather than the mean because receive/send latency can
-# only make an arrival-based offset estimate later, not earlier.
 QUEST_OFFSET_PERCENTILE = 10.0
-
-# If a new offset candidate suddenly differs from the current estimate by this
-# much, assume Unity restarted or the clock domain changed and reset the
-# offset estimator for that Quest source.
 QUEST_CLOCK_RESET_THRESHOLD_SECONDS = 5.0
 
-# Sanity check for the raw Quest timestamp span versus
-# time_from_window_start/window_duration_seconds.
+# Loose consistency check between raw sample timestamps and relative window time.
 QUEST_WINDOW_SPAN_ABSOLUTE_TOLERANCE_SECONDS = 0.50
 QUEST_WINDOW_SPAN_RELATIVE_TOLERANCE = 0.10
 
-# Image-payload safety limits.
-# A normal 1280px Quest JPEG should be far below this per-frame limit.
+# Image payload safety.
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGES_PER_WINDOW = 500
 
+# Diagnostic only. Alignment is still saved if the robot stream bridges a
+# larger interval.
+ALIGNMENT_GAP_WARNING_SECONDS = 0.25
+
 
 # ---------------------------------------------------------------------------
-# Data directory
+# Repository/data paths
 # ---------------------------------------------------------------------------
 
 def find_project_root() -> Path:
     """
-    Find the UnitreeGo2HandoffIntentDetector project directory.
-    """
-    script_dir = Path(__file__).resolve().parent
+    Find the repository root.
 
-    for parent in [script_dir, *script_dir.parents]:
+    When installed at robot_pose_prediction/data_collection_server.py this
+    resolves directly from the module location, so launching from the repo root
+    with `python -m ...` does not depend on the current working directory.
+    """
+    module_path = Path(__file__).resolve()
+    module_dir = module_path.parent
+
+    if module_dir.name == "robot_pose_prediction":
+        return module_dir.parent
+
+    for parent in [module_dir, *module_dir.parents]:
         if parent.name == "UnitreeGo2HandoffIntentDetector":
             return parent
 
@@ -80,31 +128,27 @@ def find_project_root() -> Path:
         if candidate.is_dir():
             return candidate
 
-    return Path.cwd() / "UnitreeGo2HandoffIntentDetector"
+    return Path.cwd()
 
 
 PROJECT_ROOT = find_project_root()
 
-DATA_DIR = (
-    PROJECT_ROOT
-    / "robot_pose_prediction"
-    / "data"
-)
+DATA_DIR = PROJECT_ROOT / "robot_pose_prediction" / "data"
 
-DATA_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+ROBOT_RECORDING_DIR = DATA_DIR / "robot_ground_truth"
+ALIGNED_WINDOW_DIR = DATA_DIR / "quest_aligned"
+IMAGE_DATA_DIR = DATA_DIR / "images"
 
-IMAGE_DATA_DIR = (
-    DATA_DIR
-    / "images"
-)
-
-IMAGE_DATA_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+for directory in (
+    DATA_DIR,
+    ROBOT_RECORDING_DIR,
+    ALIGNED_WINDOW_DIR,
+    IMAGE_DATA_DIR,
+):
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -125,119 +169,88 @@ class QuaternionValue(BaseModel):
     w: float
 
 
-class RobotMotionSample(BaseModel):
-    """
-    Quest-estimated robot motion sample.
-
-    `timestamp` may be either:
-      1. Unix seconds, or
-      2. Unity/Quest monotonic elapsed seconds.
-
-    If it is monotonic elapsed time, this server automatically rebases it
-    into Unix time before aligning against robot ground truth.
-
-    `time_from_window_start` remains the relative time within the motion
-    window and is never rebased.
-
-    Image fields are backward compatible:
-      - motion-only senders may omit them;
-      - image-enabled senders use `image_frame_id` to reference one entry
-        in the top-level `images` array.
-    """
-    timestamp: float
-    time_from_window_start: float
-
-    position: Vector3
-    heading: Vector3
-
-    has_image: bool = False
-    image_frame_id: int = -1
-
-
-class RobotMotionImage(BaseModel):
-    """One unique JPEG frame referenced by one or more motion samples."""
-    frame_id: int = Field(ge=0)
-
-    mime_type: str = "image/jpeg"
-
-    image_width: int = Field(gt=0)
-    image_height: int = Field(gt=0)
-
-    capture_timestamp_unix: float
-    capture_realtime_seconds: float
-
-    # Quest-world camera pose captured with this RGB frame. Optional only
-    # so older image-enabled clients remain accepted.
-    camera_position: Optional[Vector3] = None
-    camera_rotation: Optional[QuaternionValue] = None
-
-    jpeg_base64: str
-
-
-class RobotMotionHistoryWindow(BaseModel):
-    schema_version: str
-
-    window_id: str
-    source_id: str
-
-    # Optional identifier for the robot ground-truth stream to align against.
-    # Existing Unity payloads do not need to send this field if the robot
-    # ground-truth sender uses the default "unitree_go2".
-    robot_source_id: str = "unitree_go2"
-
-    # If Unity already sends a real Unix timestamp here, it is preferred as
-    # the clock-offset reference because it avoids network receive latency.
-    # If it does not look like Unix time, the server's receive time is used.
-    sent_at_unix_seconds: float
-
-    window_duration_seconds: float
-    sample_count: int = Field(ge=1)
-
-    # Backward-compatible image metadata. Motion-only payloads may omit all
-    # three fields and will therefore behave exactly as before.
-    includes_images: bool = False
-    image_count: int = Field(default=0, ge=0)
-
-    samples: List[RobotMotionSample]
-    images: List[RobotMotionImage] = Field(
-        default_factory=list
-    )
-
-
 class RobotGroundTruthSample(BaseModel):
-    """
-    Ground-truth robot pose sample.
-
-    timestamp must be Unix/wall-clock seconds in the same clock domain as
-    the server-rebased Quest timestamps.
-
-    heading should be the robot/camera forward vector in the ground-truth
-    world frame.
-    """
     timestamp: float
     position: Vector3
     heading: Vector3
 
 
 class RobotGroundTruthBatch(BaseModel):
+    """
+    Small batch from the robot sender.
+
+    recording_id is optional so the existing sender remains accepted unchanged.
+    """
     schema_version: str = "1.0"
     source_id: str = "unitree_go2"
+    recording_id: Optional[str] = None
     sample_count: int = Field(ge=1)
     samples: List[RobotGroundTruthSample]
 
 
+class QuestRobotObservation(BaseModel):
+    """
+    Quest-side observation of the robot.
+
+    timestamp may be Unix time or Quest/Unity realtime/monotonic seconds.
+    """
+    timestamp: float
+    time_from_window_start: float
+    position: Vector3
+    heading: Vector3
+    has_image: bool = False
+    image_frame_id: int = -1
+
+
+class QuestImage(BaseModel):
+    """
+    One JPEG captured by the Quest.
+
+    capture_timestamp_unix is preferred for image-to-robot alignment.
+    capture_realtime_seconds is retained as a fallback if the Unix field is not
+    valid.
+    """
+    frame_id: int = Field(ge=0)
+    mime_type: str = "image/jpeg"
+    image_width: int = Field(gt=0)
+    image_height: int = Field(gt=0)
+    capture_timestamp_unix: float
+    capture_realtime_seconds: float
+    camera_position: Optional[Vector3] = None
+    camera_rotation: Optional[QuaternionValue] = None
+    jpeg_base64: str
+
+
+class QuestMotionHistoryWindow(BaseModel):
+    schema_version: str = "1.0"
+    window_id: str
+    source_id: str
+
+    # Which robot GT source to align against.
+    robot_source_id: str = "unitree_go2"
+
+    # Prefer a true Unix timestamp generated on the Quest at send time.
+    sent_at_unix_seconds: float
+
+    window_duration_seconds: float
+    sample_count: int = Field(ge=1)
+
+    includes_images: bool = False
+    image_count: int = Field(default=0, ge=0)
+
+    samples: List[QuestRobotObservation]
+    images: List[QuestImage] = Field(
+        default_factory=list
+    )
+
+
 # ---------------------------------------------------------------------------
-# Internal Quest-window representation
+# Internal state
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PreparedQuestWindow:
-    """
-    Quest window after timestamp normalization.
-
-    The Pydantic `window` retains the original payload unchanged.
-    """
-    window: RobotMotionHistoryWindow
+    window: QuestMotionHistoryWindow
 
     original_timestamps: np.ndarray
     aligned_timestamps: np.ndarray
@@ -247,24 +260,29 @@ class PreparedQuestWindow:
     clock_offset_candidate_seconds: float
     clock_offset_reference: str
 
+    # One alignment timestamp per image, in the same clock domain as robot GT.
+    image_alignment_timestamps: np.ndarray
 
-# ---------------------------------------------------------------------------
-# In-memory state
-# ---------------------------------------------------------------------------
 
-# Ground-truth samples are buffered independently for each robot source.
+@dataclass
+class LegacyRobotRecordingState:
+    recording_id: str
+    last_timestamp: float
+
+
+# Live robot samples, by source.
 robot_ground_truth_buffers: Dict[
     str,
     List[RobotGroundTruthSample],
 ] = defaultdict(list)
 
-# Quest windows that arrived before sufficient robot ground-truth coverage.
+# Quest windows waiting for robot coverage.
 pending_quest_windows: Dict[
     Tuple[str, str],
     PreparedQuestWindow,
 ] = {}
 
-# Recent Quest monotonic->Unix offset candidates, per Quest source.
+# Quest monotonic -> Unix clock-offset estimator.
 quest_clock_offset_candidates: Dict[
     str,
     Deque[float],
@@ -284,21 +302,16 @@ quest_clock_last_raw_timestamp: Dict[
     float,
 ] = {}
 
-quest_clock_last_candidate: Dict[
+legacy_robot_recordings: Dict[
     str,
-    float,
+    LegacyRobotRecordingState,
 ] = {}
 
-quest_clock_last_reference: Dict[
-    str,
-    str,
-] = {}
-
-state_lock = asyncio.Lock()
+state_lock = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
-# General helpers
+# Generic helpers
 # ---------------------------------------------------------------------------
 
 def sanitize_filename_component(
@@ -313,56 +326,6 @@ def sanitize_filename_component(
     return value.strip("._") or "unknown"
 
 
-def get_window_file_path(
-    source_id: str,
-    window_id: str,
-) -> Path:
-    safe_source_id = sanitize_filename_component(
-        source_id
-    )
-
-    safe_window_id = sanitize_filename_component(
-        window_id
-    )
-
-    filename = (
-        f"{safe_source_id}__"
-        f"{safe_window_id}.npz"
-    )
-
-    return DATA_DIR / filename
-
-
-def get_window_image_directory(
-    source_id: str,
-    window_id: str,
-) -> Path:
-    """
-    Directory containing JPEGs and a manifest for one Quest motion window.
-
-    Layout:
-        data/
-          images/
-            <source_id>/
-              <window_id>/
-                frame_<frame_id>.jpg
-                manifest.json
-    """
-    safe_source_id = sanitize_filename_component(
-        source_id
-    )
-
-    safe_window_id = sanitize_filename_component(
-        window_id
-    )
-
-    return (
-        IMAGE_DATA_DIR
-        / safe_source_id
-        / safe_window_id
-    )
-
-
 def vector3_list_to_array(
     vectors: List[Vector3],
 ) -> np.ndarray:
@@ -375,178 +338,6 @@ def vector3_list_to_array(
     )
 
 
-def normalize_horizontal_headings(
-    headings: np.ndarray,
-) -> np.ndarray:
-    """
-    Normalize X/Z heading components.
-
-    Returns:
-        (N, 3), with Y set to zero because the current trajectory/FoV model
-        uses ground-plane heading.
-    """
-    hx = headings[:, 0]
-    hz = headings[:, 2]
-
-    norm = np.sqrt(
-        hx * hx + hz * hz
-    )
-
-    if np.any(norm < 1e-8):
-        raise ValueError(
-            "At least one heading has near-zero "
-            "horizontal magnitude."
-        )
-
-    result = np.zeros_like(
-        headings,
-        dtype=np.float64,
-    )
-
-    result[:, 0] = hx / norm
-    result[:, 2] = hz / norm
-
-    return result
-
-
-def heading_vectors_to_unwrapped_yaw(
-    headings: np.ndarray,
-) -> np.ndarray:
-    """
-    Unity-style convention:
-
-        +X = right
-        +Y = up
-        +Z = forward
-
-    yaw = atan2(heading_x, heading_z)
-    """
-    normalized = normalize_horizontal_headings(
-        headings
-    )
-
-    yaw = np.arctan2(
-        normalized[:, 0],
-        normalized[:, 2],
-    )
-
-    return np.unwrap(yaw)
-
-
-def yaw_to_heading_vectors(
-    yaw: np.ndarray,
-) -> np.ndarray:
-    headings = np.zeros(
-        (len(yaw), 3),
-        dtype=np.float64,
-    )
-
-    headings[:, 0] = np.sin(yaw)
-    headings[:, 2] = np.cos(yaw)
-
-    return headings
-
-
-def nearest_timestamp_errors(
-    query_times: np.ndarray,
-    source_times: np.ndarray,
-) -> np.ndarray:
-    """
-    For each query timestamp, compute the absolute distance to the nearest
-    raw robot ground-truth timestamp.
-    """
-    insertion_indices = np.searchsorted(
-        source_times,
-        query_times,
-        side="left",
-    )
-
-    errors = np.empty(
-        len(query_times),
-        dtype=np.float64,
-    )
-
-    for i, insertion_index in enumerate(
-        insertion_indices
-    ):
-        candidates = []
-
-        if insertion_index < len(source_times):
-            candidates.append(
-                abs(
-                    source_times[insertion_index]
-                    - query_times[i]
-                )
-            )
-
-        if insertion_index > 0:
-            candidates.append(
-                abs(
-                    source_times[insertion_index - 1]
-                    - query_times[i]
-                )
-            )
-
-        errors[i] = min(candidates)
-
-    return errors
-
-
-def interpolation_bracket_gaps(
-    query_times: np.ndarray,
-    source_times: np.ndarray,
-) -> np.ndarray:
-    """
-    For each query timestamp, return the time gap between the two robot
-    samples that bracket it.
-
-    Exact timestamp matches receive a gap of 0.
-    """
-    insertion_indices = np.searchsorted(
-        source_times,
-        query_times,
-        side="left",
-    )
-
-    gaps = np.zeros(
-        len(query_times),
-        dtype=np.float64,
-    )
-
-    for i, insertion_index in enumerate(
-        insertion_indices
-    ):
-        if (
-            insertion_index < len(source_times)
-            and math.isclose(
-                source_times[insertion_index],
-                query_times[i],
-                rel_tol=0.0,
-                abs_tol=1e-9,
-            )
-        ):
-            gaps[i] = 0.0
-            continue
-
-        if (
-            insertion_index == 0
-            or insertion_index >= len(source_times)
-        ):
-            gaps[i] = np.inf
-            continue
-
-        gaps[i] = (
-            source_times[insertion_index]
-            - source_times[insertion_index - 1]
-        )
-
-    return gaps
-
-
-# ---------------------------------------------------------------------------
-# Quest clock normalization
-# ---------------------------------------------------------------------------
-
 def looks_like_unix_timestamp(
     timestamp: float,
 ) -> bool:
@@ -556,14 +347,524 @@ def looks_like_unix_timestamp(
     )
 
 
+def normalize_direction_rows(
+    directions: np.ndarray,
+) -> np.ndarray:
+    """
+    Normalize arbitrary 3-D direction vectors.
+
+    This is intentionally coordinate-system agnostic. It does not assume that
+    X/Z or X/Y is the horizontal plane.
+    """
+    directions = np.asarray(
+        directions,
+        dtype=np.float64,
+    )
+
+    norms = np.linalg.norm(
+        directions,
+        axis=1,
+    )
+
+    if np.any(norms < 1.0e-8):
+        raise ValueError(
+            "At least one heading vector has near-zero magnitude."
+        )
+
+    return directions / norms[:, None]
+
+
+def get_aligned_window_path(
+    source_id: str,
+    window_id: str,
+) -> Path:
+    return (
+        ALIGNED_WINDOW_DIR
+        / (
+            f"{sanitize_filename_component(source_id)}__"
+            f"{sanitize_filename_component(window_id)}.npz"
+        )
+    )
+
+
+def get_window_image_directory(
+    source_id: str,
+    window_id: str,
+) -> Path:
+    return (
+        IMAGE_DATA_DIR
+        / sanitize_filename_component(source_id)
+        / sanitize_filename_component(window_id)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Robot GT validation, buffering, and persistence
+# ---------------------------------------------------------------------------
+
+def validate_robot_batch(
+    batch: RobotGroundTruthBatch,
+) -> None:
+    if batch.sample_count != len(batch.samples):
+        raise ValueError(
+            "sample_count does not match the number of robot "
+            "ground-truth samples in the payload."
+        )
+
+    if not batch.samples:
+        raise ValueError(
+            "Robot ground-truth batch has no samples."
+        )
+
+    timestamps = np.asarray(
+        [
+            sample.timestamp
+            for sample in batch.samples
+        ],
+        dtype=np.float64,
+    )
+
+    positions = vector3_list_to_array(
+        [
+            sample.position
+            for sample in batch.samples
+        ]
+    )
+
+    headings = vector3_list_to_array(
+        [
+            sample.heading
+            for sample in batch.samples
+        ]
+    )
+
+    if not np.all(np.isfinite(timestamps)):
+        raise ValueError(
+            "Robot ground-truth timestamps contain non-finite values."
+        )
+
+    if not np.all(np.isfinite(positions)):
+        raise ValueError(
+            "Robot ground-truth positions contain non-finite values."
+        )
+
+    if not np.all(np.isfinite(headings)):
+        raise ValueError(
+            "Robot ground-truth headings contain non-finite values."
+        )
+
+    # Validate only magnitude; do not change the sender's coordinate convention.
+    normalize_direction_rows(
+        headings
+    )
+
+
+def sort_and_deduplicate_robot_buffer(
+    source_id: str,
+) -> None:
+    samples = robot_ground_truth_buffers[
+        source_id
+    ]
+
+    if not samples:
+        return
+
+    # Newer received duplicate wins.
+    by_timestamp: Dict[
+        float,
+        RobotGroundTruthSample,
+    ] = {}
+
+    for sample in samples:
+        by_timestamp[
+            float(sample.timestamp)
+        ] = sample
+
+    robot_ground_truth_buffers[
+        source_id
+    ] = [
+        by_timestamp[timestamp]
+        for timestamp in sorted(
+            by_timestamp.keys()
+        )
+    ]
+
+
+def prune_robot_buffer(
+    source_id: str,
+) -> None:
+    samples = robot_ground_truth_buffers[
+        source_id
+    ]
+
+    if not samples:
+        return
+
+    newest = float(
+        samples[-1].timestamp
+    )
+
+    cutoff = (
+        newest
+        - ROBOT_BUFFER_SECONDS
+    )
+
+    # Keep anything still needed by a pending Quest window for this robot.
+    needed_starts = []
+
+    for prepared in pending_quest_windows.values():
+        if prepared.window.robot_source_id != source_id:
+            continue
+
+        required_times = get_required_alignment_times(
+            prepared
+        )
+
+        if len(required_times):
+            needed_starts.append(
+                float(
+                    required_times.min()
+                )
+            )
+
+    if needed_starts:
+        cutoff = min(
+            cutoff,
+            min(needed_starts) - 1.0,
+        )
+
+    first_keep = 0
+
+    while (
+        first_keep < len(samples)
+        and float(samples[first_keep].timestamp) < cutoff
+    ):
+        first_keep += 1
+
+    if first_keep > 0:
+        robot_ground_truth_buffers[
+            source_id
+        ] = samples[first_keep:]
+
+
+def resolve_robot_recording_id(
+    batch: RobotGroundTruthBatch,
+) -> str:
+    if (
+        batch.recording_id is not None
+        and batch.recording_id.strip()
+    ):
+        return batch.recording_id.strip()
+
+    first_timestamp = float(
+        min(
+            sample.timestamp
+            for sample in batch.samples
+        )
+    )
+
+    last_timestamp = float(
+        max(
+            sample.timestamp
+            for sample in batch.samples
+        )
+    )
+
+    current = legacy_robot_recordings.get(
+        batch.source_id
+    )
+
+    new_recording = (
+        current is None
+        or (
+            first_timestamp
+            - current.last_timestamp
+            > LEGACY_RECORDING_BREAK_SECONDS
+        )
+        or (
+            first_timestamp
+            < current.last_timestamp
+            - LEGACY_RECORDING_BREAK_SECONDS
+        )
+    )
+
+    if new_recording:
+        recording_id = (
+            "robot_gt_"
+            + str(
+                int(
+                    round(
+                        first_timestamp
+                        * 1_000_000.0
+                    )
+                )
+            )
+        )
+
+        legacy_robot_recordings[
+            batch.source_id
+        ] = LegacyRobotRecordingState(
+            recording_id=recording_id,
+            last_timestamp=last_timestamp,
+        )
+
+        return recording_id
+
+    current.last_timestamp = max(
+        current.last_timestamp,
+        last_timestamp,
+    )
+
+    return current.recording_id
+
+
+def get_robot_recording_path(
+    source_id: str,
+    recording_id: str,
+) -> Path:
+    return (
+        ROBOT_RECORDING_DIR
+        / (
+            f"{sanitize_filename_component(source_id)}__"
+            f"{sanitize_filename_component(recording_id)}.npz"
+        )
+    )
+
+
+def merge_robot_recording_arrays(
+    old_timestamps: np.ndarray,
+    old_positions: np.ndarray,
+    old_headings: np.ndarray,
+    new_timestamps: np.ndarray,
+    new_positions: np.ndarray,
+    new_headings: np.ndarray,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    timestamps = np.concatenate(
+        [old_timestamps, new_timestamps],
+        axis=0,
+    )
+
+    positions = np.concatenate(
+        [old_positions, new_positions],
+        axis=0,
+    )
+
+    headings = np.concatenate(
+        [old_headings, new_headings],
+        axis=0,
+    )
+
+    order = np.argsort(
+        timestamps,
+        kind="stable",
+    )
+
+    timestamps = timestamps[order]
+    positions = positions[order]
+    headings = headings[order]
+
+    # Keep final occurrence of duplicate timestamp.
+    rev_times = timestamps[::-1]
+
+    _, rev_unique = np.unique(
+        rev_times,
+        return_index=True,
+    )
+
+    keep = (
+        len(timestamps)
+        - 1
+        - rev_unique
+    )
+
+    keep.sort()
+
+    return (
+        timestamps[keep],
+        positions[keep],
+        headings[keep],
+    )
+
+
+def save_robot_recording_batch(
+    batch: RobotGroundTruthBatch,
+    recording_id: str,
+) -> Tuple[Path, int]:
+    """
+    Append this HTTP batch to a robot-only .npz recording.
+
+    The values are saved exactly as sent. No coordinate conversion occurs.
+    """
+    path = get_robot_recording_path(
+        batch.source_id,
+        recording_id,
+    )
+
+    new_timestamps = np.asarray(
+        [
+            sample.timestamp
+            for sample in batch.samples
+        ],
+        dtype=np.float64,
+    )
+
+    new_positions = vector3_list_to_array(
+        [
+            sample.position
+            for sample in batch.samples
+        ]
+    )
+
+    # Persist the robot heading exactly as received. Normalization is applied
+    # only when headings are used for temporal interpolation.
+    new_headings = vector3_list_to_array(
+        [
+            sample.heading
+            for sample in batch.samples
+        ]
+    )
+
+    if path.exists():
+        with np.load(
+            path,
+            allow_pickle=False,
+        ) as existing:
+            old_timestamps = np.asarray(
+                existing["robot_timestamps"],
+                dtype=np.float64,
+            )
+
+            old_positions = np.asarray(
+                existing["robot_positions"],
+                dtype=np.float64,
+            )
+
+            old_headings = np.asarray(
+                existing["robot_headings"],
+                dtype=np.float64,
+            )
+    else:
+        old_timestamps = np.empty(
+            (0,),
+            dtype=np.float64,
+        )
+
+        old_positions = np.empty(
+            (0, 3),
+            dtype=np.float64,
+        )
+
+        old_headings = np.empty(
+            (0, 3),
+            dtype=np.float64,
+        )
+
+    (
+        timestamps,
+        positions,
+        headings,
+    ) = merge_robot_recording_arrays(
+        old_timestamps,
+        old_positions,
+        old_headings,
+        new_timestamps,
+        new_positions,
+        new_headings,
+    )
+
+    relative_time = (
+        timestamps
+        - timestamps[0]
+    )
+
+    temp_path = path.with_name(
+        path.name + ".tmp"
+    )
+
+    try:
+        with temp_path.open(
+            "wb"
+        ) as file:
+            np.savez_compressed(
+                file,
+                schema_version=np.asarray(
+                    batch.schema_version
+                ),
+                source_id=np.asarray(
+                    batch.source_id
+                ),
+                recording_id=np.asarray(
+                    recording_id
+                ),
+                sample_count=np.asarray(
+                    len(timestamps),
+                    dtype=np.int64,
+                ),
+                duration_seconds=np.asarray(
+                    float(relative_time[-1])
+                    if len(relative_time)
+                    else 0.0,
+                    dtype=np.float64,
+                ),
+                robot_timestamps=(
+                    timestamps.astype(
+                        np.float64
+                    )
+                ),
+                robot_time_from_window_start=(
+                    relative_time.astype(
+                        np.float64
+                    )
+                ),
+                robot_positions=(
+                    positions.astype(
+                        np.float32
+                    )
+                ),
+                robot_headings=(
+                    headings.astype(
+                        np.float32
+                    )
+                ),
+            )
+
+        os.replace(
+            temp_path,
+            path,
+        )
+
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+
+        raise
+
+    return (
+        path,
+        len(timestamps),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quest clock normalization
+# ---------------------------------------------------------------------------
+
 def validate_quest_window_timing(
-    window: RobotMotionHistoryWindow,
+    window: QuestMotionHistoryWindow,
     raw_timestamps: np.ndarray,
 ) -> None:
+    if window.sample_count != len(window.samples):
+        raise ValueError(
+            "sample_count does not match the number of Quest samples."
+        )
+
     if len(raw_timestamps) < 2:
         raise ValueError(
-            "Quest motion window must contain at "
-            "least two samples."
+            "Quest motion window must contain at least two samples."
         )
 
     if not np.all(
@@ -577,8 +878,7 @@ def validate_quest_window_timing(
         np.diff(raw_timestamps) <= 0.0
     ):
         raise ValueError(
-            "Quest motion-window timestamps must be "
-            "strictly increasing."
+            "Quest sample timestamps must be strictly increasing."
         )
 
     relative_times = np.asarray(
@@ -593,16 +893,14 @@ def validate_quest_window_timing(
         np.isfinite(relative_times)
     ):
         raise ValueError(
-            "Quest time_from_window_start contains "
-            "non-finite values."
+            "Quest time_from_window_start contains non-finite values."
         )
 
     if np.any(
         np.diff(relative_times) <= 0.0
     ):
         raise ValueError(
-            "Quest time_from_window_start values must "
-            "be strictly increasing."
+            "Quest time_from_window_start values must be strictly increasing."
         )
 
     raw_span = float(
@@ -629,16 +927,13 @@ def validate_quest_window_timing(
         ),
     )
 
-    if (
-        abs(
-            raw_span
-            - relative_span
-        )
-        > tolerance
-    ):
+    if abs(
+        raw_span
+        - relative_span
+    ) > tolerance:
         raise ValueError(
-            "Quest raw timestamp span does not agree "
-            "with time_from_window_start. "
+            "Quest raw timestamp span does not agree with "
+            "time_from_window_start. "
             f"raw_span={raw_span:.3f}s, "
             f"relative_span={relative_span:.3f}s, "
             f"tolerance={tolerance:.3f}s."
@@ -649,12 +944,11 @@ def validate_quest_window_timing(
         and abs(
             expected_duration
             - relative_span
-        )
-        > tolerance
+        ) > tolerance
     ):
         raise ValueError(
-            "Quest window_duration_seconds does not "
-            "agree with time_from_window_start. "
+            "Quest window_duration_seconds does not agree with "
+            "time_from_window_start. "
             f"reported={expected_duration:.3f}s, "
             f"relative_span={relative_span:.3f}s, "
             f"tolerance={tolerance:.3f}s."
@@ -673,22 +967,14 @@ def reset_quest_clock_estimator(
         None,
     )
 
-    quest_clock_last_candidate.pop(
-        source_id,
-        None,
-    )
-
-    quest_clock_last_reference.pop(
-        source_id,
-        None,
-    )
-
 
 def current_quest_offset_estimate(
     source_id: str,
 ) -> Optional[float]:
-    candidates = quest_clock_offset_candidates.get(
-        source_id
+    candidates = (
+        quest_clock_offset_candidates.get(
+            source_id
+        )
     )
 
     if not candidates:
@@ -713,68 +999,92 @@ def current_quest_offset_estimate(
     return estimate
 
 
-def rebase_pending_windows_for_quest_source(
-    source_id: str,
-) -> None:
+def resolve_image_alignment_timestamps(
+    window: QuestMotionHistoryWindow,
+    aligned_sample_timestamps: np.ndarray,
+    clock_offset_seconds: float,
+) -> np.ndarray:
     """
-    If the learned clock offset changes slightly as more Quest windows arrive,
-    update pending windows from the same Quest source to the newest estimate.
+    Resolve one robot-clock-domain timestamp for every image.
+
+    Priority:
+      1. image.capture_timestamp_unix, if it looks like Unix time.
+      2. image.capture_realtime_seconds + Quest clock offset.
+      3. aligned timestamp of the first Quest sample referencing that frame.
     """
-    estimate = quest_clock_offset_estimates.get(
-        source_id
-    )
+    first_reference_by_frame: Dict[
+        int,
+        float,
+    ] = {}
 
-    if estimate is None:
-        return
-
-    for prepared in (
-        pending_quest_windows.values()
+    for sample_index, sample in enumerate(
+        window.samples
     ):
         if (
-            prepared.window.source_id
-            != source_id
+            sample.has_image
+            and sample.image_frame_id >= 0
+            and sample.image_frame_id
+            not in first_reference_by_frame
         ):
-            continue
+            first_reference_by_frame[
+                int(sample.image_frame_id)
+            ] = float(
+                aligned_sample_timestamps[
+                    sample_index
+                ]
+            )
 
-        if (
-            prepared.timestamp_mode
-            != "rebased_monotonic"
-        ):
-            continue
+    resolved = []
 
-        prepared.clock_offset_seconds = (
-            estimate
+    for image in window.images:
+        capture_unix = float(
+            image.capture_timestamp_unix
         )
 
-        prepared.aligned_timestamps = (
-            prepared.original_timestamps
-            + estimate
+        capture_realtime = float(
+            image.capture_realtime_seconds
         )
+
+        if looks_like_unix_timestamp(
+            capture_unix
+        ):
+            timestamp = capture_unix
+
+        elif math.isfinite(
+            capture_realtime
+        ):
+            timestamp = (
+                capture_realtime
+                + clock_offset_seconds
+            )
+
+        elif image.frame_id in first_reference_by_frame:
+            timestamp = (
+                first_reference_by_frame[
+                    image.frame_id
+                ]
+            )
+
+        else:
+            raise ValueError(
+                "Could not determine an alignment timestamp for "
+                f"Quest image frame {image.frame_id}."
+            )
+
+        resolved.append(
+            timestamp
+        )
+
+    return np.asarray(
+        resolved,
+        dtype=np.float64,
+    )
 
 
 def prepare_quest_window(
-    window: RobotMotionHistoryWindow,
+    window: QuestMotionHistoryWindow,
     server_receive_unix_seconds: float,
 ) -> PreparedQuestWindow:
-    """
-    Convert a Quest window to the Unix clock domain used by robot ground truth.
-
-    If the Quest sample timestamps already look like Unix seconds, they are
-    used directly.
-
-    Otherwise, a persistent offset is learned:
-
-        unix_time ~= unity_monotonic_time + offset
-
-    Preferred offset reference:
-        window.sent_at_unix_seconds
-
-    Fallback:
-        FastAPI server receive time
-
-    The server retains a rolling history of offset candidates and uses a low
-    percentile to reduce positive send/network-latency bias.
-    """
     raw_timestamps = np.asarray(
         [
             sample.timestamp
@@ -788,128 +1098,110 @@ def prepare_quest_window(
         raw_timestamps,
     )
 
-    # Already in Unix time: no rebasing necessary.
+    median_timestamp = float(
+        np.median(
+            raw_timestamps
+        )
+    )
+
     if looks_like_unix_timestamp(
-        float(
-            np.median(
-                raw_timestamps
+        median_timestamp
+    ):
+        aligned_timestamps = (
+            raw_timestamps.copy()
+        )
+
+        timestamp_mode = "unix"
+        offset = 0.0
+        candidate = 0.0
+        reference = "quest_sample_timestamp"
+
+    else:
+        previous_raw_end = (
+            quest_clock_last_raw_timestamp.get(
+                window.source_id
             )
         )
-    ):
-        quest_clock_last_raw_timestamp[
+
+        if (
+            previous_raw_end is not None
+            and raw_timestamps[0]
+            < previous_raw_end - 1.0
+        ):
+            reset_quest_clock_estimator(
+                window.source_id
+            )
+
+        if looks_like_unix_timestamp(
+            float(
+                window.sent_at_unix_seconds
+            )
+        ):
+            unix_reference = float(
+                window.sent_at_unix_seconds
+            )
+
+            reference = (
+                "window.sent_at_unix_seconds"
+            )
+        else:
+            unix_reference = float(
+                server_receive_unix_seconds
+            )
+
+            reference = (
+                "server_receive_unix_seconds"
+            )
+
+        candidate = (
+            unix_reference
+            - float(
+                raw_timestamps[-1]
+            )
+        )
+
+        previous_estimate = (
+            quest_clock_offset_estimates.get(
+                window.source_id
+            )
+        )
+
+        if (
+            previous_estimate is not None
+            and abs(
+                candidate
+                - previous_estimate
+            )
+            > QUEST_CLOCK_RESET_THRESHOLD_SECONDS
+        ):
+            reset_quest_clock_estimator(
+                window.source_id
+            )
+
+        quest_clock_offset_candidates[
             window.source_id
-        ] = float(
-            raw_timestamps[-1]
-        )
-
-        return PreparedQuestWindow(
-            window=window,
-            original_timestamps=(
-                raw_timestamps.copy()
-            ),
-            aligned_timestamps=(
-                raw_timestamps.copy()
-            ),
-            timestamp_mode="unix",
-            clock_offset_seconds=0.0,
-            clock_offset_candidate_seconds=0.0,
-            clock_offset_reference=(
-                "quest_sample_timestamp"
-            ),
-        )
-
-    # Unity/Quest elapsed clock may reset when the application restarts.
-    previous_raw_end = (
-        quest_clock_last_raw_timestamp.get(
-            window.source_id
-        )
-    )
-
-    if (
-        previous_raw_end is not None
-        and raw_timestamps[0]
-        < previous_raw_end - 1.0
-    ):
-        print(
-            "Quest monotonic clock appears to have "
-            f"reset for source '{window.source_id}'. "
-            "Resetting Quest->Unix offset estimator."
-        )
-
-        reset_quest_clock_estimator(
-            window.source_id
-        )
-
-    # Prefer the Unix timestamp generated by the Quest sender itself if it
-    # is valid. That avoids network receive latency.
-    if looks_like_unix_timestamp(
-        float(
-            window.sent_at_unix_seconds
-        )
-    ):
-        unix_reference = float(
-            window.sent_at_unix_seconds
-        )
-
-        reference_name = (
-            "window.sent_at_unix_seconds"
-        )
-    else:
-        unix_reference = float(
-            server_receive_unix_seconds
-        )
-
-        reference_name = (
-            "server_receive_unix_seconds"
-        )
-
-    # The final sample is normally immediately before the window POST.
-    candidate = (
-        unix_reference
-        - float(
-            raw_timestamps[-1]
-        )
-    )
-
-    previous_estimate = (
-        quest_clock_offset_estimates.get(
-            window.source_id
-        )
-    )
-
-    if (
-        previous_estimate is not None
-        and abs(
+        ].append(
             candidate
-            - previous_estimate
-        )
-        > QUEST_CLOCK_RESET_THRESHOLD_SECONDS
-    ):
-        print(
-            "Large Quest clock-offset change detected "
-            f"for source '{window.source_id}': "
-            f"old={previous_estimate:.6f}s, "
-            f"candidate={candidate:.6f}s. "
-            "Resetting offset estimator."
         )
 
-        reset_quest_clock_estimator(
-            window.source_id
+        offset = (
+            current_quest_offset_estimate(
+                window.source_id
+            )
         )
 
-    quest_clock_offset_candidates[
-        window.source_id
-    ].append(
-        candidate
-    )
+        if offset is None:
+            raise ValueError(
+                "Could not estimate Quest->Unix clock offset."
+            )
 
-    estimate = current_quest_offset_estimate(
-        window.source_id
-    )
+        aligned_timestamps = (
+            raw_timestamps
+            + offset
+        )
 
-    if estimate is None:
-        raise ValueError(
-            "Could not estimate Quest->Unix clock offset."
+        timestamp_mode = (
+            "rebased_monotonic"
         )
 
     quest_clock_last_raw_timestamp[
@@ -918,23 +1210,14 @@ def prepare_quest_window(
         raw_timestamps[-1]
     )
 
-    quest_clock_last_candidate[
-        window.source_id
-    ] = candidate
-
-    quest_clock_last_reference[
-        window.source_id
-    ] = reference_name
-
-    # Keep pending windows from this same Unity clock on the newest
-    # persistent estimate.
-    rebase_pending_windows_for_quest_source(
-        window.source_id
-    )
-
-    aligned_timestamps = (
-        raw_timestamps
-        + estimate
+    image_alignment_timestamps = (
+        resolve_image_alignment_timestamps(
+            window=window,
+            aligned_sample_timestamps=(
+                aligned_timestamps
+            ),
+            clock_offset_seconds=offset,
+        )
     )
 
     return PreparedQuestWindow(
@@ -945,235 +1228,526 @@ def prepare_quest_window(
         aligned_timestamps=(
             aligned_timestamps
         ),
-        timestamp_mode=(
-            "rebased_monotonic"
+        timestamp_mode=timestamp_mode,
+        clock_offset_seconds=float(
+            offset
         ),
-        clock_offset_seconds=(
-            estimate
-        ),
-        clock_offset_candidate_seconds=(
+        clock_offset_candidate_seconds=float(
             candidate
         ),
-        clock_offset_reference=(
-            reference_name
+        clock_offset_reference=reference,
+        image_alignment_timestamps=(
+            image_alignment_timestamps
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Ground-truth buffer helpers
+# Image validation/storage
 # ---------------------------------------------------------------------------
 
-def sort_and_deduplicate_ground_truth(
-    source_id: str,
-) -> None:
-    """
-    Sort by timestamp and keep the most recently received sample if duplicate
-    timestamps occur.
-    """
-    samples = robot_ground_truth_buffers[
-        source_id
-    ]
-
-    if not samples:
-        return
-
-    by_timestamp = {}
-
-    for sample in samples:
-        by_timestamp[
-            float(sample.timestamp)
-        ] = sample
-
-    sorted_times = sorted(
-        by_timestamp.keys()
-    )
-
-    robot_ground_truth_buffers[
-        source_id
-    ] = [
-        by_timestamp[timestamp]
-        for timestamp in sorted_times
-    ]
-
-
-def prune_ground_truth_buffer(
-    source_id: str,
-) -> None:
-    samples = robot_ground_truth_buffers[
-        source_id
-    ]
-
-    if not samples:
-        return
-
-    newest_timestamp = samples[-1].timestamp
-
-    cutoff = (
-        newest_timestamp
-        - ROBOT_BUFFER_SECONDS
-    )
-
-    # Do not prune robot data that a VALID rebased pending Quest window may
-    # still need.
-    pending_start_times = []
-
-    for prepared in (
-        pending_quest_windows.values()
+def validate_and_decode_images(
+    window: QuestMotionHistoryWindow,
+) -> Dict[int, bytes]:
+    if window.image_count != len(
+        window.images
     ):
-        if (
-            prepared.window.robot_source_id
-            == source_id
-            and len(
-                prepared.aligned_timestamps
-            ) > 0
-        ):
-            pending_start_times.append(
-                float(
-                    prepared.aligned_timestamps[0]
-                )
+        raise ValueError(
+            "image_count does not match the number of images."
+        )
+
+    if len(window.images) > MAX_IMAGES_PER_WINDOW:
+        raise ValueError(
+            "Motion window contains too many images: "
+            f"{len(window.images)} > {MAX_IMAGES_PER_WINDOW}."
+        )
+
+    if (
+        window.includes_images
+        and not window.images
+    ):
+        raise ValueError(
+            "includes_images is true but no images were supplied."
+        )
+
+    decoded: Dict[
+        int,
+        bytes,
+    ] = {}
+
+    for image in window.images:
+        frame_id = int(
+            image.frame_id
+        )
+
+        if frame_id in decoded:
+            raise ValueError(
+                f"Duplicate image frame_id {frame_id}."
             )
 
-    if pending_start_times:
-        earliest_needed = (
-            min(pending_start_times)
-            - 1.0
-        )
+        if image.mime_type.lower() not in {
+            "image/jpeg",
+            "image/jpg",
+        }:
+            raise ValueError(
+                f"Unsupported image MIME type {image.mime_type!r}; "
+                "only JPEG is accepted."
+            )
 
-        cutoff = min(
-            cutoff,
-            earliest_needed,
-        )
+        if (
+            image.camera_position is None
+        ) != (
+            image.camera_rotation is None
+        ):
+            raise ValueError(
+                f"Image frame {frame_id} must provide both camera_position "
+                "and camera_rotation, or neither."
+            )
 
-    first_index_to_keep = 0
+        if image.camera_rotation is not None:
+            quaternion = np.asarray(
+                [
+                    image.camera_rotation.x,
+                    image.camera_rotation.y,
+                    image.camera_rotation.z,
+                    image.camera_rotation.w,
+                ],
+                dtype=np.float64,
+            )
 
-    while (
-        first_index_to_keep < len(samples)
-        and samples[
-            first_index_to_keep
-        ].timestamp < cutoff
+            if (
+                not np.all(
+                    np.isfinite(
+                        quaternion
+                    )
+                )
+                or np.linalg.norm(
+                    quaternion
+                ) < 1.0e-8
+            ):
+                raise ValueError(
+                    f"Image frame {frame_id} has an invalid camera quaternion."
+                )
+
+        try:
+            jpeg_bytes = (
+                base64.b64decode(
+                    image.jpeg_base64,
+                    validate=True,
+                )
+            )
+        except (
+            binascii.Error,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                f"Invalid Base64 JPEG for image frame {frame_id}."
+            ) from exc
+
+        if not jpeg_bytes:
+            raise ValueError(
+                f"Decoded JPEG for image frame {frame_id} is empty."
+            )
+
+        if len(
+            jpeg_bytes
+        ) > MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"Image frame {frame_id} exceeds the image-size limit."
+            )
+
+        if not jpeg_bytes.startswith(
+            b"\xff\xd8"
+        ):
+            raise ValueError(
+                f"Image frame {frame_id} does not look like JPEG data."
+            )
+
+        decoded[
+            frame_id
+        ] = jpeg_bytes
+
+    known_frame_ids = set(
+        decoded.keys()
+    )
+
+    referenced_frame_ids = set()
+
+    for index, sample in enumerate(
+        window.samples
     ):
-        first_index_to_keep += 1
+        if not sample.has_image:
+            continue
 
-    if first_index_to_keep > 0:
-        robot_ground_truth_buffers[
-            source_id
-        ] = samples[
-            first_index_to_keep:
-        ]
+        if sample.image_frame_id < 0:
+            raise ValueError(
+                f"Quest sample {index} has_image=true but image_frame_id < 0."
+            )
+
+        if (
+            sample.image_frame_id
+            not in known_frame_ids
+        ):
+            raise ValueError(
+                f"Quest sample {index} references image frame "
+                f"{sample.image_frame_id}, which is absent."
+            )
+
+        referenced_frame_ids.add(
+            int(
+                sample.image_frame_id
+            )
+        )
+
+    unreferenced = (
+        known_frame_ids
+        - referenced_frame_ids
+    )
+
+    if unreferenced:
+        raise ValueError(
+            "Quest payload contains unreferenced image frames: "
+            f"{sorted(unreferenced)}."
+        )
+
+    return decoded
+
+
+def save_window_images(
+    window: QuestMotionHistoryWindow,
+    decoded_images: Dict[int, bytes],
+) -> Optional[Path]:
+    if not decoded_images:
+        return None
+
+    final_directory = (
+        get_window_image_directory(
+            window.source_id,
+            window.window_id,
+        )
+    )
+
+    if final_directory.exists():
+        return final_directory
+
+    final_directory.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp_directory = Path(
+        tempfile.mkdtemp(
+            prefix=".quest_images_",
+            dir=final_directory.parent,
+        )
+    )
+
+    try:
+        manifest_images = []
+
+        for image in window.images:
+            frame_id = int(
+                image.frame_id
+            )
+
+            filename = (
+                f"frame_{frame_id:020d}.jpg"
+            )
+
+            (
+                temp_directory
+                / filename
+            ).write_bytes(
+                decoded_images[
+                    frame_id
+                ]
+            )
+
+            manifest_images.append(
+                {
+                    "frame_id": frame_id,
+                    "file_name": filename,
+                    "mime_type": image.mime_type,
+                    "image_width": int(
+                        image.image_width
+                    ),
+                    "image_height": int(
+                        image.image_height
+                    ),
+                    "capture_timestamp_unix": float(
+                        image.capture_timestamp_unix
+                    ),
+                    "capture_realtime_seconds": float(
+                        image.capture_realtime_seconds
+                    ),
+                }
+            )
+
+        manifest = {
+            "schema_version": (
+                window.schema_version
+            ),
+            "window_id": window.window_id,
+            "source_id": window.source_id,
+            "image_count": len(
+                window.images
+            ),
+            "images": manifest_images,
+        }
+
+        (
+            temp_directory
+            / "manifest.json"
+        ).write_text(
+            json.dumps(
+                manifest,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        os.replace(
+            temp_directory,
+            final_directory,
+        )
+
+    except Exception:
+        # Best-effort cleanup for an incomplete temp directory.
+        for child in (
+            temp_directory.iterdir()
+            if temp_directory.exists()
+            else []
+        ):
+            try:
+                child.unlink()
+            except Exception:
+                pass
+
+        try:
+            temp_directory.rmdir()
+        except Exception:
+            pass
+
+        raise
+
+    return final_directory
 
 
 # ---------------------------------------------------------------------------
-# Alignment
+# Temporal interpolation
 # ---------------------------------------------------------------------------
 
-def has_ground_truth_coverage(
+def get_required_alignment_times(
+    prepared: PreparedQuestWindow,
+) -> np.ndarray:
+    if len(
+        prepared.image_alignment_timestamps
+    ):
+        return np.concatenate(
+            [
+                prepared.aligned_timestamps,
+                prepared.image_alignment_timestamps,
+            ]
+        )
+
+    return (
+        prepared.aligned_timestamps
+    )
+
+
+def has_robot_coverage(
     prepared: PreparedQuestWindow,
 ) -> bool:
-    window = prepared.window
-
-    samples = robot_ground_truth_buffers.get(
-        window.robot_source_id,
-        [],
+    samples = (
+        robot_ground_truth_buffers.get(
+            prepared.window.robot_source_id,
+            [],
+        )
     )
 
     if len(samples) < 2:
         return False
 
-    quest_start = float(
-        prepared.aligned_timestamps[0]
+    required_times = (
+        get_required_alignment_times(
+            prepared
+        )
     )
 
-    quest_end = float(
-        prepared.aligned_timestamps[-1]
-    )
-
-    robot_start = float(
-        samples[0].timestamp
-    )
-
-    robot_end = float(
-        samples[-1].timestamp
-    )
+    if not len(required_times):
+        return False
 
     return (
-        robot_start <= quest_start
-        and robot_end >= quest_end
+        float(samples[0].timestamp)
+        <= float(required_times.min())
+        and float(samples[-1].timestamp)
+        >= float(required_times.max())
     )
 
 
-def align_robot_ground_truth_to_quest(
-    prepared: PreparedQuestWindow,
-) -> dict:
+def nearest_timestamp_errors(
+    query_times: np.ndarray,
+    source_times: np.ndarray,
+) -> np.ndarray:
+    indices = np.searchsorted(
+        source_times,
+        query_times,
+        side="left",
+    )
+
+    errors = np.empty(
+        len(query_times),
+        dtype=np.float64,
+    )
+
+    for i, index in enumerate(indices):
+        candidates = []
+
+        if index < len(source_times):
+            candidates.append(
+                abs(
+                    float(
+                        source_times[index]
+                        - query_times[i]
+                    )
+                )
+            )
+
+        if index > 0:
+            candidates.append(
+                abs(
+                    float(
+                        source_times[index - 1]
+                        - query_times[i]
+                    )
+                )
+            )
+
+        errors[i] = min(
+            candidates
+        )
+
+    return errors
+
+
+def interpolation_bracket_gaps(
+    query_times: np.ndarray,
+    source_times: np.ndarray,
+) -> np.ndarray:
+    indices = np.searchsorted(
+        source_times,
+        query_times,
+        side="left",
+    )
+
+    gaps = np.zeros(
+        len(query_times),
+        dtype=np.float64,
+    )
+
+    for i, index in enumerate(indices):
+        if (
+            index < len(source_times)
+            and math.isclose(
+                float(
+                    source_times[index]
+                ),
+                float(
+                    query_times[i]
+                ),
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            )
+        ):
+            gaps[i] = 0.0
+            continue
+
+        if (
+            index == 0
+            or index >= len(source_times)
+        ):
+            gaps[i] = np.inf
+            continue
+
+        gaps[i] = (
+            source_times[index]
+            - source_times[index - 1]
+        )
+
+    return gaps
+
+
+def interpolate_robot_at_times(
+    robot_source_id: str,
+    query_times: np.ndarray,
+) -> Dict[str, np.ndarray]:
     """
-    Interpolate robot ground-truth pose to every REBASED Quest timestamp.
+    Interpolate raw robot GT at arbitrary timestamps.
 
-    Position is linearly interpolated.
+    Position:
+        component-wise linear interpolation.
 
-    Heading is converted to yaw, unwrapped, linearly interpolated in yaw,
-    then converted back to a normalized X/Z heading vector.
+    Heading:
+        component-wise linear interpolation followed by 3-D normalization.
+
+    The heading operation is intentionally not expressed as yaw, so this server
+    does not assume ROS XY, Unity XZ, or any other particular ground plane.
     """
-    window = prepared.window
-
-    robot_samples = (
+    samples = (
         robot_ground_truth_buffers.get(
-            window.robot_source_id,
+            robot_source_id,
             [],
         )
     )
 
-    if len(robot_samples) < 2:
+    if len(samples) < 2:
         raise ValueError(
-            "Fewer than two robot ground-truth samples "
-            "are available."
+            "Fewer than two robot GT samples are available."
         )
-
-    quest_times = np.asarray(
-        prepared.aligned_timestamps,
-        dtype=np.float64,
-    )
 
     robot_times = np.asarray(
         [
             sample.timestamp
-            for sample in robot_samples
+            for sample in samples
         ],
         dtype=np.float64,
     )
 
+    query_times = np.asarray(
+        query_times,
+        dtype=np.float64,
+    )
+
     if (
-        quest_times.min() < robot_times[0]
-        or quest_times.max() > robot_times[-1]
+        float(query_times.min())
+        < float(robot_times[0])
+        or float(query_times.max())
+        > float(robot_times[-1])
     ):
         raise ValueError(
-            "Robot ground-truth buffer does not cover "
-            "the full rebased Quest window."
+            "Robot GT buffer does not cover the complete requested time range."
         )
 
     robot_positions = vector3_list_to_array(
         [
             sample.position
-            for sample in robot_samples
+            for sample in samples
         ]
     )
 
-    robot_headings = vector3_list_to_array(
-        [
-            sample.heading
-            for sample in robot_samples
-        ]
-    )
-
-    robot_yaw = (
-        heading_vectors_to_unwrapped_yaw(
-            robot_headings
+    robot_headings = normalize_direction_rows(
+        vector3_list_to_array(
+            [
+                sample.heading
+                for sample in samples
+            ]
         )
     )
 
-    aligned_positions = np.column_stack(
+    positions = np.column_stack(
         [
             np.interp(
-                quest_times,
+                query_times,
                 robot_times,
                 robot_positions[:, axis],
             )
@@ -1181,45 +1755,41 @@ def align_robot_ground_truth_to_quest(
         ]
     )
 
-    aligned_yaw = np.interp(
-        quest_times,
-        robot_times,
-        robot_yaw,
+    raw_headings = np.column_stack(
+        [
+            np.interp(
+                query_times,
+                robot_times,
+                robot_headings[:, axis],
+            )
+            for axis in range(3)
+        ]
     )
 
-    aligned_headings = (
-        yaw_to_heading_vectors(
-            aligned_yaw
-        )
+    headings = normalize_direction_rows(
+        raw_headings
     )
 
     nearest_errors = (
         nearest_timestamp_errors(
-            quest_times,
+            query_times,
             robot_times,
         )
     )
 
     bracket_gaps = (
         interpolation_bracket_gaps(
-            quest_times,
+            query_times,
             robot_times,
         )
     )
 
-    max_bracket_gap = float(
-        np.max(
-            bracket_gaps
-        )
-    )
-
-    # Save the subset of raw robot samples surrounding this Quest window.
     left_index = max(
         0,
         int(
             np.searchsorted(
                 robot_times,
-                quest_times.min(),
+                query_times.min(),
                 side="left",
             )
         ) - 1,
@@ -1230,260 +1800,54 @@ def align_robot_ground_truth_to_quest(
         int(
             np.searchsorted(
                 robot_times,
-                quest_times.max(),
+                query_times.max(),
                 side="right",
             )
         ) + 1,
     )
 
-    source_times = robot_times[
-        left_index:right_index
-    ]
-
-    source_positions = robot_positions[
-        left_index:right_index
-    ]
-
-    source_headings = (
-        normalize_horizontal_headings(
-            robot_headings[
-                left_index:right_index
-            ]
-        )
-    )
-
     return {
-        "aligned_positions": (
-            aligned_positions
+        "timestamps": (
+            query_times.copy()
         ),
-        "aligned_headings": (
-            aligned_headings
-        ),
-        "aligned_yaw": aligned_yaw,
+        "positions": positions,
+        "headings": headings,
         "nearest_timestamp_errors": (
             nearest_errors
         ),
         "bracket_gaps": bracket_gaps,
-        "max_bracket_gap": (
-            max_bracket_gap
+        "source_times": (
+            robot_times[
+                left_index:right_index
+            ]
         ),
-        "source_times": source_times,
         "source_positions": (
-            source_positions
+            robot_positions[
+                left_index:right_index
+            ]
         ),
         "source_headings": (
-            source_headings
+            robot_headings[
+                left_index:right_index
+            ]
         ),
     }
 
 
 # ---------------------------------------------------------------------------
-# Motion-window image validation / storage
+# Saving aligned Quest windows
 # ---------------------------------------------------------------------------
 
-def validate_and_decode_motion_images(
-    window: RobotMotionHistoryWindow,
-) -> Dict[int, bytes]:
-    """
-    Validate the optional image portion of a Quest motion-history payload.
+def build_image_metadata(
+    prepared: PreparedQuestWindow,
+    image_alignment: Dict[
+        str,
+        np.ndarray,
+    ],
+) -> Dict[str, np.ndarray]:
+    window = prepared.window
 
-    Returns:
-        Dictionary mapping frame_id -> decoded JPEG bytes.
-
-    Motion-only payloads return an empty dictionary.
-    """
-    if window.image_count != len(window.images):
-        raise ValueError(
-            "image_count does not match the number "
-            "of images in the payload."
-        )
-
-    if len(window.images) > MAX_IMAGES_PER_WINDOW:
-        raise ValueError(
-            "Motion window contains too many images: "
-            f"{len(window.images)} > "
-            f"{MAX_IMAGES_PER_WINDOW}."
-        )
-
-    if window.includes_images and not window.images:
-        raise ValueError(
-            "includes_images is true but the payload "
-            "contains no images."
-        )
-
-    decoded_by_frame_id: Dict[int, bytes] = {}
-
-    for image in window.images:
-        if image.frame_id in decoded_by_frame_id:
-            raise ValueError(
-                "Duplicate image frame_id in payload: "
-                f"{image.frame_id}."
-            )
-
-        # Position and rotation should either both be supplied or both omitted.
-        if (image.camera_position is None) != (image.camera_rotation is None):
-            raise ValueError(
-                "Camera pose for image frame "
-                f"{image.frame_id} must contain both camera_position "
-                "and camera_rotation, or neither."
-            )
-
-        if image.camera_position is not None:
-            pose_values = [
-                image.camera_position.x,
-                image.camera_position.y,
-                image.camera_position.z,
-                image.camera_rotation.x,
-                image.camera_rotation.y,
-                image.camera_rotation.z,
-                image.camera_rotation.w,
-            ]
-
-            if not all(math.isfinite(float(value)) for value in pose_values):
-                raise ValueError(
-                    "Camera pose contains non-finite values for image frame "
-                    f"{image.frame_id}."
-                )
-
-            quaternion_norm = math.sqrt(
-                float(image.camera_rotation.x) ** 2
-                + float(image.camera_rotation.y) ** 2
-                + float(image.camera_rotation.z) ** 2
-                + float(image.camera_rotation.w) ** 2
-            )
-
-            if quaternion_norm < 1.0e-8:
-                raise ValueError(
-                    "Camera rotation quaternion has near-zero magnitude for "
-                    f"image frame {image.frame_id}."
-                )
-
-        if image.mime_type.lower() not in {
-            "image/jpeg",
-            "image/jpg",
-        }:
-            raise ValueError(
-                "Unsupported motion image MIME type "
-                f"for frame {image.frame_id}: "
-                f"{image.mime_type!r}. "
-                "Only JPEG images are accepted."
-            )
-
-        try:
-            jpeg_bytes = base64.b64decode(
-                image.jpeg_base64,
-                validate=True,
-            )
-        except (
-            binascii.Error,
-            ValueError,
-        ) as exc:
-            raise ValueError(
-                "Invalid Base64 JPEG data for frame "
-                f"{image.frame_id}."
-            ) from exc
-
-        if not jpeg_bytes:
-            raise ValueError(
-                "Decoded JPEG is empty for frame "
-                f"{image.frame_id}."
-            )
-
-        if len(jpeg_bytes) > MAX_IMAGE_BYTES:
-            raise ValueError(
-                "Decoded JPEG exceeds the per-image "
-                "size limit for frame "
-                f"{image.frame_id}: "
-                f"{len(jpeg_bytes)} bytes > "
-                f"{MAX_IMAGE_BYTES} bytes."
-            )
-
-        # JPEG files begin with the SOI marker FF D8.
-        if not jpeg_bytes.startswith(
-            b"\xff\xd8"
-        ):
-            raise ValueError(
-                "Decoded image does not look like a "
-                "JPEG for frame "
-                f"{image.frame_id}."
-            )
-
-        decoded_by_frame_id[
-            image.frame_id
-        ] = jpeg_bytes
-
-    referenced_frame_ids = set()
-
-    for sample_index, sample in enumerate(
-        window.samples
-    ):
-        if sample.has_image:
-            if sample.image_frame_id < 0:
-                raise ValueError(
-                    "Motion sample "
-                    f"{sample_index} has_image=true "
-                    "but image_frame_id is negative."
-                )
-
-            if (
-                sample.image_frame_id
-                not in decoded_by_frame_id
-            ):
-                raise ValueError(
-                    "Motion sample "
-                    f"{sample_index} references image "
-                    f"frame {sample.image_frame_id}, "
-                    "but that frame is not present in "
-                    "the top-level images array."
-                )
-
-            referenced_frame_ids.add(
-                sample.image_frame_id
-            )
-
-    unreferenced_frame_ids = (
-        set(decoded_by_frame_id.keys())
-        - referenced_frame_ids
-    )
-
-    if unreferenced_frame_ids:
-        raise ValueError(
-            "The payload contains image frames that "
-            "are not referenced by any motion sample: "
-            f"{sorted(unreferenced_frame_ids)}."
-        )
-
-    return decoded_by_frame_id
-
-
-def build_motion_image_metadata(
-    window: RobotMotionHistoryWindow,
-) -> dict:
-    """
-    Build fixed-size NumPy metadata arrays that can be stored in the aligned
-    .npz without embedding the JPEG bytes themselves.
-    """
-    sample_has_image = np.asarray(
-        [
-            bool(sample.has_image)
-            for sample in window.samples
-        ],
-        dtype=np.bool_,
-    )
-
-    sample_image_frame_ids = np.asarray(
-        [
-            (
-                int(sample.image_frame_id)
-                if sample.has_image
-                else -1
-            )
-            for sample in window.samples
-        ],
-        dtype=np.int64,
-    )
-
-    image_frame_ids = np.asarray(
+    frame_ids = np.asarray(
         [
             int(image.frame_id)
             for image in window.images
@@ -1491,7 +1855,7 @@ def build_motion_image_metadata(
         dtype=np.int64,
     )
 
-    image_widths = np.asarray(
+    widths = np.asarray(
         [
             int(image.image_width)
             for image in window.images
@@ -1499,7 +1863,7 @@ def build_motion_image_metadata(
         dtype=np.int32,
     )
 
-    image_heights = np.asarray(
+    heights = np.asarray(
         [
             int(image.image_height)
             for image in window.images
@@ -1507,83 +1871,97 @@ def build_motion_image_metadata(
         dtype=np.int32,
     )
 
-    image_capture_timestamp_unix = np.asarray(
+    capture_unix = np.asarray(
         [
-            float(image.capture_timestamp_unix)
+            float(
+                image.capture_timestamp_unix
+            )
             for image in window.images
         ],
         dtype=np.float64,
     )
 
-    image_capture_realtime_seconds = np.asarray(
+    capture_realtime = np.asarray(
         [
-            float(image.capture_realtime_seconds)
+            float(
+                image.capture_realtime_seconds
+            )
             for image in window.images
         ],
         dtype=np.float64,
     )
 
-    image_camera_positions = np.asarray(
+    camera_positions = np.asarray(
         [
             (
                 [
-                    float(image.camera_position.x),
-                    float(image.camera_position.y),
-                    float(image.camera_position.z),
+                    image.camera_position.x,
+                    image.camera_position.y,
+                    image.camera_position.z,
                 ]
-                if image.camera_position is not None
-                else [np.nan, np.nan, np.nan]
+                if image.camera_position
+                is not None
+                else [
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                ]
             )
             for image in window.images
         ],
         dtype=np.float32,
     ).reshape((-1, 3))
 
-    # Unity Quaternion fields are serialized in x, y, z, w order.
-    image_camera_rotations_xyzw = np.asarray(
+    camera_rotations = np.asarray(
         [
             (
                 [
-                    float(image.camera_rotation.x),
-                    float(image.camera_rotation.y),
-                    float(image.camera_rotation.z),
-                    float(image.camera_rotation.w),
+                    image.camera_rotation.x,
+                    image.camera_rotation.y,
+                    image.camera_rotation.z,
+                    image.camera_rotation.w,
                 ]
-                if image.camera_rotation is not None
-                else [np.nan, np.nan, np.nan, np.nan]
+                if image.camera_rotation
+                is not None
+                else [
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                ]
             )
             for image in window.images
         ],
         dtype=np.float32,
     ).reshape((-1, 4))
 
-    image_has_camera_pose = np.asarray(
+    has_camera_pose = np.asarray(
         [
-            image.camera_position is not None
-            and image.camera_rotation is not None
+            (
+                image.camera_position
+                is not None
+                and image.camera_rotation
+                is not None
+            )
             for image in window.images
         ],
         dtype=np.bool_,
     )
 
-    safe_source_id = sanitize_filename_component(
-        window.source_id
-    )
-
-    safe_window_id = sanitize_filename_component(
-        window.window_id
-    )
-
-    image_relative_paths = np.asarray(
+    relative_paths = np.asarray(
         [
             (
                 Path("images")
-                / safe_source_id
-                / safe_window_id
+                / sanitize_filename_component(
+                    window.source_id
+                )
+                / sanitize_filename_component(
+                    window.window_id
+                )
                 / (
-                    "frame_"
+                    f"frame_"
                     f"{int(image.frame_id):020d}"
-                    ".jpg"
+                    f".jpg"
                 )
             ).as_posix()
             for image in window.images
@@ -1592,274 +1970,144 @@ def build_motion_image_metadata(
     )
 
     return {
-        "sample_has_image": sample_has_image,
-        "sample_image_frame_ids": (
-            sample_image_frame_ids
+        "frame_ids": frame_ids,
+        "widths": widths,
+        "heights": heights,
+        "capture_unix": capture_unix,
+        "capture_realtime": capture_realtime,
+        "alignment_timestamps": (
+            prepared.image_alignment_timestamps.astype(
+                np.float64
+            )
         ),
-        "image_frame_ids": image_frame_ids,
-        "image_widths": image_widths,
-        "image_heights": image_heights,
-        "image_capture_timestamp_unix": (
-            image_capture_timestamp_unix
+        "camera_positions": (
+            camera_positions
         ),
-        "image_capture_realtime_seconds": (
-            image_capture_realtime_seconds
+        "camera_rotations_xyzw": (
+            camera_rotations
         ),
-        "image_has_camera_pose": (
-            image_has_camera_pose
+        "has_camera_pose": (
+            has_camera_pose
         ),
-        "image_camera_positions": (
-            image_camera_positions
+        "relative_paths": (
+            relative_paths
         ),
-        "image_camera_rotations_xyzw": (
-            image_camera_rotations_xyzw
+        "robot_positions": (
+            image_alignment[
+                "positions"
+            ].astype(
+                np.float32
+            )
         ),
-        "image_relative_paths": (
-            image_relative_paths
+        "robot_headings": (
+            image_alignment[
+                "headings"
+            ].astype(
+                np.float32
+            )
+        ),
+        "nearest_robot_timestamp_error_seconds": (
+            image_alignment[
+                "nearest_timestamp_errors"
+            ].astype(
+                np.float64
+            )
+        ),
+        "robot_interpolation_bracket_gap_seconds": (
+            image_alignment[
+                "bracket_gaps"
+            ].astype(
+                np.float64
+            )
         ),
     }
 
 
-def save_motion_window_images(
-    window: RobotMotionHistoryWindow,
-) -> Optional[Path]:
-    """
-    Save unique JPEG frames for one motion window and write manifest.json.
-
-    JPEGs are intentionally stored as normal image files rather than inside
-    the .npz. The .npz stores frame IDs and relative paths that link each
-    motion sample back to the correct JPEG.
-    """
-    decoded_by_frame_id = (
-        validate_and_decode_motion_images(
-            window
-        )
-    )
-
-    if not decoded_by_frame_id:
-        return None
-
-    final_directory = (
-        get_window_image_directory(
-            source_id=window.source_id,
-            window_id=window.window_id,
-        )
-    )
-
-    final_directory.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    temp_directory = Path(
-        tempfile.mkdtemp(
-            prefix=".motion_images_",
-            dir=final_directory.parent,
-        )
-    )
-
-    sample_indices_by_frame: Dict[
-        int,
-        List[int],
-    ] = defaultdict(list)
-
-    for sample_index, sample in enumerate(
-        window.samples
-    ):
-        if sample.has_image:
-            sample_indices_by_frame[
-                int(sample.image_frame_id)
-            ].append(
-                sample_index
-            )
-
-    manifest_images = []
-
-    try:
-        for image in window.images:
-            frame_id = int(
-                image.frame_id
-            )
-
-            filename = (
-                "frame_"
-                f"{frame_id:020d}"
-                ".jpg"
-            )
-
-            image_path = (
-                temp_directory
-                / filename
-            )
-
-            image_path.write_bytes(
-                decoded_by_frame_id[
-                    frame_id
-                ]
-            )
-
-            relative_path = (
-                Path("images")
-                / sanitize_filename_component(
-                    window.source_id
-                )
-                / sanitize_filename_component(
-                    window.window_id
-                )
-                / filename
-            ).as_posix()
-
-            manifest_images.append(
-                {
-                    "frame_id": frame_id,
-                    "file_name": filename,
-                    "relative_path": (
-                        relative_path
-                    ),
-                    "mime_type": (
-                        image.mime_type
-                    ),
-                    "image_width": (
-                        int(
-                            image.image_width
-                        )
-                    ),
-                    "image_height": (
-                        int(
-                            image.image_height
-                        )
-                    ),
-                    "capture_timestamp_unix": (
-                        float(
-                            image.capture_timestamp_unix
-                        )
-                    ),
-                    "capture_realtime_seconds": (
-                        float(
-                            image.capture_realtime_seconds
-                        )
-                    ),
-                    "camera_position": (
-                        {
-                            "x": float(image.camera_position.x),
-                            "y": float(image.camera_position.y),
-                            "z": float(image.camera_position.z),
-                        }
-                        if image.camera_position is not None
-                        else None
-                    ),
-                    "camera_rotation_xyzw": (
-                        {
-                            "x": float(image.camera_rotation.x),
-                            "y": float(image.camera_rotation.y),
-                            "z": float(image.camera_rotation.z),
-                            "w": float(image.camera_rotation.w),
-                        }
-                        if image.camera_rotation is not None
-                        else None
-                    ),
-                    "sample_indices": (
-                        sample_indices_by_frame[
-                            frame_id
-                        ]
-                    ),
-                    "byte_count": len(
-                        decoded_by_frame_id[
-                            frame_id
-                        ]
-                    ),
-                }
-            )
-
-        manifest = {
-            "schema_version": (
-                window.schema_version
-            ),
-            "window_id": (
-                window.window_id
-            ),
-            "source_id": (
-                window.source_id
-            ),
-            "sample_count": (
-                len(window.samples)
-            ),
-            "image_count": (
-                len(window.images)
-            ),
-            "sample_image_frame_ids": [
-                (
-                    int(
-                        sample.image_frame_id
-                    )
-                    if sample.has_image
-                    else -1
-                )
-                for sample in window.samples
-            ],
-            "images": manifest_images,
-        }
-
-        manifest_path = (
-            temp_directory
-            / "manifest.json"
-        )
-
-        manifest_path.write_text(
-            json.dumps(
-                manifest,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        # If a previous interrupted attempt left image files behind but no
-        # completed .npz, replace that stale directory with this validated one.
-        if final_directory.exists():
-            shutil.rmtree(
-                final_directory
-            )
-
-        os.replace(
-            temp_directory,
-            final_directory,
-        )
-
-    except Exception:
-        if temp_directory.exists():
-            shutil.rmtree(
-                temp_directory,
-                ignore_errors=True,
-            )
-
-        raise
-
-    return final_directory
-
-
-# ---------------------------------------------------------------------------
-# Saving
-# ---------------------------------------------------------------------------
-
-def save_aligned_motion_window(
+def save_aligned_window(
     prepared: PreparedQuestWindow,
-    alignment: dict,
+    decoded_images: Dict[
+        int,
+        bytes,
+    ],
 ) -> Path:
     window = prepared.window
 
-    output_path = get_window_file_path(
-        source_id=window.source_id,
-        window_id=window.window_id,
+    quest_alignment = (
+        interpolate_robot_at_times(
+            robot_source_id=(
+                window.robot_source_id
+            ),
+            query_times=(
+                prepared.aligned_timestamps
+            ),
+        )
     )
 
-    quest_original_timestamps = np.asarray(
-        prepared.original_timestamps,
-        dtype=np.float64,
+    if len(
+        prepared.image_alignment_timestamps
+    ):
+        image_alignment = (
+            interpolate_robot_at_times(
+                robot_source_id=(
+                    window.robot_source_id
+                ),
+                query_times=(
+                    prepared.image_alignment_timestamps
+                ),
+            )
+        )
+    else:
+        image_alignment = {
+            "positions": np.empty(
+                (0, 3),
+                dtype=np.float64,
+            ),
+            "headings": np.empty(
+                (0, 3),
+                dtype=np.float64,
+            ),
+            "nearest_timestamp_errors": (
+                np.empty(
+                    (0,),
+                    dtype=np.float64,
+                )
+            ),
+            "bracket_gaps": np.empty(
+                (0,),
+                dtype=np.float64,
+            ),
+        }
+
+    image_directory = (
+        save_window_images(
+            window,
+            decoded_images,
+        )
     )
 
-    quest_timestamps = np.asarray(
-        prepared.aligned_timestamps,
-        dtype=np.float64,
+    image_metadata = (
+        build_image_metadata(
+            prepared,
+            image_alignment,
+        )
+    )
+
+    quest_positions = (
+        vector3_list_to_array(
+            [
+                sample.position
+                for sample in window.samples
+            ]
+        )
+    )
+
+    quest_headings = (
+        vector3_list_to_array(
+            [
+                sample.heading
+                for sample in window.samples
+            ]
+        )
     )
 
     quest_time_from_start = np.asarray(
@@ -1867,344 +2115,267 @@ def save_aligned_motion_window(
             sample.time_from_window_start
             for sample in window.samples
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
 
-    quest_positions = vector3_list_to_array(
+    sample_has_image = np.asarray(
         [
-            sample.position
+            bool(
+                sample.has_image
+            )
             for sample in window.samples
-        ]
-    ).astype(np.float32)
+        ],
+        dtype=np.bool_,
+    )
 
-    quest_headings = vector3_list_to_array(
+    sample_image_frame_ids = np.asarray(
         [
-            sample.heading
+            (
+                int(
+                    sample.image_frame_id
+                )
+                if sample.has_image
+                else -1
+            )
             for sample in window.samples
-        ]
-    ).astype(np.float32)
-
-    robot_positions = alignment[
-        "aligned_positions"
-    ].astype(np.float32)
-
-    robot_headings = alignment[
-        "aligned_headings"
-    ].astype(np.float32)
-
-    robot_yaw = alignment[
-        "aligned_yaw"
-    ].astype(np.float32)
-
-    nearest_errors = alignment[
-        "nearest_timestamp_errors"
-    ].astype(np.float32)
-
-    bracket_gaps = alignment[
-        "bracket_gaps"
-    ].astype(np.float32)
-
-    max_bracket_gap = float(
-        alignment[
-            "max_bracket_gap"
-        ]
+        ],
+        dtype=np.int64,
     )
 
-    alignment_warning = (
-        max_bracket_gap
-        > ALIGNMENT_GAP_WARNING_SECONDS
-    )
-
-    image_metadata = (
-        build_motion_image_metadata(
-            window
+    output_path = (
+        get_aligned_window_path(
+            window.source_id,
+            window.window_id,
         )
     )
 
-    image_directory = (
-        save_motion_window_images(
-            window
-        )
+    temp_path = output_path.with_name(
+        output_path.name + ".tmp"
     )
 
-    with tempfile.NamedTemporaryFile(
-        dir=DATA_DIR,
-        suffix=".npz",
-        delete=False,
-    ) as temp_file:
-        temp_path = Path(
-            temp_file.name
+    max_sample_gap = (
+        float(
+            np.max(
+                quest_alignment[
+                    "bracket_gaps"
+                ]
+            )
         )
+        if len(
+            quest_alignment[
+                "bracket_gaps"
+            ]
+        )
+        else 0.0
+    )
 
     try:
-        np.savez_compressed(
-            temp_path,
+        with temp_path.open(
+            "wb"
+        ) as file:
+            np.savez_compressed(
+                file,
+                schema_version=np.asarray(
+                    window.schema_version
+                ),
+                window_id=np.asarray(
+                    window.window_id
+                ),
+                quest_source_id=np.asarray(
+                    window.source_id
+                ),
+                robot_source_id=np.asarray(
+                    window.robot_source_id
+                ),
 
-            # -----------------------------------------------------------
-            # Window metadata
-            # -----------------------------------------------------------
-            schema_version=np.asarray(
-                window.schema_version
-            ),
+                # Quest observations.
+                quest_original_timestamps=(
+                    prepared.original_timestamps.astype(
+                        np.float64
+                    )
+                ),
+                quest_timestamps=(
+                    prepared.aligned_timestamps.astype(
+                        np.float64
+                    )
+                ),
+                quest_time_from_window_start=(
+                    quest_time_from_start
+                ),
+                quest_positions=(
+                    quest_positions.astype(
+                        np.float32
+                    )
+                ),
+                quest_headings=(
+                    quest_headings.astype(
+                        np.float32
+                    )
+                ),
+                quest_sample_has_image=(
+                    sample_has_image
+                ),
+                quest_sample_image_frame_ids=(
+                    sample_image_frame_ids
+                ),
 
-            window_id=np.asarray(
-                window.window_id
-            ),
+                # Robot GT aligned to every Quest observation.
+                robot_ground_truth_timestamps=(
+                    prepared.aligned_timestamps.astype(
+                        np.float64
+                    )
+                ),
+                robot_ground_truth_positions=(
+                    quest_alignment[
+                        "positions"
+                    ].astype(
+                        np.float32
+                    )
+                ),
+                robot_ground_truth_headings=(
+                    quest_alignment[
+                        "headings"
+                    ].astype(
+                        np.float32
+                    )
+                ),
+                robot_nearest_timestamp_error_seconds=(
+                    quest_alignment[
+                        "nearest_timestamp_errors"
+                    ].astype(
+                        np.float64
+                    )
+                ),
+                robot_interpolation_bracket_gap_seconds=(
+                    quest_alignment[
+                        "bracket_gaps"
+                    ].astype(
+                        np.float64
+                    )
+                ),
 
-            source_id=np.asarray(
-                window.source_id
-            ),
+                # Raw robot samples surrounding this aligned window.
+                robot_source_timestamps=(
+                    quest_alignment[
+                        "source_times"
+                    ].astype(
+                        np.float64
+                    )
+                ),
+                robot_source_positions=(
+                    quest_alignment[
+                        "source_positions"
+                    ].astype(
+                        np.float32
+                    )
+                ),
+                robot_source_headings=(
+                    quest_alignment[
+                        "source_headings"
+                    ].astype(
+                        np.float32
+                    )
+                ),
 
-            robot_source_id=np.asarray(
-                window.robot_source_id
-            ),
+                # Per-image metadata + robot GT aligned at each image capture.
+                quest_image_frame_ids=(
+                    image_metadata[
+                        "frame_ids"
+                    ]
+                ),
+                quest_image_widths=(
+                    image_metadata[
+                        "widths"
+                    ]
+                ),
+                quest_image_heights=(
+                    image_metadata[
+                        "heights"
+                    ]
+                ),
+                quest_image_capture_timestamp_unix=(
+                    image_metadata[
+                        "capture_unix"
+                    ]
+                ),
+                quest_image_capture_realtime_seconds=(
+                    image_metadata[
+                        "capture_realtime"
+                    ]
+                ),
+                quest_image_alignment_timestamps=(
+                    image_metadata[
+                        "alignment_timestamps"
+                    ]
+                ),
+                quest_image_has_camera_pose=(
+                    image_metadata[
+                        "has_camera_pose"
+                    ]
+                ),
+                quest_image_camera_positions=(
+                    image_metadata[
+                        "camera_positions"
+                    ]
+                ),
+                quest_image_camera_rotations_xyzw=(
+                    image_metadata[
+                        "camera_rotations_xyzw"
+                    ]
+                ),
+                quest_image_relative_paths=(
+                    image_metadata[
+                        "relative_paths"
+                    ]
+                ),
+                quest_image_robot_ground_truth_positions=(
+                    image_metadata[
+                        "robot_positions"
+                    ]
+                ),
+                quest_image_robot_ground_truth_headings=(
+                    image_metadata[
+                        "robot_headings"
+                    ]
+                ),
+                quest_image_nearest_robot_timestamp_error_seconds=(
+                    image_metadata[
+                        "nearest_robot_timestamp_error_seconds"
+                    ]
+                ),
+                quest_image_robot_interpolation_bracket_gap_seconds=(
+                    image_metadata[
+                        "robot_interpolation_bracket_gap_seconds"
+                    ]
+                ),
 
-            sent_at_unix_seconds=np.asarray(
-                window.sent_at_unix_seconds,
-                dtype=np.float64,
-            ),
-
-            window_duration_seconds=np.asarray(
-                window.window_duration_seconds,
-                dtype=np.float32,
-            ),
-
-            sample_count=np.asarray(
-                window.sample_count,
-                dtype=np.int32,
-            ),
-
-            # -----------------------------------------------------------
-            # Optional Quest image metadata
-            #
-            # JPEG bytes themselves are saved under:
-            # data/images/<source_id>/<window_id>/
-            # -----------------------------------------------------------
-            quest_includes_images=np.asarray(
-                len(window.images) > 0,
-                dtype=np.bool_,
-            ),
-
-            quest_image_count=np.asarray(
-                len(window.images),
-                dtype=np.int32,
-            ),
-
-            quest_sample_has_image=(
-                image_metadata[
-                    "sample_has_image"
-                ]
-            ),
-
-            quest_sample_image_frame_ids=(
-                image_metadata[
-                    "sample_image_frame_ids"
-                ]
-            ),
-
-            quest_image_frame_ids=(
-                image_metadata[
-                    "image_frame_ids"
-                ]
-            ),
-
-            quest_image_widths=(
-                image_metadata[
-                    "image_widths"
-                ]
-            ),
-
-            quest_image_heights=(
-                image_metadata[
-                    "image_heights"
-                ]
-            ),
-
-            quest_image_capture_timestamp_unix=(
-                image_metadata[
-                    "image_capture_timestamp_unix"
-                ]
-            ),
-
-            quest_image_capture_realtime_seconds=(
-                image_metadata[
-                    "image_capture_realtime_seconds"
-                ]
-            ),
-
-            quest_image_has_camera_pose=(
-                image_metadata[
-                    "image_has_camera_pose"
-                ]
-            ),
-
-            quest_image_camera_positions=(
-                image_metadata[
-                    "image_camera_positions"
-                ]
-            ),
-
-            # Quaternion component order: x, y, z, w.
-            quest_image_camera_rotations_xyzw=(
-                image_metadata[
-                    "image_camera_rotations_xyzw"
-                ]
-            ),
-
-            quest_image_relative_paths=(
-                image_metadata[
-                    "image_relative_paths"
-                ]
-            ),
-
-            # -----------------------------------------------------------
-            # Quest clock diagnostics
-            # -----------------------------------------------------------
-            quest_original_timestamps=(
-                quest_original_timestamps
-            ),
-
-            quest_timestamp_mode=np.asarray(
-                prepared.timestamp_mode
-            ),
-
-            quest_timestamp_was_rebased=np.asarray(
-                prepared.timestamp_mode
-                == "rebased_monotonic",
-                dtype=np.bool_,
-            ),
-
-            quest_clock_offset_seconds=np.asarray(
-                prepared.clock_offset_seconds,
-                dtype=np.float64,
-            ),
-
-            quest_clock_offset_candidate_seconds=(
-                np.asarray(
+                # Clock/alignment diagnostics.
+                quest_timestamp_mode=np.asarray(
+                    prepared.timestamp_mode
+                ),
+                quest_clock_offset_seconds=np.asarray(
+                    prepared.clock_offset_seconds,
+                    dtype=np.float64,
+                ),
+                quest_clock_offset_candidate_seconds=np.asarray(
                     prepared.clock_offset_candidate_seconds,
                     dtype=np.float64,
-                )
-            ),
-
-            quest_clock_offset_reference=np.asarray(
-                prepared.clock_offset_reference
-            ),
-
-            # -----------------------------------------------------------
-            # Backward-compatible Quest keys.
-            #
-            # `timestamps` means the normalized/rebased Unix timeline,
-            # while positions/headings remain the Quest-estimated values.
-            # -----------------------------------------------------------
-            timestamps=quest_timestamps,
-
-            time_from_window_start=(
-                quest_time_from_start
-            ),
-
-            positions=quest_positions,
-
-            headings=quest_headings,
-
-            # -----------------------------------------------------------
-            # Explicit Quest-estimate keys
-            # -----------------------------------------------------------
-            quest_timestamps=quest_timestamps,
-
-            quest_time_from_window_start=(
-                quest_time_from_start
-            ),
-
-            quest_positions=quest_positions,
-
-            quest_headings=quest_headings,
-
-            # -----------------------------------------------------------
-            # Robot ground truth aligned exactly to Quest timestamps
-            # -----------------------------------------------------------
-            robot_ground_truth_timestamps=(
-                quest_timestamps
-            ),
-
-            robot_ground_truth_positions=(
-                robot_positions
-            ),
-
-            robot_ground_truth_headings=(
-                robot_headings
-            ),
-
-            robot_ground_truth_yaw=(
-                robot_yaw
-            ),
-
-            # -----------------------------------------------------------
-            # Alignment diagnostics
-            # -----------------------------------------------------------
-            alignment_nearest_timestamp_error_seconds=(
-                nearest_errors
-            ),
-
-            alignment_interpolation_gap_seconds=(
-                bracket_gaps
-            ),
-
-            alignment_mean_nearest_timestamp_error_seconds=(
-                np.asarray(
-                    float(
-                        np.mean(
-                            nearest_errors
-                        )
-                    ),
+                ),
+                quest_clock_offset_reference=np.asarray(
+                    prepared.clock_offset_reference
+                ),
+                max_robot_interpolation_gap_seconds=np.asarray(
+                    max_sample_gap,
                     dtype=np.float64,
-                )
-            ),
-
-            alignment_max_nearest_timestamp_error_seconds=(
-                np.asarray(
-                    float(
-                        np.max(
-                            nearest_errors
-                        )
-                    ),
-                    dtype=np.float64,
-                )
-            ),
-
-            alignment_max_interpolation_gap_seconds=(
-                np.asarray(
-                    max_bracket_gap,
-                    dtype=np.float64,
-                )
-            ),
-
-            alignment_warning=np.asarray(
-                alignment_warning,
-                dtype=np.bool_,
-            ),
-
-            # -----------------------------------------------------------
-            # Raw robot ground-truth samples surrounding this window.
-            # These are retained so alignment can be audited/recomputed.
-            # -----------------------------------------------------------
-            robot_source_timestamps=(
-                alignment[
-                    "source_times"
-                ].astype(np.float64)
-            ),
-
-            robot_source_positions=(
-                alignment[
-                    "source_positions"
-                ].astype(np.float32)
-            ),
-
-            robot_source_headings=(
-                alignment[
-                    "source_headings"
-                ].astype(np.float32)
-            ),
-        )
+                ),
+                robot_ground_truth_coordinate_frame=np.asarray(
+                    "as_sent_by_robot"
+                ),
+                spatial_transform_applied=np.asarray(
+                    False,
+                    dtype=np.bool_,
+                ),
+            )
 
         os.replace(
             temp_path,
@@ -2215,148 +2386,65 @@ def save_aligned_motion_window(
         if temp_path.exists():
             temp_path.unlink()
 
-        # Do not leave a seemingly valid image directory without its matching
-        # aligned .npz if the final motion save fails.
-        if (
-            image_directory is not None
-            and image_directory.exists()
-        ):
-            shutil.rmtree(
-                image_directory,
-                ignore_errors=True,
-            )
-
         raise
+
+    if (
+        max_sample_gap
+        > ALIGNMENT_GAP_WARNING_SECONDS
+    ):
+        print(
+            "WARNING: saved aligned Quest window "
+            f"{window.window_id!r} with max robot interpolation "
+            f"gap {max_sample_gap:.3f}s.",
+            flush=True,
+        )
+
+    print(
+        f"Saved aligned Quest window: {output_path}",
+        flush=True,
+    )
+
+    if image_directory is not None:
+        print(
+            f"Saved Quest images: {image_directory}",
+            flush=True,
+        )
 
     return output_path
 
 
-def print_alignment_summary(
+def try_save_prepared_window(
     prepared: PreparedQuestWindow,
-    alignment: dict,
-    saved_path: Path,
-) -> None:
-    window = prepared.window
-
-    nearest_errors = alignment[
-        "nearest_timestamp_errors"
-    ]
-
-    max_bracket_gap = alignment[
-        "max_bracket_gap"
-    ]
-
-    print()
-    print(
-        "Saved aligned robot-motion window"
-    )
-    print(
-        "---------------------------------"
-    )
-    print(
-        f"Window ID: {window.window_id}"
-    )
-    print(
-        f"Quest source: {window.source_id}"
-    )
-    print(
-        "Robot GT source: "
-        f"{window.robot_source_id}"
-    )
-    print(
-        f"Samples: {window.sample_count}"
-    )
-    print(
-        "Quest timestamp mode: "
-        f"{prepared.timestamp_mode}"
-    )
-
-    if (
-        prepared.timestamp_mode
-        == "rebased_monotonic"
-    ):
-        print(
-            "Quest->Unix offset: "
-            f"{prepared.clock_offset_seconds:.6f} s"
-        )
-        print(
-            "Offset reference: "
-            f"{prepared.clock_offset_reference}"
-        )
-
-    print(
-        "Aligned Quest range: "
-        f"{prepared.aligned_timestamps[0]:.6f} "
-        "-> "
-        f"{prepared.aligned_timestamps[-1]:.6f}"
-    )
-    print(
-        "Mean nearest timestamp error: "
-        f"{np.mean(nearest_errors) * 1000.0:.2f} ms"
-    )
-    print(
-        "Max nearest timestamp error: "
-        f"{np.max(nearest_errors) * 1000.0:.2f} ms"
-    )
-    print(
-        "Max robot interpolation gap: "
-        f"{max_bracket_gap * 1000.0:.2f} ms"
-    )
-
-    if (
-        max_bracket_gap
-        > ALIGNMENT_GAP_WARNING_SECONDS
-    ):
-        print(
-            "WARNING: robot ground-truth stream "
-            "contains a relatively large sampling gap."
-        )
-
-    print(
-        f"Saved: {saved_path}"
-    )
-    print(
-        "---------------------------------"
-    )
-    print()
-
-
-def try_align_and_save_window(
-    prepared: PreparedQuestWindow,
+    decoded_images: Optional[
+        Dict[int, bytes]
+    ] = None,
 ) -> Optional[Path]:
-    if not has_ground_truth_coverage(
+    if not has_robot_coverage(
         prepared
     ):
         return None
 
-    alignment = (
-        align_robot_ground_truth_to_quest(
-            prepared
+    if decoded_images is None:
+        decoded_images = (
+            validate_and_decode_images(
+                prepared.window
+            )
         )
-    )
 
-    saved_path = (
-        save_aligned_motion_window(
-            prepared,
-            alignment,
-        )
-    )
-
-    print_alignment_summary(
+    return save_aligned_window(
         prepared,
-        alignment,
-        saved_path,
+        decoded_images,
     )
-
-    return saved_path
 
 
 def try_save_pending_windows_for_robot(
     robot_source_id: str,
 ) -> List[Path]:
-    saved_paths = []
+    saved_paths: List[
+        Path
+    ] = []
 
-    pending_keys = [
+    matching_keys = [
         key
         for key, prepared
         in pending_quest_windows.items()
@@ -2366,16 +2454,18 @@ def try_save_pending_windows_for_robot(
         )
     ]
 
-    for key in pending_keys:
-        prepared = pending_quest_windows[
-            key
-        ]
+    for key in matching_keys:
+        prepared = (
+            pending_quest_windows[
+                key
+            ]
+        )
 
-        window = prepared.window
-
-        output_path = get_window_file_path(
-            source_id=window.source_id,
-            window_id=window.window_id,
+        output_path = (
+            get_aligned_window_path(
+                prepared.window.source_id,
+                prepared.window.window_id,
+            )
         )
 
         if output_path.exists():
@@ -2384,15 +2474,15 @@ def try_save_pending_windows_for_robot(
             ]
             continue
 
-        saved_path = (
-            try_align_and_save_window(
+        saved = (
+            try_save_prepared_window(
                 prepared
             )
         )
 
-        if saved_path is not None:
+        if saved is not None:
             saved_paths.append(
-                saved_path
+                saved
             )
 
             del pending_quest_windows[
@@ -2407,9 +2497,9 @@ def try_save_pending_windows_for_robot(
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health():
-    async with state_lock:
-        robot_buffer_sizes = {
+def health():
+    with state_lock:
+        robot_sources = {
             source_id: len(samples)
             for source_id, samples
             in robot_ground_truth_buffers.items()
@@ -2417,26 +2507,33 @@ async def health():
 
         return {
             "status": "ok",
+            "project_root": str(
+                PROJECT_ROOT
+            ),
             "data_directory": str(
                 DATA_DIR
+            ),
+            "robot_recording_directory": str(
+                ROBOT_RECORDING_DIR
+            ),
+            "aligned_window_directory": str(
+                ALIGNED_WINDOW_DIR
+            ),
+            "image_directory": str(
+                IMAGE_DATA_DIR
+            ),
+            "robot_buffer_sizes": (
+                robot_sources
             ),
             "pending_quest_windows": len(
                 pending_quest_windows
             ),
-            "robot_ground_truth_buffer_sizes": (
-                robot_buffer_sizes
-            ),
-            "quest_clock_offset_estimates": {
-                source_id: estimate
-                for source_id, estimate
-                in quest_clock_offset_estimates.items()
-            },
         }
 
 
-@app.get("/alignment_status")
-async def alignment_status():
-    async with state_lock:
+@app.get("/collection_status")
+def collection_status():
+    with state_lock:
         robot_sources = {}
 
         for source_id, samples in (
@@ -2449,13 +2546,13 @@ async def alignment_status():
                     "sample_count": len(
                         samples
                     ),
-                    "start_timestamp": (
+                    "start_timestamp": float(
                         samples[0].timestamp
                     ),
-                    "end_timestamp": (
+                    "end_timestamp": float(
                         samples[-1].timestamp
                     ),
-                    "duration_seconds": (
+                    "duration_seconds": float(
                         samples[-1].timestamp
                         - samples[0].timestamp
                     ),
@@ -2464,212 +2561,138 @@ async def alignment_status():
                 robot_sources[
                     source_id
                 ] = {
-                    "sample_count": 0,
+                    "sample_count": 0
                 }
 
-        quest_clock_sources = {}
-
-        known_quest_sources = set(
-            quest_clock_offset_candidates.keys()
-        ) | set(
-            quest_clock_offset_estimates.keys()
-        )
-
-        for source_id in sorted(
-            known_quest_sources
-        ):
-            candidates = list(
-                quest_clock_offset_candidates.get(
-                    source_id,
-                    [],
-                )
-            )
-
-            quest_clock_sources[
-                source_id
-            ] = {
-                "offset_estimate_seconds": (
-                    quest_clock_offset_estimates.get(
-                        source_id
-                    )
+        pending = [
+            {
+                "window_id": (
+                    prepared.window.window_id
                 ),
-                "candidate_count": len(
-                    candidates
+                "quest_source_id": (
+                    prepared.window.source_id
                 ),
-                "last_candidate_seconds": (
-                    quest_clock_last_candidate.get(
-                        source_id
-                    )
+                "robot_source_id": (
+                    prepared.window.robot_source_id
                 ),
-                "last_reference": (
-                    quest_clock_last_reference.get(
-                        source_id
-                    )
+                "aligned_start_timestamp": float(
+                    get_required_alignment_times(
+                        prepared
+                    ).min()
                 ),
-                "last_raw_timestamp": (
-                    quest_clock_last_raw_timestamp.get(
-                        source_id
-                    )
+                "aligned_end_timestamp": float(
+                    get_required_alignment_times(
+                        prepared
+                    ).max()
+                ),
+                "images": len(
+                    prepared.window.images
                 ),
             }
-
-        pending = []
-
-        for prepared in (
-            pending_quest_windows.values()
-        ):
-            window = prepared.window
-
-            pending.append(
-                {
-                    "window_id": (
-                        window.window_id
-                    ),
-                    "quest_source_id": (
-                        window.source_id
-                    ),
-                    "robot_source_id": (
-                        window.robot_source_id
-                    ),
-                    "timestamp_mode": (
-                        prepared.timestamp_mode
-                    ),
-                    "clock_offset_seconds": (
-                        prepared.clock_offset_seconds
-                    ),
-                    "raw_start_timestamp": (
-                        float(
-                            prepared.original_timestamps[0]
-                        )
-                    ),
-                    "raw_end_timestamp": (
-                        float(
-                            prepared.original_timestamps[-1]
-                        )
-                    ),
-                    "aligned_start_timestamp": (
-                        float(
-                            prepared.aligned_timestamps[0]
-                        )
-                    ),
-                    "aligned_end_timestamp": (
-                        float(
-                            prepared.aligned_timestamps[-1]
-                        )
-                    ),
-                }
-            )
+            for prepared
+            in pending_quest_windows.values()
+        ]
 
         return {
-            "robot_sources": (
-                robot_sources
+            "robot_sources": robot_sources,
+            "pending_quest_windows": pending,
+            "quest_clock_offset_estimates": dict(
+                quest_clock_offset_estimates
             ),
-            "quest_clock_sources": (
-                quest_clock_sources
-            ),
-            "pending_windows": pending,
         }
 
 
 @app.post("/robot_ground_truth")
-async def receive_robot_ground_truth(
+def receive_robot_ground_truth(
     batch: RobotGroundTruthBatch,
 ):
-    if (
-        batch.sample_count
-        != len(batch.samples)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "sample_count does not match the "
-                "number of robot ground-truth "
-                "samples in the payload."
-            ),
+    try:
+        validate_robot_batch(
+            batch
         )
 
-    if not batch.samples:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Robot ground-truth batch has "
-                "no samples."
-            ),
-        )
+        with state_lock:
+            recording_id = (
+                resolve_robot_recording_id(
+                    batch
+                )
+            )
 
-    robot_timestamps = np.asarray(
-        [
-            sample.timestamp
-            for sample in batch.samples
-        ],
-        dtype=np.float64,
-    )
+            recording_path, recording_count = (
+                save_robot_recording_batch(
+                    batch,
+                    recording_id,
+                )
+            )
 
-    if not np.all(
-        np.isfinite(
-            robot_timestamps
-        )
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Robot ground-truth timestamps "
-                "contain non-finite values."
-            ),
-        )
-
-    async with state_lock:
-        buffer = (
             robot_ground_truth_buffers[
                 batch.source_id
-            ]
-        )
+            ].extend(
+                batch.samples
+            )
 
-        buffer.extend(
-            batch.samples
-        )
-
-        sort_and_deduplicate_ground_truth(
-            batch.source_id
-        )
-
-        saved_paths = (
-            try_save_pending_windows_for_robot(
+            sort_and_deduplicate_robot_buffer(
                 batch.source_id
             )
-        )
 
-        prune_ground_truth_buffer(
-            batch.source_id
-        )
+            saved_pending = (
+                try_save_pending_windows_for_robot(
+                    batch.source_id
+                )
+            )
 
-        current_buffer = (
-            robot_ground_truth_buffers[
+            prune_robot_buffer(
                 batch.source_id
-            ]
-        )
-
-        if current_buffer:
-            buffer_start = float(
-                current_buffer[
-                    0
-                ].timestamp
             )
 
-            buffer_end = float(
-                current_buffer[
-                    -1
-                ].timestamp
+            buffer = (
+                robot_ground_truth_buffers[
+                    batch.source_id
+                ]
             )
-        else:
-            buffer_start = None
-            buffer_end = None
+
+            buffer_start = (
+                float(
+                    buffer[0].timestamp
+                )
+                if buffer
+                else None
+            )
+
+            buffer_end = (
+                float(
+                    buffer[-1].timestamp
+                )
+                if buffer
+                else None
+            )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to store robot ground-truth batch."
+            ),
+        ) from exc
 
     return {
         "accepted": True,
         "source_id": batch.source_id,
+        "recording_id": recording_id,
         "samples_received": len(
             batch.samples
+        ),
+        "samples_in_recording": (
+            recording_count
+        ),
+        "recording_path": str(
+            recording_path
         ),
         "buffer_start_timestamp": (
             buffer_start
@@ -2677,59 +2700,30 @@ async def receive_robot_ground_truth(
         "buffer_end_timestamp": (
             buffer_end
         ),
+
+        # Kept for compatibility with the existing sender's debug message.
         "pending_windows_saved": len(
-            saved_paths
+            saved_pending
         ),
         "saved_paths": [
             str(path)
-            for path in saved_paths
+            for path in saved_pending
         ],
     }
 
 
 @app.post("/robot-motion-history")
 @app.post("/robot_motion_history")
-async def receive_robot_motion_history(
-    window: RobotMotionHistoryWindow,
+def receive_quest_motion_history(
+    window: QuestMotionHistoryWindow,
 ):
-    server_receive_unix_seconds = (
-        time.time()
-    )
+    receive_time = time.time()
 
-    if (
-        window.sample_count
-        != len(window.samples)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "sample_count does not match "
-                "the number of samples in the "
-                "payload."
-            ),
+    output_path = (
+        get_aligned_window_path(
+            window.source_id,
+            window.window_id,
         )
-
-    if not window.samples:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Motion window has no samples."
-            ),
-        )
-
-    try:
-        validate_and_decode_motion_images(
-            window
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
-    output_path = get_window_file_path(
-        source_id=window.source_id,
-        window_id=window.window_id,
     )
 
     pending_key = (
@@ -2737,53 +2731,137 @@ async def receive_robot_motion_history(
         window.window_id,
     )
 
-    async with state_lock:
-        if output_path.exists():
-            return {
-                "accepted": True,
-                "duplicate": True,
-                "aligned": True,
-                "pending": False,
-                "window_id": (
-                    window.window_id
-                ),
-                "samples_received": len(
-                    window.samples
-                ),
-                "images_received": len(
-                    window.images
-                ),
-                "saved_path": str(
-                    output_path
-                ),
-                "image_directory": (
-                    str(
-                        get_window_image_directory(
-                            window.source_id,
-                            window.window_id,
-                        )
-                    )
-                    if get_window_image_directory(
-                        window.source_id,
-                        window.window_id,
-                    ).exists()
-                    else None
-                ),
-            }
+    try:
+        # Validate image payload immediately so malformed payloads do not sit in
+        # the pending queue.
+        decoded_images = (
+            validate_and_decode_images(
+                window
+            )
+        )
 
-        if (
-            pending_key
-            in pending_quest_windows
-        ):
-            existing = (
-                pending_quest_windows[
-                    pending_key
-                ]
+        with state_lock:
+            if output_path.exists():
+                return {
+                    "accepted": True,
+                    "duplicate": True,
+                    "aligned": True,
+                    "pending": False,
+                    "window_id": (
+                        window.window_id
+                    ),
+                    "samples_received": len(
+                        window.samples
+                    ),
+                    "images_received": len(
+                        window.images
+                    ),
+                    "saved_path": str(
+                        output_path
+                    ),
+                }
+
+            if (
+                pending_key
+                in pending_quest_windows
+            ):
+                existing = (
+                    pending_quest_windows[
+                        pending_key
+                    ]
+                )
+
+                return {
+                    "accepted": True,
+                    "duplicate": True,
+                    "aligned": False,
+                    "pending": True,
+                    "window_id": (
+                        window.window_id
+                    ),
+                    "aligned_start_timestamp": float(
+                        get_required_alignment_times(
+                            existing
+                        ).min()
+                    ),
+                    "aligned_end_timestamp": float(
+                        get_required_alignment_times(
+                            existing
+                        ).max()
+                    ),
+                }
+
+            prepared = (
+                prepare_quest_window(
+                    window=window,
+                    server_receive_unix_seconds=(
+                        receive_time
+                    ),
+                )
             )
 
+            saved_path = (
+                try_save_prepared_window(
+                    prepared,
+                    decoded_images=(
+                        decoded_images
+                    ),
+                )
+            )
+
+            if saved_path is not None:
+                return {
+                    "accepted": True,
+                    "duplicate": False,
+                    "aligned": True,
+                    "pending": False,
+                    "window_id": (
+                        window.window_id
+                    ),
+                    "samples_received": len(
+                        window.samples
+                    ),
+                    "images_received": len(
+                        window.images
+                    ),
+                    "timestamp_mode": (
+                        prepared.timestamp_mode
+                    ),
+                    "clock_offset_seconds": (
+                        prepared.clock_offset_seconds
+                    ),
+                    "aligned_start_timestamp": float(
+                        get_required_alignment_times(
+                            prepared
+                        ).min()
+                    ),
+                    "aligned_end_timestamp": float(
+                        get_required_alignment_times(
+                            prepared
+                        ).max()
+                    ),
+                    "saved_path": str(
+                        saved_path
+                    ),
+                    "image_directory": (
+                        str(
+                            get_window_image_directory(
+                                window.source_id,
+                                window.window_id,
+                            )
+                        )
+                        if window.images
+                        else None
+                    ),
+                }
+
+            pending_quest_windows[
+                pending_key
+            ] = prepared
+
             return {
                 "accepted": True,
-                "duplicate": True,
+                "duplicate": False,
                 "aligned": False,
                 "pending": True,
                 "window_id": (
@@ -2793,83 +2871,7 @@ async def receive_robot_motion_history(
                     window.samples
                 ),
                 "images_received": len(
-                    existing.window.images
-                ),
-                "timestamp_mode": (
-                    existing.timestamp_mode
-                ),
-                "aligned_start_timestamp": (
-                    float(
-                        existing.aligned_timestamps[0]
-                    )
-                ),
-                "aligned_end_timestamp": (
-                    float(
-                        existing.aligned_timestamps[-1]
-                    )
-                ),
-            }
-
-        try:
-            prepared = prepare_quest_window(
-                window,
-                server_receive_unix_seconds,
-            )
-
-            # A new offset estimate can slightly improve older pending windows
-            # from this Quest source. Try them again immediately against the
-            # currently buffered robot ground truth.
-            newly_saved_paths = (
-                try_save_pending_windows_for_robot(
-                    window.robot_source_id
-                )
-            )
-
-            saved_path = (
-                try_align_and_save_window(
-                    prepared
-                )
-            )
-
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=str(exc),
-            ) from exc
-
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Failed to normalize/align/save "
-                    "robot motion-history window."
-                ),
-            ) from exc
-
-        if saved_path is not None:
-            return {
-                "accepted": True,
-                "duplicate": False,
-                "aligned": True,
-                "pending": False,
-                "window_id": (
-                    window.window_id
-                ),
-                "samples_received": len(
-                    window.samples
-                ),
-                "images_received": len(
                     window.images
-                ),
-                "image_directory": (
-                    str(
-                        get_window_image_directory(
-                            window.source_id,
-                            window.window_id,
-                        )
-                    )
-                    if window.images
-                    else None
                 ),
                 "timestamp_mode": (
                     prepared.timestamp_mode
@@ -2880,82 +2882,89 @@ async def receive_robot_motion_history(
                 "clock_offset_reference": (
                     prepared.clock_offset_reference
                 ),
-                "aligned_start_timestamp": (
-                    float(
-                        prepared.aligned_timestamps[0]
-                    )
+                "aligned_start_timestamp": float(
+                    get_required_alignment_times(
+                        prepared
+                    ).min()
                 ),
-                "aligned_end_timestamp": (
-                    float(
-                        prepared.aligned_timestamps[-1]
-                    )
+                "aligned_end_timestamp": float(
+                    get_required_alignment_times(
+                        prepared
+                    ).max()
                 ),
-                "saved_path": str(
-                    saved_path
-                ),
-                "other_pending_windows_saved": (
-                    len(
-                        newly_saved_paths
-                    )
+                "detail": (
+                    "Quest window accepted and buffered until robot "
+                    "ground truth covers the complete observation/image "
+                    "timestamp range."
                 ),
             }
 
-        # Ground truth has not yet covered the entire normalized Quest window.
-        pending_quest_windows[
-            pending_key
-        ] = prepared
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
 
-        return {
-            "accepted": True,
-            "duplicate": False,
-            "aligned": False,
-            "pending": True,
-            "window_id": (
-                window.window_id
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to process Quest motion/image window."
             ),
-            "samples_received": len(
-                window.samples
-            ),
-            "images_received": len(
-                window.images
-            ),
-            "timestamp_mode": (
-                prepared.timestamp_mode
-            ),
-            "clock_offset_seconds": (
-                prepared.clock_offset_seconds
-            ),
-            "clock_offset_reference": (
-                prepared.clock_offset_reference
-            ),
-            "raw_start_timestamp": (
-                float(
-                    prepared.original_timestamps[0]
-                )
-            ),
-            "raw_end_timestamp": (
-                float(
-                    prepared.original_timestamps[-1]
-                )
-            ),
-            "aligned_start_timestamp": (
-                float(
-                    prepared.aligned_timestamps[0]
-                )
-            ),
-            "aligned_end_timestamp": (
-                float(
-                    prepared.aligned_timestamps[-1]
-                )
-            ),
-            "other_pending_windows_saved": (
-                len(
-                    newly_saved_paths
-                )
-            ),
-            "detail": (
-                "Quest window timestamps were normalized. "
-                "The window is buffered until robot ground "
-                "truth covers its full aligned timestamp range."
-            ),
-        }
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Module entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Collect raw robot ground truth and temporally align "
+            "Quest observations/JPEG images."
+        )
+    )
+
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+    )
+
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="info",
+        choices=[
+            "critical",
+            "error",
+            "warning",
+            "info",
+            "debug",
+            "trace",
+        ],
+    )
+
+    args = parser.parse_args()
+
+    import uvicorn
+
+    # Passing the app object works cleanly with `python -m` and avoids requiring
+    # the caller to know the import string.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+    )
+
+
+if __name__ == "__main__":
+    main()
