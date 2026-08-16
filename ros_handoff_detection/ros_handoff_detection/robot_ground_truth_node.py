@@ -99,7 +99,7 @@ class RobotGroundTruthNode(Node):
 
         self.declare_parameter(
             "convert_ros_to_server_coordinates",
-            True,
+            False,
         )
 
         self.server_url = str(

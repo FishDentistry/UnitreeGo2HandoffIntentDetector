@@ -54,6 +54,11 @@ class HandoffInferenceNode(Node):
         )
 
         self.declare_parameter(
+            "debug",
+            False,
+        )
+
+        self.declare_parameter(
             "servo_port",
             "/dev/ttyACM0",
         )
@@ -104,6 +109,12 @@ class HandoffInferenceNode(Node):
             .bool_value
         )
 
+        debug = (
+            self.get_parameter("debug")
+            .get_parameter_value()
+            .bool_value
+        )
+
         servo_port = (
             self.get_parameter("servo_port")
             .get_parameter_value()
@@ -147,6 +158,10 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
+                    f"  debug={debug}"
+                )
+
+        self.get_logger().info(
             f"  servo_port={servo_port}"
         )
 
@@ -166,6 +181,7 @@ class HandoffInferenceNode(Node):
 
         self.model_type = model_type
         self.show_output_window = bool(show_output_window)
+        self.debug = bool(debug)
         self.output_window_name = "Handoff Classification"
 
         # ---------------------------------------------------------
@@ -180,22 +196,23 @@ class HandoffInferenceNode(Node):
             f"Connecting to servo controller on {servo_port}..."
         )
 
-        try:
-            self.servo = ServoController(
-                port=servo_port,
-                baud_rate=int(servo_baud_rate),
-            )
-            self.servo.connect()
-        except Exception as exc:
-            self.get_logger().error(
-                f"Failed to connect to servo controller: {exc}"
-            )
-            raise
+        if(debug == False):
+            try:
+                self.servo = ServoController(
+                    port=servo_port,
+                    baud_rate=int(servo_baud_rate),
+                )
+                self.servo.connect()
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Failed to connect to servo controller: {exc}"
+                )
+                raise
 
-        self.get_logger().info(
-            "Servo controller connected successfully."
-        )
-        self.servo.send_command(0)
+            self.get_logger().info(
+                "Servo controller connected successfully."
+            )
+            self.servo.send_command(0)
 
         # ---------------------------------------------------------
         # Model
@@ -478,7 +495,8 @@ class HandoffInferenceNode(Node):
                 and self._last_classification != "handoff"
                 and not self._servo_active
             ):
-                self._activate_servo_for_handoff()
+                if(self.debug == False):
+                    self._activate_servo_for_handoff()
 
             self._last_classification = classification
 
