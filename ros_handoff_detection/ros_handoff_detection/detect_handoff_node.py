@@ -53,10 +53,20 @@ class HandoffInferenceNode(Node):
         )
 
         # This is the handoff-confidence threshold used by the detector.
-        # A handoff decision at or above this threshold also pauses patrol.
+        # A frame at/above this threshold contributes toward the consecutive-
+        # frame confirmation required before patrol is paused.
         self.declare_parameter(
             "threshold",
-            0.60,
+            0.5,
+        )
+
+        # Require this many consecutive frames at/above the committed
+        # handoff threshold before starting the physical interaction.
+        # A value of 2 suppresses isolated one-frame false positives while
+        # adding only one frame of confirmation latency.
+        self.declare_parameter(
+            "handoff_confirmation_frames",
+            2,
         )
 
         self.declare_parameter(
@@ -94,8 +104,8 @@ class HandoffInferenceNode(Node):
         # ---------------------------------------------------------
         # An "aborted attempt" is operationally defined as handoff
         # probability rising into an incipient-attempt region, but then
-        # falling away again without ever reaching the committed handoff
-        # threshold above. This is intentionally robot-side only and does
+        # falling away again without ever satisfying the debounced committed
+        # handoff decision. This is intentionally robot-side only and does
         # not require any synchronization with the AR headset.
         self.declare_parameter(
             "aborted_handoff_logging_enabled",
@@ -131,8 +141,8 @@ class HandoffInferenceNode(Node):
         # Robot reaction-time logging
         # ---------------------------------------------------------
         # Reaction time is measured entirely on the robot:
-        # first observed P(handoff) >= the attempt-start threshold
-        # through first observed P(handoff) >= the committed threshold.
+        # first observed P(handoff) >= the attempt-start threshold through
+        # the debounced committed-handoff confirmation.
         self.declare_parameter(
             "robot_reaction_time_logging_enabled",
             True,
@@ -201,6 +211,12 @@ class HandoffInferenceNode(Node):
             self.get_parameter("threshold")
             .get_parameter_value()
             .double_value
+        )
+
+        handoff_confirmation_frames = (
+            self.get_parameter("handoff_confirmation_frames")
+            .get_parameter_value()
+            .integer_value
         )
 
         handoff_pause_topic = (
@@ -336,6 +352,11 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
+            "  handoff_confirmation_frames="
+            f"{handoff_confirmation_frames}"
+        )
+
+        self.get_logger().info(
             f"  handoff_pause_topic={handoff_pause_topic}"
         )
 
@@ -415,6 +436,9 @@ class HandoffInferenceNode(Node):
         self.features_type = str(features_type)
         self.crop_around_object = bool(crop_around_object)
         self.handoff_stop_threshold = float(threshold)
+        self.handoff_confirmation_frames = int(
+            handoff_confirmation_frames
+        )
         self.handoff_pause_topic = str(handoff_pause_topic)
         self.show_output_window = bool(show_output_window)
         self.debug = bool(debug)
@@ -457,6 +481,11 @@ class HandoffInferenceNode(Node):
         self.aborted_handoff_attempt_min_duration_seconds = float(
             aborted_handoff_attempt_min_duration_seconds
         )
+
+        if self.handoff_confirmation_frames < 1:
+            raise ValueError(
+                "handoff_confirmation_frames must be >= 1."
+            )
 
         if not (
             0.0
@@ -525,6 +554,7 @@ class HandoffInferenceNode(Node):
         self._handoff_active = False
         self._handoff_reset_timer = None
         self._last_handoff_stop_condition = False
+        self._handoff_confirmation_count = 0
 
         self.get_logger().info(
             f"Connecting to servo controller on {servo_port}..."
@@ -809,12 +839,34 @@ class HandoffInferenceNode(Node):
                 float(confidence),
             )
 
+            # -----------------------------------------------------
+            # Debounce the committed handoff decision
+            # -----------------------------------------------------
+            # The classifier output/confidence published above remain raw so
+            # they can still be inspected diagnostically. Only the committed
+            # handoff event is debounced.
+            raw_handoff_stop_condition = (
+                classification == "handoff"
+                and handoff_probability >= self.handoff_stop_threshold
+            )
+
+            if raw_handoff_stop_condition:
+                self._handoff_confirmation_count += 1
+            else:
+                self._handoff_confirmation_count = 0
+
+            handoff_stop_condition = (
+                self._handoff_confirmation_count
+                >= self.handoff_confirmation_frames
+            )
+
             if (
                 self.aborted_handoff_logging_enabled
                 or self.robot_reaction_time_logging_enabled
             ):
                 self._update_aborted_handoff_attempt_tracking(
-                    handoff_probability
+                    handoff_probability,
+                    handoff_committed=handoff_stop_condition,
                 )
 
             # -----------------------------------------------------
@@ -852,18 +904,13 @@ class HandoffInferenceNode(Node):
             # Handoff interaction trigger
             # -----------------------------------------------------
             # The robot keeps patrolling normally until the detector
-            # confidently identifies a handoff. At that point, request
-            # that the patrol node stop and hold the stop for the same
-            # interval used by the handoff servo.
+            # identifies a handoff for the configured number of consecutive
+            # frames. At that point, request that the patrol node stop and
+            # hold the stop for the same interval used by the handoff servo.
             #
-            # Using the transition into this condition prevents repeated
-            # triggering on every camera frame while the person remains
-            # in a handoff pose.
-            handoff_stop_condition = (
-                classification == "handoff"
-                and handoff_probability >= self.handoff_stop_threshold
-            )
-
+            # Using the transition into the debounced condition prevents
+            # repeated triggering on every camera frame while the person
+            # remains in a handoff pose.
             if (
                 handoff_stop_condition
                 and not self._last_handoff_stop_condition
@@ -922,14 +969,15 @@ class HandoffInferenceNode(Node):
     def _update_aborted_handoff_attempt_tracking(
         self,
         handoff_probability: float,
+        handoff_committed: bool = False,
     ):
         """
         Track incipient handoff behavior that disappears before commitment.
 
         State logic:
           1. P(handoff) >= start threshold begins a candidate attempt.
-          2. P(handoff) >= committed threshold means it became a real
-             detected handoff, so it is NOT counted as aborted.
+          2. A handoff becomes committed only after the main trigger's
+             consecutive-frame debounce confirms it.
           3. Otherwise, if P(handoff) stays below the lower end threshold
              for the configured grace period, the candidate is counted as
              aborted (provided it lasted at least the minimum duration).
@@ -944,13 +992,11 @@ class HandoffInferenceNode(Node):
             min(1.0, float(handoff_probability)),
         )
 
-        # A committed handoff is never an aborted attempt. If an
-        # incipient attempt was already active, the elapsed time from its
-        # first threshold crossing to this committed threshold is the
-        # robot-side reaction/recognition time. If the probability jumps
-        # directly from below the attempt threshold to the committed
-        # threshold in one sample, the observable reaction time is 0.0 s.
-        if handoff_probability >= self.handoff_stop_threshold:
+        # A committed handoff is never an aborted attempt. Commitment is
+        # supplied by the same consecutive-frame debounce used to start the
+        # physical interaction, so an isolated high-probability frame cannot
+        # be logged as a real handoff.
+        if handoff_committed:
             # A committed interaction disarms detection until the signal
             # clears. This also ensures reaction time is recorded once,
             # rather than on every frame that remains above 0.60.
@@ -1123,6 +1169,9 @@ class HandoffInferenceNode(Node):
             "committedHandoffProbabilityThreshold": float(
                 self.handoff_stop_threshold
             ),
+            "handoffConfirmationFrames": int(
+                self.handoff_confirmation_frames
+            ),
             "modelType": self.model_type,
             "featuresType": self.features_type,
             "cropAroundObject": self.crop_around_object,
@@ -1173,6 +1222,9 @@ class HandoffInferenceNode(Node):
             ),
             "committedHandoffProbability": float(
                 committed_handoff_probability
+            ),
+            "handoffConfirmationFrames": int(
+                self.handoff_confirmation_frames
             ),
             "directCommit": bool(direct_commit),
             "modelType": self.model_type,
