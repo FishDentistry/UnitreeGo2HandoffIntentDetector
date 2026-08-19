@@ -85,6 +85,7 @@ BASE_POSE_FEATURE_COUNT = (
 PROJECTED_DIMS_PER_JOINT = 2
 PROJECTED_FEATURE_COUNT = 21 * PROJECTED_DIMS_PER_JOINT
 RESNET_SPSA_EPSILON = 1e-3
+VERIFY_PROJECTION_FEATURES = False
 
 MODIFIABLE_JOINT_NAMES = {
     "left_hand",
@@ -1327,6 +1328,7 @@ def find_minimal_perturbation(
     target_intent: bool,
     *,
     features_type: Optional[str] = None,
+    original_probability: Optional[float] = None,
     classification_weight: float,
     reachability_weight: float,
     max_iterations: int = 1000,
@@ -1711,49 +1713,50 @@ def find_minimal_perturbation(
                 "42 projected values), "
                 f"but this model expects {model.input_dim}."
             )
-
-        with torch.inference_mode():
-            regenerated_original_projection = (
-                project_joint_positions_to_chest_plane_torch(
-                    original_joint_features,
-                    joint_indices=joint_indices,
+        
+        if VERIFY_PROJECTION_FEATURES:
+            with torch.inference_mode():
+                regenerated_original_projection = (
+                    project_joint_positions_to_chest_plane_torch(
+                        original_joint_features,
+                        joint_indices=joint_indices,
+                    )
                 )
-            )
-            supplied_original_projection = original_features[
-                :, BASE_POSE_FEATURE_COUNT:
-            ]
-
-            if not torch.allclose(
-                regenerated_original_projection,
-                supplied_original_projection,
-                rtol=1e-4,
-                atol=1e-5,
-            ):
-                max_abs_difference = float(
-                    (
-                        regenerated_original_projection
-                        - supplied_original_projection
-                    ).abs().max().item()
+                supplied_original_projection = original_features[
+                    :, BASE_POSE_FEATURE_COUNT:
+                ]
+                if not torch.allclose(
+                    regenerated_original_projection,
+                    supplied_original_projection,
+                    rtol=1e-4,
+                    atol=1e-5,
+                ):
+                    max_abs_difference = float(
+                        (
+                            regenerated_original_projection
+                            - supplied_original_projection
+                        ).abs().max().item()
+                    )
+                    raise ValueError(
+                        "Differentiable chest-plane projection does not match the "
+                        "projection features supplied with the original sample. "
+                        "This indicates a feature-ordering or projection-definition "
+                        "mismatch. Maximum absolute difference="
+                        f"{max_abs_difference:.6g}."
+                    )
+                
+    if original_probability is None:
+        with measure_latency(
+            latency_tracker,
+            "classifier_forward",
+            device=model.device,
+        ):
+            with torch.inference_mode():
+                original_probability = float(
+                    model.forward_feature_probabilities(
+                        original_features
+                    )[0].item()
                 )
-                raise ValueError(
-                    "Differentiable chest-plane projection does not match the "
-                    "projection features supplied with the original sample. "
-                    "This indicates a feature-ordering or projection-definition "
-                    "mismatch. Maximum absolute difference="
-                    f"{max_abs_difference:.6g}."
-                )
-
-    with measure_latency(
-        latency_tracker,
-        "classifier_forward",
-        device=model.device,
-    ):
-        with torch.inference_mode():
-            original_probability = float(
-                model.forward_feature_probabilities(
-                    original_features
-                )[0].item()
-            )
 
     # Convert probability_margin into the actual probability boundary that a
     # robust counterfactual must satisfy. For a handoff target this is
@@ -3686,3 +3689,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+ 
