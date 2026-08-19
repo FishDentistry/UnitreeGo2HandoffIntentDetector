@@ -1,4 +1,5 @@
 import cv2
+import csv
 import json
 import threading
 import time
@@ -86,8 +87,8 @@ class HandoffInferenceNode(Node):
         )
 
         # When enabled, pressing S while the visualization window is active
-        # saves the current annotated frame. Saving is only active when
-        # debug=True and show_output_window=True as well.
+        # saves the current annotated frame. Saving requires the visualization
+        # window, but it works regardless of whether debug mode is enabled.
         self.declare_parameter(
             "save_viz_images",
             False,
@@ -463,18 +464,19 @@ class HandoffInferenceNode(Node):
         self.debug = bool(debug)
         self.output_window_name = "Handoff Classification"
 
-        # Visualization-image saving is deliberately restricted to debug mode
-        # with the visualization window enabled, so this cannot silently write
-        # images during normal deployment.
+        # Visualization-image saving is available whenever explicitly enabled
+        # and the visualization window is active. Debug mode is not required.
         self.save_viz_images_requested = bool(save_viz_images)
         self.save_viz_images = (
             self.save_viz_images_requested
-            and self.debug
             and self.show_output_window
         )
         self.viz_image_save_root = (
             Path.cwd() / "handoff_viz_images"
         ).resolve()
+        self.viz_confidence_csv_path = (
+            self.viz_image_save_root / "handoff_confidences.csv"
+        )
         self._viz_saved_frame_count = 0
 
         if self.save_viz_images:
@@ -490,7 +492,7 @@ class HandoffInferenceNode(Node):
         elif self.save_viz_images_requested:
             self.get_logger().warning(
                 "save_viz_images=True was requested, but image saving is "
-                "disabled unless debug=True and show_output_window=True."
+                "disabled unless show_output_window=True."
             )
 
         # ---------------------------------------------------------
@@ -958,6 +960,7 @@ class HandoffInferenceNode(Node):
                         display_image=display_image,
                         classification=classification,
                         confidence=float(confidence),
+                        handoff_probability=float(handoff_probability),
                     )
 
             # -----------------------------------------------------
@@ -999,12 +1002,18 @@ class HandoffInferenceNode(Node):
         display_image,
         classification: str,
         confidence: float,
+        handoff_probability: float,
     ):
-        """Save one annotated visualization frame to the output directory."""
+        """Save one annotated frame and append its P(handoff) to CSV."""
         confidence = max(0.0, min(1.0, float(confidence)))
+        handoff_probability = max(
+            0.0,
+            min(1.0, float(handoff_probability)),
+        )
 
         self._viz_saved_frame_count += 1
-        timestamp = datetime.now(timezone.utc).strftime(
+        now_utc = datetime.now(timezone.utc)
+        timestamp = now_utc.strftime(
             "%Y%m%dT%H%M%S_%fZ"
         )
         safe_classification = str(classification).replace("/", "_")
@@ -1020,9 +1029,56 @@ class HandoffInferenceNode(Node):
             self.get_logger().warning(
                 f"Failed to save visualization image: {output_path}"
             )
-        else:
+            return
+
+        self.get_logger().info(
+            f"Saved visualization image: {output_path}"
+        )
+
+        csv_exists_with_content = (
+            self.viz_confidence_csv_path.exists()
+            and self.viz_confidence_csv_path.stat().st_size > 0
+        )
+
+        try:
+            with self.viz_confidence_csv_path.open(
+                "a",
+                newline="",
+                encoding="utf-8",
+            ) as csv_file:
+                writer = csv.writer(csv_file)
+
+                if not csv_exists_with_content:
+                    writer.writerow(
+                        [
+                            "timestamp_utc",
+                            "image_filename",
+                            "classification",
+                            "classification_confidence",
+                            "handoff_probability",
+                        ]
+                    )
+
+                writer.writerow(
+                    [
+                        now_utc.isoformat(),
+                        filename,
+                        classification,
+                        f"{confidence:.6f}",
+                        f"{handoff_probability:.6f}",
+                    ]
+                )
+
             self.get_logger().info(
-                f"Saved visualization image: {output_path}"
+                "Recorded saved-frame P(handoff)="
+                f"{handoff_probability:.6f} in "
+                f"{self.viz_confidence_csv_path}"
+            )
+
+        except Exception as exc:
+            self.get_logger().warning(
+                "Saved visualization image, but failed to append its "
+                f"confidence to CSV: {type(exc).__name__}: {exc}"
             )
 
     @staticmethod
