@@ -88,12 +88,13 @@ class HandoffDetector:
         reject_back_facing=True,
         back_facing_min_torso_ratio=0.15,
         reject_side_without_forward_wrist=True,
-        side_facing_max_torso_ratio=0.30,
-        side_shoulder_depth_fraction=0.10,
-        side_wrist_forward_depth_fraction=0.06,
-        side_wrist_beyond_elbow_depth_fraction=0.02,
+        side_facing_max_torso_ratio=0.45,
+        side_shoulder_depth_fraction=0.06,
+        side_wrist_forward_depth_fraction=0.10,
+        side_wrist_beyond_elbow_depth_fraction=0.04,
+        side_max_probability_penalty=0.45,
+        side_correction_min_raw_probability=0.50,
     ):
-
         self.features_type = features_type
         self.threshold = float(threshold)
         self.normalize_keypoints = bool(normalize_keypoints)
@@ -115,9 +116,11 @@ class HandoffDetector:
                 "back_facing_min_torso_ratio must be >= 0.0."
             )
 
-        # Optional deployment-only side-view safeguard. A clearly side-on
-        # person is allowed through only when at least one wrist is
-        # sufficiently closer to the camera than the shoulder midpoint.
+        # Optional deployment-only side-view correction. This used to be a
+        # hard gate that rejected a frame whenever a side-facing person did
+        # not exceed fixed wrist-depth thresholds. The legacy enable flag is
+        # retained for compatibility, but now enables a SOFT probability
+        # correction applied only after TabM produces its raw probability.
         self.reject_side_without_forward_wrist = bool(
             reject_side_without_forward_wrist
         )
@@ -133,26 +136,49 @@ class HandoffDetector:
         self.side_wrist_beyond_elbow_depth_fraction = float(
             side_wrist_beyond_elbow_depth_fraction
         )
+        self.side_max_probability_penalty = float(
+            side_max_probability_penalty
+        )
+        self.side_correction_min_raw_probability = float(
+            side_correction_min_raw_probability
+        )
 
-        if self.side_facing_max_torso_ratio < 0.0:
+        if self.side_facing_max_torso_ratio <= 0.0:
             raise ValueError(
-                "side_facing_max_torso_ratio must be >= 0.0."
+                "side_facing_max_torso_ratio must be > 0.0."
+            )
+        if self.side_shoulder_depth_fraction <= 0.0:
+            raise ValueError(
+                "side_shoulder_depth_fraction must be > 0.0."
+            )
+        if self.side_wrist_forward_depth_fraction <= 0.0:
+            raise ValueError(
+                "side_wrist_forward_depth_fraction must be > 0.0."
+            )
+        if self.side_wrist_beyond_elbow_depth_fraction <= 0.0:
+            raise ValueError(
+                "side_wrist_beyond_elbow_depth_fraction must be > 0.0."
+            )
+        if not 0.0 <= self.side_max_probability_penalty <= 1.0:
+            raise ValueError(
+                "side_max_probability_penalty must be in [0.0, 1.0]."
+            )
+        if not 0.0 <= self.side_correction_min_raw_probability <= 1.0:
+            raise ValueError(
+                "side_correction_min_raw_probability must be in [0.0, 1.0]."
             )
 
-        if self.side_shoulder_depth_fraction < 0.0:
-            raise ValueError(
-                "side_shoulder_depth_fraction must be >= 0.0."
-            )
-
-        if self.side_wrist_forward_depth_fraction < 0.0:
-            raise ValueError(
-                "side_wrist_forward_depth_fraction must be >= 0.0."
-            )
-
-        if self.side_wrist_beyond_elbow_depth_fraction < 0.0:
-            raise ValueError(
-                "side_wrist_beyond_elbow_depth_fraction must be >= 0.0."
-            )
+        # Diagnostics from the latest successful model prediction.
+        self.last_raw_handoff_probability = None
+        self.last_adjusted_handoff_probability = None
+        self.last_side_score = 0.0
+        self.last_presentation_score = 1.0
+        self.last_side_probability_penalty = 0.0
+        self._side_metadata_for_last_features = {
+            "side_score": 0.0,
+            "presentation_score": 1.0,
+            "valid": False,
+        }
 
         # Keep RTMPose crop generation identical to the updated training
         # pipeline. The full-frame RTMPose pass uses the normal detector
@@ -468,108 +494,71 @@ class HandoffDetector:
             and hip_back_ratio >= min_ratio
         )
 
-    def _is_side_facing(
+    def _side_facing_score_2d(
         self,
         person,
     ):
-        """
-        Return True when the shoulders look strongly side-on in 2D.
-
-        This intentionally does NOT require hip keypoints. Side views often
-        make one or both hips weak/occluded, which previously caused the
-        side-view safeguard to be bypassed.
-
-        A second, independent depth-based side test is applied later after
-        shoulder depths have been sampled.
-        """
+        """Return a continuous 0..1 side-view score from 2D shoulders."""
         if not self.reject_side_without_forward_wrist:
-            return False
+            return 0.0
 
         keypoints = np.asarray(
             person.get("keypoints", []),
             dtype=np.float32,
         )
-
         if (
             keypoints.ndim != 2
             or keypoints.shape[0] < 7
             or keypoints.shape[1] < 2
         ):
-            return False
+            return 0.0
 
         left_shoulder = keypoints[5]
         right_shoulder = keypoints[6]
-
         shoulder_xy = np.stack(
-            [
-                left_shoulder[:2],
-                right_shoulder[:2],
-            ]
+            [left_shoulder[:2], right_shoulder[:2]]
         )
-
         if not np.isfinite(shoulder_xy).all():
-            return False
+            return 0.0
 
         if keypoints.shape[1] >= 3:
-            confidence_threshold = (
-                self.person_presence_confidence
-            )
-
+            confidence_threshold = self.person_presence_confidence
             shoulder_scores = np.asarray(
-                [
-                    left_shoulder[2],
-                    right_shoulder[2],
-                ],
+                [left_shoulder[2], right_shoulder[2]],
                 dtype=np.float32,
             )
-
             if not np.isfinite(shoulder_scores).all():
-                return False
+                return 0.0
+            if np.any(shoulder_scores < confidence_threshold):
+                return 0.0
 
-            if np.any(
-                shoulder_scores < confidence_threshold
-            ):
-                return False
-
-        # Use the vertical size of the detected upper body as a scale.
-        # This avoids depending on hip confidence.
         upper_body_xy = keypoints[5:11, :2]
         valid = np.isfinite(upper_body_xy).all(axis=1)
         valid &= ~np.all(upper_body_xy == 0, axis=1)
-
         if keypoints.shape[1] >= 3:
             upper_scores = keypoints[5:11, 2]
             valid &= np.isfinite(upper_scores)
-            valid &= (
-                upper_scores >= self.keypoint_confidence
-            )
-
+            valid &= upper_scores >= self.keypoint_confidence
         if int(np.count_nonzero(valid)) < 4:
-            return False
+            return 0.0
 
         valid_xy = upper_body_xy[valid]
         upper_body_height = float(
-            np.max(valid_xy[:, 1])
-            - np.min(valid_xy[:, 1])
+            np.max(valid_xy[:, 1]) - np.min(valid_xy[:, 1])
         )
-
         if upper_body_height <= 1e-6:
-            return False
+            return 0.0
 
         shoulder_width_ratio = (
-            abs(
-                float(
-                    left_shoulder[0]
-                    - right_shoulder[0]
-                )
-            )
+            abs(float(left_shoulder[0] - right_shoulder[0]))
             / upper_body_height
         )
-
-        return (
+        # The former hard threshold is now the half-score point.
+        score = 1.0 - (
             shoulder_width_ratio
-            <= self.side_facing_max_torso_ratio
+            / (2.0 * self.side_facing_max_torso_ratio)
         )
+        return float(np.clip(score, 0.0, 1.0))
 
     def _crop_images(
         self,
@@ -814,10 +803,8 @@ class HandoffDetector:
         if self._is_facing_away(people[0]):
             return None
 
-        # A strong side view is not rejected automatically. Instead, after
-        # depth lookup below, it must show evidence that at least one wrist
-        # is actually extended toward the camera.
-        side_facing = self._is_side_facing(
+        # Continuous 2D side-view evidence. This never rejects the frame.
+        side_score_2d = self._side_facing_score_2d(
             people[0]
         )
 
@@ -879,178 +866,138 @@ class HandoffDetector:
             )
 
         # ---------------------------------------------------------
-        # Side-view wrist-depth safeguard
+        # Continuous side-view / arm-presentation evidence
         # ---------------------------------------------------------
+        # This section no longer rejects frames. It only computes evidence
+        # for a soft post-TabM correction.
+        side_score = 0.0
+        presentation_score = 1.0
+        side_correction_valid = False
+
         if self.reject_side_without_forward_wrist:
-            # relative_joint_depths corresponds to COCO joints 5..10:
-            #   0,1 = shoulders
-            #   2,3 = elbows
-            #   4,5 = wrists
-            #
-            # First add a depth-based side-view cue. In a true side view,
-            # the shoulder line points substantially into/out of the image,
-            # so one shoulder is often noticeably closer to the camera.
-            left_shoulder_relative_depth = float(
-                relative_joint_depths[0]
-            )
-            right_shoulder_relative_depth = float(
-                relative_joint_depths[1]
-            )
+            left_shoulder_relative_depth = float(relative_joint_depths[0])
+            right_shoulder_relative_depth = float(relative_joint_depths[1])
+            left_elbow_relative_depth = float(relative_joint_depths[2])
+            right_elbow_relative_depth = float(relative_joint_depths[3])
+            left_wrist_relative_depth = float(relative_joint_depths[4])
+            right_wrist_relative_depth = float(relative_joint_depths[5])
 
             shoulder_depth_difference = abs(
                 left_shoulder_relative_depth
                 - right_shoulder_relative_depth
             )
-
-            side_facing_by_depth = (
+            shoulder_depth_fraction = (
                 shoulder_depth_difference
-                >= (
-                    self.side_shoulder_depth_fraction
-                    * shoulder_midpoint_depth
+                / max(float(shoulder_midpoint_depth), 1e-6)
+            )
+            side_score_depth = float(
+                np.clip(
+                    shoulder_depth_fraction
+                    / (2.0 * self.side_shoulder_depth_fraction),
+                    0.0,
+                    1.0,
                 )
             )
 
-            side_facing = (
-                side_facing
-                or side_facing_by_depth
+            # Unlike the previous OR, both independent side-view cues must
+            # agree before the correction becomes strong.
+            side_score = float(
+                np.clip(
+                    side_score_2d * side_score_depth,
+                    0.0,
+                    1.0,
+                )
             )
 
-            if side_facing:
-                left_elbow_relative_depth = float(
-                    relative_joint_depths[2]
-                )
-                right_elbow_relative_depth = float(
-                    relative_joint_depths[3]
-                )
-                left_wrist_relative_depth = float(
-                    relative_joint_depths[4]
-                )
-                right_wrist_relative_depth = float(
-                    relative_joint_depths[5]
-                )
+            nearest_shoulder_relative_depth = min(
+                left_shoulder_relative_depth,
+                right_shoulder_relative_depth,
+            )
+            nearest_shoulder_depth = (
+                shoulder_midpoint_depth
+                + nearest_shoulder_relative_depth
+            )
+            depth_scale = max(float(nearest_shoulder_depth), 1e-6)
 
-                # Compare the wrists against the NEAREST shoulder rather
-                # than the average shoulder depth. This prevents a neutral
-                # side pose from appearing artificially "forward" simply
-                # because the far shoulder pulls the midpoint backward.
-                nearest_shoulder_relative_depth = min(
-                    left_shoulder_relative_depth,
-                    right_shoulder_relative_depth,
-                )
-
-                nearest_shoulder_depth = (
-                    shoulder_midpoint_depth
-                    + nearest_shoulder_relative_depth
-                )
-
-                required_forward_depth = (
-                    self.side_wrist_forward_depth_fraction
-                    * nearest_shoulder_depth
-                )
-
-                required_wrist_relative_depth = (
-                    nearest_shoulder_relative_depth
-                    - required_forward_depth
-                )
-
-                # In addition to being forward of the shoulders, require the
-                # wrist to be meaningfully closer to the camera than the
-                # elbow on the SAME arm. This rejects side-on neutral/hanging
-                # arm poses whose wrist happens to be somewhat forward simply
-                # because of body orientation.
-                required_wrist_beyond_elbow_depth = (
-                    self.side_wrist_beyond_elbow_depth_fraction
-                    * nearest_shoulder_depth
-                )
-
-                if keypoints.shape[1] >= 3:
-                    left_elbow_score = float(
-                        keypoints[7, 2]
-                    )
-                    right_elbow_score = float(
-                        keypoints[8, 2]
-                    )
-                    left_wrist_score = float(
-                        keypoints[9, 2]
-                    )
-                    right_wrist_score = float(
-                        keypoints[10, 2]
-                    )
-
-                    confidence_threshold = (
-                        self.person_presence_confidence
-                    )
-
-                    left_elbow_reliable = (
-                        np.isfinite(left_elbow_score)
-                        and left_elbow_score
-                        >= confidence_threshold
-                    )
-                    right_elbow_reliable = (
-                        np.isfinite(right_elbow_score)
-                        and right_elbow_score
-                        >= confidence_threshold
-                    )
-                    left_wrist_reliable = (
-                        np.isfinite(left_wrist_score)
-                        and left_wrist_score
-                        >= confidence_threshold
-                    )
-                    right_wrist_reliable = (
-                        np.isfinite(right_wrist_score)
-                        and right_wrist_score
-                        >= confidence_threshold
-                    )
-                else:
-                    left_elbow_reliable = True
-                    right_elbow_reliable = True
-                    left_wrist_reliable = True
-                    right_wrist_reliable = True
-
-                # A side-view handoff must have at least one arm for which
-                # both the elbow and wrist are trustworthy.
+            if keypoints.shape[1] >= 3:
+                confidence_threshold = self.person_presence_confidence
+                left_elbow_score = float(keypoints[7, 2])
+                right_elbow_score = float(keypoints[8, 2])
+                left_wrist_score = float(keypoints[9, 2])
+                right_wrist_score = float(keypoints[10, 2])
                 left_arm_reliable = (
-                    left_elbow_reliable
-                    and left_wrist_reliable
+                    np.isfinite(left_elbow_score)
+                    and np.isfinite(left_wrist_score)
+                    and left_elbow_score >= confidence_threshold
+                    and left_wrist_score >= confidence_threshold
                 )
                 right_arm_reliable = (
-                    right_elbow_reliable
-                    and right_wrist_reliable
+                    np.isfinite(right_elbow_score)
+                    and np.isfinite(right_wrist_score)
+                    and right_elbow_score >= confidence_threshold
+                    and right_wrist_score >= confidence_threshold
                 )
+            else:
+                left_arm_reliable = True
+                right_arm_reliable = True
 
-                if not (
-                    left_arm_reliable
-                    or right_arm_reliable
-                ):
-                    return None
+            def _arm_presentation_score(
+                elbow_relative_depth,
+                wrist_relative_depth,
+            ):
+                shoulder_forward_fraction = max(
+                    0.0,
+                    (nearest_shoulder_relative_depth - wrist_relative_depth)
+                    / depth_scale,
+                )
+                elbow_forward_fraction = max(
+                    0.0,
+                    (elbow_relative_depth - wrist_relative_depth)
+                    / depth_scale,
+                )
+                shoulder_component = float(
+                    np.clip(
+                        shoulder_forward_fraction
+                        / self.side_wrist_forward_depth_fraction,
+                        0.0,
+                        1.0,
+                    )
+                )
+                elbow_component = float(
+                    np.clip(
+                        elbow_forward_fraction
+                        / self.side_wrist_beyond_elbow_depth_fraction,
+                        0.0,
+                        1.0,
+                    )
+                )
+                # Weighted evidence replaces the old hard logical AND.
+                return 0.70 * shoulder_component + 0.30 * elbow_component
 
-                left_wrist_forward = (
-                    left_arm_reliable
-                    and left_wrist_relative_depth
-                    <= required_wrist_relative_depth
-                    and left_wrist_relative_depth
-                    <= (
-                        left_elbow_relative_depth
-                        - required_wrist_beyond_elbow_depth
+            arm_scores = []
+            if left_arm_reliable:
+                arm_scores.append(
+                    _arm_presentation_score(
+                        left_elbow_relative_depth,
+                        left_wrist_relative_depth,
+                    )
+                )
+            if right_arm_reliable:
+                arm_scores.append(
+                    _arm_presentation_score(
+                        right_elbow_relative_depth,
+                        right_wrist_relative_depth,
                     )
                 )
 
-                right_wrist_forward = (
-                    right_arm_reliable
-                    and right_wrist_relative_depth
-                    <= required_wrist_relative_depth
-                    and right_wrist_relative_depth
-                    <= (
-                        right_elbow_relative_depth
-                        - required_wrist_beyond_elbow_depth
-                    )
-                )
-
-                if not (
-                    left_wrist_forward
-                    or right_wrist_forward
-                ):
-                    return None
+            if arm_scores:
+                presentation_score = float(max(arm_scores))
+                side_correction_valid = True
+            else:
+                # Missing arm keypoints are uncertainty, not negative evidence.
+                side_score = 0.0
+                presentation_score = 1.0
+                side_correction_valid = False
 
         # ---------------------------------------------------------
         # Normalize 2D keypoints
@@ -1124,6 +1071,12 @@ class HandoffDetector:
                 f"{features.size}."
             )
 
+        self._side_metadata_for_last_features = {
+            "side_score": float(side_score),
+            "presentation_score": float(presentation_score),
+            "valid": bool(side_correction_valid),
+        }
+
         return features
 
     def predict(
@@ -1151,18 +1104,30 @@ class HandoffDetector:
                 Confidence in the returned class,
                 from 0.0 to 1.0.
         """
+        # Reset transient correction metadata so an early return from feature
+        # extraction can never reuse geometry from the previous frame.
+        self._side_metadata_for_last_features = {
+            "side_score": 0.0,
+            "presentation_score": 1.0,
+            "valid": False,
+        }
+
         features = self._extract_features(
             rgb_image,
             depth_image,
         )
 
-        # No sufficiently confident person, a clear back-facing person,
-        # or a side-facing person without forward wrist extension means
-        # a handoff is rejected. Return a normal negative prediction
-        # so ROS publishes a fresh state instead of retaining the previous
-        # classification after an exception.
+        # Missing/invalid person and clear back-facing cases remain normal
+        # negatives. Side views are no longer force-rejected.
         if features is None:
+            self.last_raw_handoff_probability = None
+            self.last_adjusted_handoff_probability = None
+            self.last_side_score = 0.0
+            self.last_presentation_score = 1.0
+            self.last_side_probability_penalty = 0.0
             return "not_handoff", 1.0
+
+        side_metadata = self._side_metadata_for_last_features
 
         input_tensor = (
             torch.from_numpy(features)
@@ -1202,13 +1167,53 @@ class HandoffDetector:
                 .item()
             )
 
+        raw_handoff_probability = handoff_probability
+
+        side_score = float(side_metadata.get("side_score", 0.0))
+        presentation_score = float(
+            side_metadata.get("presentation_score", 1.0)
+        )
+        side_correction_valid = bool(side_metadata.get("valid", False))
+        side_probability_penalty = 0.0
+
+        # Correct only predictions for which TabM itself is leaning positive.
+        if (
+            self.reject_side_without_forward_wrist
+            and side_correction_valid
+            and raw_handoff_probability
+            >= self.side_correction_min_raw_probability
+        ):
+            suspicious_side_evidence = (
+                side_score * (1.0 - presentation_score)
+            )
+            side_probability_penalty = float(
+                np.clip(
+                    self.side_max_probability_penalty
+                    * suspicious_side_evidence,
+                    0.0,
+                    self.side_max_probability_penalty,
+                )
+            )
+            handoff_probability = (
+                raw_handoff_probability
+                * (1.0 - side_probability_penalty)
+            )
+
+        handoff_probability = float(
+            np.clip(handoff_probability, 0.0, 1.0)
+        )
+
+        self.last_raw_handoff_probability = float(raw_handoff_probability)
+        self.last_adjusted_handoff_probability = float(handoff_probability)
+        self.last_side_score = float(side_score)
+        self.last_presentation_score = float(presentation_score)
+        self.last_side_probability_penalty = float(side_probability_penalty)
+
         if handoff_probability >= self.threshold:
             classification = "handoff"
             confidence = handoff_probability
         else:
             classification = "not_handoff"
-            confidence = (
-                1.0 - handoff_probability
-            )
+            confidence = 1.0 - handoff_probability
 
         return classification, confidence
