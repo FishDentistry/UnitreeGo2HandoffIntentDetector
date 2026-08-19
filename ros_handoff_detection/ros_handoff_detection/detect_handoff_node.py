@@ -13,6 +13,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
+
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32, String
@@ -92,6 +95,40 @@ class HandoffInferenceNode(Node):
         self.declare_parameter(
             "save_viz_images",
             False,
+        )
+
+        # ---------------------------------------------------------
+        # Person-presence gating / Nav2 slowdown
+        # ---------------------------------------------------------
+        # RTMPose person presence is checked before the handoff model.
+        # When no valid person is present, detector.predict() is not called.
+        self.declare_parameter(
+            "person_absence_grace_seconds",
+            0.50,
+        )
+
+        # While a valid person is visible, reduce the Nav2 DWB controller's
+        # configured translational speed limits to this fraction of their
+        # normal values. 0.50 means 50% of normal patrol speed.
+        self.declare_parameter(
+            "person_slowdown_fraction",
+            0.50,
+        )
+
+        # Standard Nav2 controller-server parameter service and DWB plugin
+        # parameter names. These defaults match the common FollowPath DWB
+        # configuration and remain configurable for a different setup.
+        self.declare_parameter(
+            "nav2_controller_node",
+            "/controller_server",
+        )
+        self.declare_parameter(
+            "nav2_max_vel_x_parameter",
+            "FollowPath.max_vel_x",
+        )
+        self.declare_parameter(
+            "nav2_max_speed_xy_parameter",
+            "FollowPath.max_speed_xy",
         )
 
         self.declare_parameter(
@@ -253,6 +290,39 @@ class HandoffInferenceNode(Node):
             .bool_value
         )
 
+        person_absence_grace_seconds = (
+            self.get_parameter("person_absence_grace_seconds")
+            .get_parameter_value()
+            .double_value
+        )
+
+        person_slowdown_fraction = (
+            self.get_parameter("person_slowdown_fraction")
+            .get_parameter_value()
+            .double_value
+        )
+
+        nav2_controller_node = (
+            self.get_parameter("nav2_controller_node")
+            .get_parameter_value()
+            .string_value
+            .strip()
+        )
+
+        nav2_max_vel_x_parameter = (
+            self.get_parameter("nav2_max_vel_x_parameter")
+            .get_parameter_value()
+            .string_value
+            .strip()
+        )
+
+        nav2_max_speed_xy_parameter = (
+            self.get_parameter("nav2_max_speed_xy_parameter")
+            .get_parameter_value()
+            .string_value
+            .strip()
+        )
+
         servo_port = (
             self.get_parameter("servo_port")
             .get_parameter_value()
@@ -389,6 +459,25 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
+            "  person_absence_grace_seconds="
+            f"{person_absence_grace_seconds}"
+        )
+
+        self.get_logger().info(
+            f"  person_slowdown_fraction={person_slowdown_fraction}"
+        )
+
+        self.get_logger().info(
+            f"  nav2_controller_node={nav2_controller_node}"
+        )
+
+        self.get_logger().info(
+            "  nav2_speed_parameters="
+            f"[{nav2_max_vel_x_parameter}, "
+            f"{nav2_max_speed_xy_parameter}]"
+        )
+
+        self.get_logger().info(
             f"  servo_port={servo_port}"
         )
 
@@ -464,6 +553,35 @@ class HandoffInferenceNode(Node):
         self.debug = bool(debug)
         self.output_window_name = "Handoff Classification"
 
+        # Person-presence gating and slowdown state. The current-frame
+        # presence decision gates handoff inference. Slowdown release uses a
+        # short grace interval so a one-frame RTMPose miss does not cause the
+        # robot to jump immediately back to full speed.
+        self.person_absence_grace_seconds = float(
+            person_absence_grace_seconds
+        )
+        self.person_slowdown_fraction = float(
+            person_slowdown_fraction
+        )
+        self.nav2_controller_node = str(
+            nav2_controller_node or "/controller_server"
+        )
+        if not self.nav2_controller_node.startswith("/"):
+            self.nav2_controller_node = "/" + self.nav2_controller_node
+
+        self.nav2_speed_parameter_names = [
+            str(nav2_max_vel_x_parameter),
+            str(nav2_max_speed_xy_parameter),
+        ]
+        self._last_person_seen_monotonic = None
+        self._person_slowdown_desired = False
+        self._person_slowdown_applied = False
+        self._controller_speed_initialized = False
+        self._controller_speed_get_inflight = False
+        self._controller_speed_set_inflight = False
+        self._controller_normal_speeds = {}
+        self._controller_speed_service_wait_logged = False
+
         # Visualization-image saving is available whenever explicitly enabled
         # and the visualization window is active. Debug mode is not required.
         self.save_viz_images_requested = bool(save_viz_images)
@@ -536,6 +654,21 @@ class HandoffInferenceNode(Node):
         if self.handoff_confirmation_frames < 1:
             raise ValueError(
                 "handoff_confirmation_frames must be >= 1."
+            )
+
+        if self.person_absence_grace_seconds < 0.0:
+            raise ValueError(
+                "person_absence_grace_seconds must be >= 0."
+            )
+
+        if not (0.0 < self.person_slowdown_fraction <= 1.0):
+            raise ValueError(
+                "person_slowdown_fraction must satisfy 0 < value <= 1."
+            )
+
+        if not any(self.nav2_speed_parameter_names):
+            raise ValueError(
+                "At least one Nav2 speed parameter name must be non-empty."
             )
 
         if not (
@@ -717,6 +850,28 @@ class HandoffInferenceNode(Node):
         )
 
         # ---------------------------------------------------------
+        # Nav2 controller speed-parameter clients
+        # ---------------------------------------------------------
+        # This is compatible with the normal ROS 2 parameter services and
+        # does not require changing the patrol node. The node first reads the
+        # controller's configured normal speeds, then scales/restores those
+        # exact values as person presence changes.
+        controller_base = self.nav2_controller_node.rstrip("/")
+        self._controller_get_parameters_client = self.create_client(
+            GetParameters,
+            controller_base + "/get_parameters",
+        )
+        self._controller_set_parameters_client = self.create_client(
+            SetParameters,
+            controller_base + "/set_parameters",
+        )
+
+        self._controller_speed_init_timer = self.create_timer(
+            1.0,
+            self._try_initialize_controller_speed_limits,
+        )
+
+        # ---------------------------------------------------------
         # ROS image conversion
         # ---------------------------------------------------------
         self.get_logger().info(
@@ -842,22 +997,43 @@ class HandoffInferenceNode(Node):
                 desired_encoding="rgb8",
             )
 
-            # Preserve native depth representation,
-            # e.g. uint16 Z16.
+            # Preserve native depth representation, e.g. uint16 Z16.
             depth_image = self.bridge.imgmsg_to_cv2(
                 depth_msg,
                 desired_encoding="passthrough",
             )
 
             # -----------------------------------------------------
-            # Inference
+            # Person-presence gate
             # -----------------------------------------------------
-            classification, confidence = (
-                self.detector.predict(
+            # Do a lightweight RTMPose pass first. This intentionally uses
+            # the detector wrapper's existing keypoint detector and existing
+            # _is_valid_person() validator without changing the wrapper.
+            person_present = self._person_present_in_frame(rgb_image)
+            self._update_person_slowdown_state(person_present)
+
+            # -----------------------------------------------------
+            # Handoff inference ONLY when a valid person is present
+            # -----------------------------------------------------
+            if person_present:
+                classification, confidence = self.detector.predict(
                     rgb_image,
                     depth_image,
                 )
-            )
+
+                handoff_probability = (
+                    self._handoff_probability_from_result(
+                        classification,
+                        float(confidence),
+                    )
+                )
+            else:
+                # Publish a fresh explicit negative instead of allowing a
+                # previous handoff result to remain visible downstream. TabM
+                # (and the rest of detector.predict()) is not run here.
+                classification = "not_handoff"
+                confidence = 1.0
+                handoff_probability = 0.0
 
             # -----------------------------------------------------
             # Publish result
@@ -868,42 +1044,36 @@ class HandoffInferenceNode(Node):
             confidence_msg = Float32()
             confidence_msg.data = float(confidence)
 
-            self.classification_pub.publish(
-                classification_msg
-            )
+            self.classification_pub.publish(classification_msg)
+            self.confidence_pub.publish(confidence_msg)
 
-            self.confidence_pub.publish(
-                confidence_msg
-            )
-
-            self.get_logger().info(
-                f"[{self.model_type.upper()}] "
-                f"{classification} "
-                f"(confidence={confidence:.3f})"
-            )
-
-            # The detector wrapper returns confidence in whichever class
-            # it selected. Convert that back to P(handoff) so a negative
-            # result with confidence 0.80 correctly means P(handoff)=0.20.
-            handoff_probability = self._handoff_probability_from_result(
-                classification,
-                float(confidence),
-            )
+            if person_present:
+                self.get_logger().info(
+                    f"[{self.model_type.upper()}] "
+                    f"{classification} "
+                    f"(confidence={confidence:.3f}, "
+                    f"P(handoff)={handoff_probability:.3f})"
+                )
+            else:
+                self.get_logger().info(
+                    "No valid person detected; handoff classifier skipped."
+                )
 
             # -----------------------------------------------------
             # Debounce the committed handoff decision
             # -----------------------------------------------------
-            # The classifier output/confidence published above remain raw so
-            # they can still be inspected diagnostically. Only the committed
-            # handoff event is debounced.
             raw_handoff_stop_condition = (
-                classification == "handoff"
+                person_present
+                and classification == "handoff"
                 and handoff_probability >= self.handoff_stop_threshold
             )
 
             if raw_handoff_stop_condition:
                 self._handoff_confirmation_count += 1
             else:
+                # This explicitly resets across any person-tracking loss, so
+                # two positive frames separated by a missing-person frame do
+                # not count as consecutive evidence.
                 self._handoff_confirmation_count = 0
 
             handoff_stop_condition = (
@@ -915,13 +1085,15 @@ class HandoffInferenceNode(Node):
                 self.aborted_handoff_logging_enabled
                 or self.robot_reaction_time_logging_enabled
             ):
+                # P(handoff)=0 while no person is present lets any incipient
+                # attempt naturally clear through the existing hysteresis.
                 self._update_aborted_handoff_attempt_tracking(
                     handoff_probability,
                     handoff_committed=handoff_stop_condition,
                 )
 
             # -----------------------------------------------------
-            # Optional output window
+            # Optional output window + existing S/Q key behavior
             # -----------------------------------------------------
             if self.show_output_window:
                 display_image = cv2.cvtColor(
@@ -929,10 +1101,13 @@ class HandoffInferenceNode(Node):
                     cv2.COLOR_RGB2BGR,
                 )
 
-                label = (
-                    f"{classification} "
-                    f"({confidence:.3f})"
-                )
+                if person_present:
+                    label = (
+                        f"{classification} | "
+                        f"P(handoff)={handoff_probability:.3f}"
+                    )
+                else:
+                    label = "NO PERSON | handoff inference skipped"
 
                 cv2.putText(
                     display_image,
@@ -945,6 +1120,22 @@ class HandoffInferenceNode(Node):
                     cv2.LINE_AA,
                 )
 
+                speed_label = (
+                    "SLOW"
+                    if self._person_slowdown_desired
+                    else "NORMAL SPEED"
+                )
+                cv2.putText(
+                    display_image,
+                    speed_label,
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
                 cv2.imshow(
                     self.output_window_name,
                     display_image,
@@ -952,12 +1143,12 @@ class HandoffInferenceNode(Node):
 
                 key = cv2.waitKey(1) & 0xFF
 
-                # Press Q/q to stop all future study-server logging while
-                # leaving inference, visualization, servo behavior, ROS
-                # publishing, and manual S-key image/CSV saving active.
+                # Existing behavior: Q/q stops future study-server logging.
                 if key in (ord("q"), ord("Q")):
                     self._stop_server_logging()
 
+                # Existing behavior: S/s saves exactly the annotated frame
+                # being displayed and appends its P(handoff) to the CSV.
                 if (
                     self.save_viz_images
                     and key in (ord("s"), ord("S"))
@@ -972,14 +1163,8 @@ class HandoffInferenceNode(Node):
             # -----------------------------------------------------
             # Handoff interaction trigger
             # -----------------------------------------------------
-            # The robot keeps patrolling normally until the detector
-            # identifies a handoff for the configured number of consecutive
-            # frames. At that point, request that the patrol node stop and
-            # hold the stop for the same interval used by the handoff servo.
-            #
-            # Using the transition into the debounced condition prevents
-            # repeated triggering on every camera frame while the person
-            # remains in a handoff pose.
+            # Person present -> slowdown + inference. Two consecutive handoff
+            # frames at/above threshold -> existing cancel/servo interval.
             if (
                 handoff_stop_condition
                 and not self._last_handoff_stop_condition
@@ -990,18 +1175,290 @@ class HandoffInferenceNode(Node):
             self._last_handoff_stop_condition = handoff_stop_condition
 
         except Exception as exc:
+            # A failed callback must not carry positive evidence into the next
+            # frame. The slowdown itself is released only through the person
+            # absence grace logic on subsequent successful callbacks.
+            self._handoff_confirmation_count = 0
+            self._last_handoff_stop_condition = False
+
             self.get_logger().warning(
                 "Handoff inference failed "
                 f"[{self.model_type.upper()}]."
             )
-
             self.get_logger().warning(
                 f"Exception type: {type(exc).__name__}"
             )
-
             self.get_logger().warning(
                 f"Exception: {exc}"
             )
+
+    def _person_present_in_frame(self, rgb_image) -> bool:
+        """Return True when RTMPose finds at least one valid person."""
+        try:
+            # The wrapper converts incoming RGB to BGR before passing images
+            # into the same RTMPose detector, so mirror that preprocessing.
+            pose_image = cv2.cvtColor(
+                rgb_image,
+                cv2.COLOR_RGB2BGR,
+            )
+            people = self.detector.keypoint_detector.predict(pose_image)
+
+            if not people:
+                return False
+
+            validator = getattr(self.detector, "_is_valid_person", None)
+            if callable(validator):
+                return any(bool(validator(person)) for person in people)
+
+            # Defensive fallback for an older wrapper without
+            # _is_valid_person(): require a geometrically valid upper body.
+            for person in people:
+                keypoints = person.get("keypoints", [])
+                try:
+                    import numpy as np
+                    keypoints = np.asarray(keypoints, dtype=np.float32)
+                except Exception:
+                    continue
+
+                if (
+                    keypoints.ndim == 2
+                    and keypoints.shape[0] >= 11
+                    and keypoints.shape[1] >= 2
+                    and np.isfinite(keypoints[5:11, :2]).all()
+                ):
+                    return True
+
+            return False
+
+        except Exception as exc:
+            self.get_logger().warning(
+                "Person-presence RTMPose check failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    def _update_person_slowdown_state(self, person_present: bool):
+        """Apply slowdown on presence; restore speed after absence grace."""
+        now = time.monotonic()
+
+        if person_present:
+            self._last_person_seen_monotonic = now
+            self._set_person_slowdown_desired(True)
+            return
+
+        if not self._person_slowdown_desired:
+            return
+
+        if self._last_person_seen_monotonic is None:
+            self._set_person_slowdown_desired(False)
+            return
+
+        absent_for = now - self._last_person_seen_monotonic
+        if absent_for >= self.person_absence_grace_seconds:
+            self._set_person_slowdown_desired(False)
+
+    def _set_person_slowdown_desired(self, should_slow: bool):
+        """Update desired Nav2 speed state and reconcile controller params."""
+        should_slow = bool(should_slow)
+        if should_slow == self._person_slowdown_desired:
+            return
+
+        self._person_slowdown_desired = should_slow
+
+        if should_slow:
+            self.get_logger().info(
+                "Valid person detected: requesting reduced patrol speed and "
+                "enabling handoff inference."
+            )
+        else:
+            self.get_logger().info(
+                "Person no longer present: requesting normal patrol speed."
+            )
+
+        self._request_controller_speed_reconcile()
+
+    @staticmethod
+    def _parameter_value_as_float(value):
+        if value.type == ParameterType.PARAMETER_DOUBLE:
+            return float(value.double_value)
+        if value.type == ParameterType.PARAMETER_INTEGER:
+            return float(value.integer_value)
+        return None
+
+    def _try_initialize_controller_speed_limits(self):
+        """Read and cache normal Nav2 DWB speed parameters once available."""
+        if self._controller_speed_initialized:
+            if self._controller_speed_init_timer is not None:
+                self._controller_speed_init_timer.cancel()
+            return
+
+        if self._controller_speed_get_inflight:
+            return
+
+        if not self._controller_get_parameters_client.service_is_ready():
+            if not self._controller_speed_service_wait_logged:
+                self._controller_speed_service_wait_logged = True
+                self.get_logger().info(
+                    "Waiting for Nav2 controller parameter service at "
+                    f"{self.nav2_controller_node}/get_parameters ..."
+                )
+            return
+
+        self._controller_speed_service_wait_logged = False
+        self._controller_speed_get_inflight = True
+
+        request = GetParameters.Request()
+        request.names = [
+            name for name in self.nav2_speed_parameter_names if name
+        ]
+        future = self._controller_get_parameters_client.call_async(request)
+        future.add_done_callback(
+            self._controller_speed_parameters_received
+        )
+
+    def _controller_speed_parameters_received(self, future):
+        self._controller_speed_get_inflight = False
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().warning(
+                "Could not read Nav2 controller speed parameters: "
+                f"{exc}"
+            )
+            return
+
+        names = [
+            name for name in self.nav2_speed_parameter_names if name
+        ]
+        normal_speeds = {}
+
+        for name, value in zip(names, response.values):
+            numeric_value = self._parameter_value_as_float(value)
+            if numeric_value is None or numeric_value <= 0.0:
+                self.get_logger().warning(
+                    f"Nav2 speed parameter {name!r} was not a positive "
+                    "numeric value; it will not be modified."
+                )
+                continue
+            normal_speeds[name] = numeric_value
+
+        if not normal_speeds:
+            self.get_logger().error(
+                "Could not initialize person slowdown: none of the configured "
+                "Nav2 speed parameters were readable. Handoff detection will "
+                "still work, but patrol speed cannot be reduced."
+            )
+            return
+
+        self._controller_normal_speeds = normal_speeds
+        self._controller_speed_initialized = True
+
+        if self._controller_speed_init_timer is not None:
+            self._controller_speed_init_timer.cancel()
+
+        values_text = ", ".join(
+            f"{name}={value:.3f}"
+            for name, value in normal_speeds.items()
+        )
+        self.get_logger().info(
+            "Cached normal Nav2 controller speeds: " + values_text
+        )
+
+        self._request_controller_speed_reconcile()
+
+    def _request_controller_speed_reconcile(self):
+        """Set cached Nav2 speeds to normal or the configured slow fraction."""
+        if not self._controller_speed_initialized:
+            return
+        if self._controller_speed_set_inflight:
+            return
+        if (
+            self._person_slowdown_applied
+            == self._person_slowdown_desired
+        ):
+            return
+        if not self._controller_set_parameters_client.service_is_ready():
+            self.get_logger().warning(
+                "Nav2 controller set_parameters service is not ready; "
+                "cannot change patrol speed yet."
+            )
+            return
+
+        target_slow = self._person_slowdown_desired
+        scale = self.person_slowdown_fraction if target_slow else 1.0
+
+        request = SetParameters.Request()
+        request.parameters = []
+        target_values = {}
+
+        for name, normal_value in self._controller_normal_speeds.items():
+            target_value = normal_value * scale
+            target_values[name] = target_value
+            request.parameters.append(
+                Parameter(
+                    name=name,
+                    value=ParameterValue(
+                        type=ParameterType.PARAMETER_DOUBLE,
+                        double_value=float(target_value),
+                    ),
+                )
+            )
+
+        self._controller_speed_set_inflight = True
+        future = self._controller_set_parameters_client.call_async(request)
+        future.add_done_callback(
+            lambda completed_future: self._controller_speed_set_done(
+                completed_future,
+                target_slow,
+                target_values,
+            )
+        )
+
+    def _controller_speed_set_done(
+        self,
+        future,
+        target_slow: bool,
+        target_values: dict,
+    ):
+        self._controller_speed_set_inflight = False
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                "Failed to update Nav2 controller speed parameters: "
+                f"{exc}"
+            )
+            return
+
+        failures = [
+            result.reason or "parameter update rejected"
+            for result in response.results
+            if not result.successful
+        ]
+
+        if failures:
+            self.get_logger().error(
+                "Nav2 rejected person-slowdown parameter update: "
+                + "; ".join(failures)
+            )
+            return
+
+        self._person_slowdown_applied = target_slow
+        mode = "SLOW" if target_slow else "NORMAL"
+        values_text = ", ".join(
+            f"{name}={value:.3f}"
+            for name, value in target_values.items()
+        )
+        self.get_logger().info(
+            f"Nav2 patrol speed state -> {mode}: {values_text}"
+        )
+
+        # Presence can change while the asynchronous parameter request is in
+        # flight. Reconcile again immediately if the desired state changed.
+        if self._person_slowdown_applied != self._person_slowdown_desired:
+            self._request_controller_speed_reconcile()
 
     def _save_visualization_image(
         self,
@@ -1598,8 +2055,36 @@ class HandoffInferenceNode(Node):
             timer.cancel()
             self.destroy_timer(timer)
 
+    def _restore_normal_controller_speed_for_shutdown(self):
+        """Best-effort restoration of cached normal Nav2 speeds on shutdown."""
+        if not self._controller_speed_initialized:
+            return
+        if not self._controller_set_parameters_client.service_is_ready():
+            return
+
+        request = SetParameters.Request()
+        request.parameters = [
+            Parameter(
+                name=name,
+                value=ParameterValue(
+                    type=ParameterType.PARAMETER_DOUBLE,
+                    double_value=float(value),
+                ),
+            )
+            for name, value in self._controller_normal_speeds.items()
+        ]
+
+        try:
+            self._controller_set_parameters_client.call_async(request)
+        except Exception as exc:
+            self.get_logger().warning(
+                "Could not request normal Nav2 speed during shutdown: "
+                f"{exc}"
+            )
+
     def destroy_node(self):
-        """Safely return the servo to 0 and close the serial port."""
+        """Safely restore speed/servo state and close resources."""
+        self._restore_normal_controller_speed_for_shutdown()
         if self.show_output_window:
             try:
                 cv2.destroyWindow(self.output_window_name)
