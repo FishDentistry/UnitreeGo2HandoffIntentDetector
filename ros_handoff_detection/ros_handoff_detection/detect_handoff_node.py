@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -57,7 +58,7 @@ class HandoffInferenceNode(Node):
         # frame confirmation required before patrol is paused.
         self.declare_parameter(
             "threshold",
-            0.5,
+            0.6,
         )
 
         # Require this many consecutive frames at/above the committed
@@ -81,6 +82,14 @@ class HandoffInferenceNode(Node):
 
         self.declare_parameter(
             "debug",
+            False,
+        )
+
+        # When enabled, annotated frames from the visualization window are
+        # saved to confidence-binned folders. Saving is only active when
+        # debug=True and show_output_window=True as well.
+        self.declare_parameter(
+            "save_viz_images",
             False,
         )
 
@@ -237,6 +246,12 @@ class HandoffInferenceNode(Node):
             .bool_value
         )
 
+        save_viz_images = (
+            self.get_parameter("save_viz_images")
+            .get_parameter_value()
+            .bool_value
+        )
+
         servo_port = (
             self.get_parameter("servo_port")
             .get_parameter_value()
@@ -365,8 +380,12 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
-                    f"  debug={debug}"
-                )
+            f"  debug={debug}"
+        )
+
+        self.get_logger().info(
+            f"  save_viz_images={save_viz_images}"
+        )
 
         self.get_logger().info(
             f"  servo_port={servo_port}"
@@ -443,6 +462,35 @@ class HandoffInferenceNode(Node):
         self.show_output_window = bool(show_output_window)
         self.debug = bool(debug)
         self.output_window_name = "Handoff Classification"
+
+        # Visualization-image saving is deliberately restricted to debug mode
+        # with the visualization window enabled, so this cannot silently write
+        # images during normal deployment.
+        self.save_viz_images_requested = bool(save_viz_images)
+        self.save_viz_images = (
+            self.save_viz_images_requested
+            and self.debug
+            and self.show_output_window
+        )
+        self.viz_image_save_root = (
+            Path.cwd() / "handoff_viz_images"
+        ).resolve()
+        self._viz_saved_frame_count = 0
+
+        if self.save_viz_images:
+            self.viz_image_save_root.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            self.get_logger().info(
+                "Annotated visualization image saving enabled: "
+                f"{self.viz_image_save_root}"
+            )
+        elif self.save_viz_images_requested:
+            self.get_logger().warning(
+                "save_viz_images=True was requested, but image saving is "
+                "disabled unless debug=True and show_output_window=True."
+            )
 
         # ---------------------------------------------------------
         # Aborted-handoff logging configuration/state
@@ -894,6 +942,13 @@ class HandoffInferenceNode(Node):
                     cv2.LINE_AA,
                 )
 
+                if self.save_viz_images:
+                    self._save_visualization_image(
+                        display_image=display_image,
+                        classification=classification,
+                        confidence=float(confidence),
+                    )
+
                 cv2.imshow(
                     self.output_window_name,
                     display_image,
@@ -932,6 +987,39 @@ class HandoffInferenceNode(Node):
 
             self.get_logger().warning(
                 f"Exception: {exc}"
+            )
+
+    def _save_visualization_image(
+        self,
+        display_image,
+        classification: str,
+        confidence: float,
+    ):
+        """Save one annotated visualization frame into its 0.05 confidence bin."""
+        confidence = max(0.0, min(1.0, float(confidence)))
+
+        # Round to the nearest 0.05 using conventional half-up behavior.
+        # Examples: 0.623 -> 0.60, 0.628 -> 0.65.
+        confidence_bin = int(confidence * 20.0 + 0.5) / 20.0
+        confidence_folder = self.viz_image_save_root / f"{confidence_bin:.2f}"
+        confidence_folder.mkdir(parents=True, exist_ok=True)
+
+        self._viz_saved_frame_count += 1
+        timestamp = datetime.now(timezone.utc).strftime(
+            "%Y%m%dT%H%M%S_%fZ"
+        )
+        safe_classification = str(classification).replace("/", "_")
+        filename = (
+            f"{timestamp}_"
+            f"frame_{self._viz_saved_frame_count:08d}_"
+            f"{safe_classification}_"
+            f"confidence_{confidence:.3f}.png"
+        )
+        output_path = confidence_folder / filename
+
+        if not cv2.imwrite(str(output_path), display_image):
+            self.get_logger().warning(
+                f"Failed to save visualization image: {output_path}"
             )
 
     @staticmethod
