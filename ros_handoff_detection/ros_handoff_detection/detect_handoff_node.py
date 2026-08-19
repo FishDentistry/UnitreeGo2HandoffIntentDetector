@@ -85,8 +85,8 @@ class HandoffInferenceNode(Node):
             False,
         )
 
-        # When enabled, annotated frames from the visualization window are
-        # saved to confidence-binned folders. Saving is only active when
+        # When enabled, pressing S while the visualization window is active
+        # saves the current annotated frame. Saving is only active when
         # debug=True and show_output_window=True as well.
         self.declare_parameter(
             "save_viz_images",
@@ -483,7 +483,8 @@ class HandoffInferenceNode(Node):
                 exist_ok=True,
             )
             self.get_logger().info(
-                "Annotated visualization image saving enabled: "
+                "Annotated visualization image saving enabled. "
+                "Press S in the visualization window to save the current frame: "
                 f"{self.viz_image_save_root}"
             )
         elif self.save_viz_images_requested:
@@ -942,18 +943,22 @@ class HandoffInferenceNode(Node):
                     cv2.LINE_AA,
                 )
 
-                if self.save_viz_images:
+                cv2.imshow(
+                    self.output_window_name,
+                    display_image,
+                )
+
+                key = cv2.waitKey(1) & 0xFF
+
+                if (
+                    self.save_viz_images
+                    and key in (ord("s"), ord("S"))
+                ):
                     self._save_visualization_image(
                         display_image=display_image,
                         classification=classification,
                         confidence=float(confidence),
                     )
-
-                cv2.imshow(
-                    self.output_window_name,
-                    display_image,
-                )
-                cv2.waitKey(1)
 
             # -----------------------------------------------------
             # Handoff interaction trigger
@@ -995,14 +1000,8 @@ class HandoffInferenceNode(Node):
         classification: str,
         confidence: float,
     ):
-        """Save one annotated visualization frame into its 0.05 confidence bin."""
+        """Save one annotated visualization frame to the output directory."""
         confidence = max(0.0, min(1.0, float(confidence)))
-
-        # Round to the nearest 0.05 using conventional half-up behavior.
-        # Examples: 0.623 -> 0.60, 0.628 -> 0.65.
-        confidence_bin = int(confidence * 20.0 + 0.5) / 20.0
-        confidence_folder = self.viz_image_save_root / f"{confidence_bin:.2f}"
-        confidence_folder.mkdir(parents=True, exist_ok=True)
 
         self._viz_saved_frame_count += 1
         timestamp = datetime.now(timezone.utc).strftime(
@@ -1015,11 +1014,15 @@ class HandoffInferenceNode(Node):
             f"{safe_classification}_"
             f"confidence_{confidence:.3f}.png"
         )
-        output_path = confidence_folder / filename
+        output_path = self.viz_image_save_root / filename
 
         if not cv2.imwrite(str(output_path), display_image):
             self.get_logger().warning(
                 f"Failed to save visualization image: {output_path}"
+            )
+        else:
+            self.get_logger().info(
+                f"Saved visualization image: {output_path}"
             )
 
     @staticmethod
