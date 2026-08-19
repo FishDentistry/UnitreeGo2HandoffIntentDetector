@@ -1,5 +1,9 @@
 import math
 import random
+import select
+import sys
+import termios
+import tty
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -106,9 +110,19 @@ class RandomNav2Patrol(Node):
 
         self.handoff_pause_requested = False
 
+        # Manual pause toggled from the terminal with the P key.
+        # This is kept separate from the handoff pause so releasing one
+        # pause source cannot resume patrol while the other is still active.
+        self.manual_pause_requested = False
+
         self.pause_cancel_requested = False
 
         self.frame_id: Optional[str] = None
+
+        # Terminal keyboard handling for the manual P-key pause.
+        self._stdin_fd = None
+        self._stdin_termios_original = None
+        self.keyboard_timer = None
 
         # ------------------------------------------------------------
         # /publish_point subscriber
@@ -151,9 +165,137 @@ class RandomNav2Patrol(Node):
             self.check_nav2_ready,
         )
 
+        # Configure non-blocking single-key terminal input. This lets P pause
+        # or resume patrol without requiring Enter.
+        self._setup_keyboard_input()
+
         self.get_logger().info(
             f'Waiting for {self.num_points} points on '
             f'{self.point_topic}.'
+        )
+
+    # ==================================================================
+    # Manual keyboard pause / resume
+    # ==================================================================
+
+    def _setup_keyboard_input(self) -> None:
+        """Enable non-blocking single-key input when stdin is a terminal."""
+
+        if not sys.stdin.isatty():
+            self.get_logger().warning(
+                'stdin is not an interactive terminal; '
+                'P-key patrol pause is unavailable.'
+            )
+            return
+
+        try:
+            self._stdin_fd = sys.stdin.fileno()
+            self._stdin_termios_original = termios.tcgetattr(
+                self._stdin_fd
+            )
+
+            # cbreak mode makes each key available immediately while
+            # preserving normal signal handling such as Ctrl-C.
+            tty.setcbreak(self._stdin_fd)
+
+            self.keyboard_timer = self.create_timer(
+                0.10,
+                self._keyboard_poll_callback,
+            )
+
+            self.get_logger().info(
+                'Keyboard control enabled: press P to pause/resume patrol.'
+            )
+
+        except Exception as exc:
+            self.get_logger().warning(
+                f'Could not enable P-key patrol pause: {exc}'
+            )
+            self._restore_keyboard_input()
+
+    def _restore_keyboard_input(self) -> None:
+        """Restore the terminal settings changed for single-key input."""
+
+        if (
+            self._stdin_fd is not None
+            and self._stdin_termios_original is not None
+        ):
+            try:
+                termios.tcsetattr(
+                    self._stdin_fd,
+                    termios.TCSADRAIN,
+                    self._stdin_termios_original,
+                )
+            except Exception as exc:
+                self.get_logger().warning(
+                    f'Could not restore terminal settings: {exc}'
+                )
+
+        self._stdin_fd = None
+        self._stdin_termios_original = None
+
+    def _keyboard_poll_callback(self) -> None:
+        """Process any pending terminal keypresses without blocking ROS."""
+
+        if self._stdin_fd is None:
+            return
+
+        try:
+            while True:
+                readable, _, _ = select.select(
+                    [sys.stdin],
+                    [],
+                    [],
+                    0.0,
+                )
+
+                if not readable:
+                    break
+
+                key = sys.stdin.read(1)
+
+                if key.lower() == 'p':
+                    self._toggle_manual_pause()
+
+        except Exception as exc:
+            self.get_logger().warning(
+                f'Keyboard input error: {exc}'
+            )
+
+    def _toggle_manual_pause(self) -> None:
+        """Toggle the manual patrol pause without advancing the route."""
+
+        self.manual_pause_requested = (
+            not self.manual_pause_requested
+        )
+
+        if self.manual_pause_requested:
+            self.get_logger().info(
+                'Manual patrol pause enabled with P.'
+            )
+            self.request_pause_cancel()
+            return
+
+        self.get_logger().info(
+            'Manual patrol pause released with P.'
+        )
+
+        # Do not resume if the handoff detector is independently requesting
+        # a pause. If no goal is active, resend the current waypoint.
+        if (
+            not self.handoff_pause_requested
+            and self.navigation_started
+            and not self.collecting_points
+            and not self.goal_in_progress
+        ):
+            self.send_current_goal()
+
+    def _patrol_paused(self) -> bool:
+        """Return True while either manual or handoff pause is active."""
+
+        return (
+            self.handoff_pause_requested
+            or self.manual_pause_requested
         )
 
     # ==================================================================
@@ -187,7 +329,8 @@ class RandomNav2Patrol(Node):
         # case goal_result_callback() will resend the same waypoint once the
         # cancellation result arrives.
         if (
-            self.navigation_started
+            not self.manual_pause_requested
+            and self.navigation_started
             and not self.collecting_points
             and not self.goal_in_progress
         ):
@@ -211,7 +354,7 @@ class RandomNav2Patrol(Node):
         self.pause_cancel_requested = True
 
         self.get_logger().info(
-            'Canceling current Nav2 goal for handoff pause.'
+            'Canceling current Nav2 goal for patrol pause.'
         )
 
         cancel_future = (
@@ -231,13 +374,13 @@ class RandomNav2Patrol(Node):
             response = future.result()
         except Exception as exc:
             self.get_logger().error(
-                f'Error requesting handoff pause cancellation: {exc}'
+                f'Error requesting patrol pause cancellation: {exc}'
             )
             return
 
         if not response.goals_canceling:
             self.get_logger().warning(
-                'Nav2 did not accept the handoff pause cancellation request.'
+                'Nav2 did not accept the patrol pause cancellation request.'
             )
 
     # ==================================================================
@@ -429,7 +572,7 @@ class RandomNav2Patrol(Node):
 
     def send_current_goal(self) -> None:
 
-        if self.handoff_pause_requested:
+        if self._patrol_paused():
             return
 
         if self.goal_in_progress:
@@ -627,7 +770,7 @@ class RandomNav2Patrol(Node):
 
         # A pause request can arrive between send_goal_async() and this
         # callback. Cancel immediately once the goal handle exists.
-        if self.handoff_pause_requested:
+        if self._patrol_paused():
             self.request_pause_cancel()
 
     def goal_result_callback(
@@ -688,14 +831,14 @@ class RandomNav2Patrol(Node):
             and was_pause_cancel
         ):
             self.get_logger().info(
-                f'Navigation to {label} paused for handoff. '
+                f'Navigation to {label} paused. '
                 'The waypoint will not be skipped.'
             )
 
-            # If the pause was already released while cancellation was in
-            # flight, resume the same waypoint now. Otherwise wait for the
-            # release message.
-            if not self.handoff_pause_requested:
+            # If every pause source was already released while cancellation
+            # was in flight, resume the same waypoint now. Otherwise wait for
+            # the corresponding resume event.
+            if not self._patrol_paused():
                 self.send_current_goal()
 
             return
@@ -746,6 +889,21 @@ class RandomNav2Patrol(Node):
         self.route_index += 1
 
         self.send_current_goal()
+
+
+    def destroy_node(self):
+        """Restore terminal state before shutting down the ROS node."""
+
+        if self.keyboard_timer is not None:
+            try:
+                self.keyboard_timer.cancel()
+            except Exception:
+                pass
+
+        self._restore_keyboard_input()
+
+        return super().destroy_node()
+
 
 
 def main(args=None):

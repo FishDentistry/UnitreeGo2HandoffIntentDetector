@@ -952,6 +952,12 @@ class HandoffInferenceNode(Node):
 
                 key = cv2.waitKey(1) & 0xFF
 
+                # Press Q/q to stop all future study-server logging while
+                # leaving inference, visualization, servo behavior, ROS
+                # publishing, and manual S-key image/CSV saving active.
+                if key in (ord("q"), ord("Q")):
+                    self._stop_server_logging()
+
                 if (
                     self.save_viz_images
                     and key in (ord("s"), ord("S"))
@@ -1506,6 +1512,28 @@ class HandoffInferenceNode(Node):
                 "Unexpected error posting aborted handoff event "
                 f"to {url}: {type(exc).__name__}: {exc}"
             )
+
+    def _stop_server_logging(self):
+        """Disable all future study-server logging for this node run."""
+        if (
+            not self.aborted_handoff_logging_enabled
+            and not self.robot_reaction_time_logging_enabled
+        ):
+            return
+
+        self.aborted_handoff_logging_enabled = False
+        self.robot_reaction_time_logging_enabled = False
+
+        # Discard any in-progress incipient-attempt state so it cannot be
+        # carried forward if logging settings are changed later.
+        self._reset_aborted_attempt_candidate()
+        self._aborted_attempt_detection_armed = True
+
+        self.get_logger().warning(
+            "Q pressed: study-server logging stopped. "
+            "No further aborted-handoff or robot reaction-time events "
+            "will be posted during this node run."
+        )
 
     def _publish_handoff_pause(self, should_pause: bool):
         """Publish whether the patrol node should temporarily stop."""
