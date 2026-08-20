@@ -1336,6 +1336,10 @@ def find_minimal_perturbation(
     step_size: float = 0.01,
     probability_margin: float = 1e-4,
     object_arm: str = "both",
+    robustness_enabled: bool = True,
+    robustness_radius: float = 0.015,
+    robustness_required_fraction: float = 5.0 / 6.0,
+    robustness_neighbor_margin: float = 0.0,
     latency_tracker: Optional[LatencyTracker] = None,
 ) -> dict[str, Any]:
     """
@@ -1374,8 +1378,9 @@ def find_minimal_perturbation(
             this is the best target-directed candidate encountered.
 
         reached_target:
-            True only when the returned features satisfy threshold +/-
-            probability_margin for the requested target class.
+            True only when the returned features satisfy the central
+            threshold +/- probability_margin target AND the local robustness
+            criterion.
 
         used_fallback:
             True when optimization exhausted max_iterations without reaching the
@@ -1392,7 +1397,25 @@ def find_minimal_perturbation(
             Classifier probability for the returned feature vector.
 
         target_probability:
-            Required probability boundary after applying probability_margin.
+            Required central-pose probability boundary after applying
+            probability_margin.
+
+        robust_success:
+            True only when the returned successful counterfactual also passes
+            the local hand-target neighborhood check. A best-progress fallback
+            keeps reached_target=False and robust_success=False.
+
+        robust_neighbor_probabilities:
+            Handoff probabilities for deterministic +/-XYZ hand-target
+            neighbors around the returned successful perturbation.
+
+    Robustness does NOT add another term to the optimization objective. The
+    original distance/classification/reachability objective is preserved. It
+    only changes the acceptance test for a successful counterfactual: the
+    center pose must satisfy threshold +/- probability_margin, and most small
+    hand-target neighbors must remain on the target side of the ordinary model
+    threshold (optionally shifted by robustness_neighbor_margin). Binary search
+    uses the same acceptance test, preserving minimum-movement behavior.
     """
     if max_iterations <= 0:
         raise ValueError(
@@ -1417,6 +1440,21 @@ def find_minimal_perturbation(
     if probability_margin < 0.0:
         raise ValueError(
             "probability_margin must be nonnegative."
+        )
+
+    if robustness_radius < 0.0:
+        raise ValueError(
+            "robustness_radius must be nonnegative."
+        )
+
+    if not (0.0 < robustness_required_fraction <= 1.0):
+        raise ValueError(
+            "robustness_required_fraction must be in (0, 1]."
+        )
+
+    if robustness_neighbor_margin < 0.0:
+        raise ValueError(
+            "robustness_neighbor_margin must be nonnegative."
         )
 
     object_arm = str(object_arm).strip().lower()
@@ -1772,13 +1810,168 @@ def find_minimal_perturbation(
             0.0,
         )
 
-    # No counterfactual is required only if the original sample already
-    # satisfies the requested target class with the requested margin.
-    if probability_meets_target_class(
+    # The central pose retains the existing probability-margin requirement.
+    # Nearby hand-target variants only need to remain on the correct side of
+    # the ordinary classifier threshold by default. This is intentionally a
+    # weaker criterion than the central margin so robustness does not force
+    # unnecessarily large human movements.
+    if target_intent:
+        robust_neighbor_target_probability = min(
+            threshold + robustness_neighbor_margin,
+            1.0,
+        )
+    else:
+        robust_neighbor_target_probability = max(
+            threshold - robustness_neighbor_margin,
+            0.0,
+        )
+
+    # Optimize six values for both arms, or three values for one selected arm.
+    # both:  [left_dx, left_dy, left_dz, right_dx, right_dy, right_dz]
+    # single arm: [dx, dy, dz]
+    perturbation_width = 6 if object_arm == "both" else 3
+
+    def evaluate_local_robustness(
+        perturbation: torch.Tensor,
+        *,
+        central_probability: float,
+        track_latency: bool = True,
+    ) -> dict[str, Any]:
+        """Evaluate deterministic +/-XYZ hand-target neighbors.
+
+        For one active hand this evaluates six neighbors. For both active hands
+        this evaluates twelve neighbors, changing one hand coordinate at a time.
+        Each neighbor is reconstructed through the same FABRIK + derived-feature
+        pipeline as every other classifier candidate.
+        """
+        central_success = probability_meets_target_class(
+            central_probability,
+            target_intent,
+            target_probability,
+        )
+
+        if not robustness_enabled or robustness_radius == 0.0:
+            return {
+                "success": bool(central_success),
+                "central_success": bool(central_success),
+                "neighbor_probabilities": [],
+                "neighbor_success_count": 0,
+                "neighbor_count": 0,
+                "neighbor_success_fraction": 1.0,
+                "required_neighbor_count": 0,
+            }
+
+        neighbor_probabilities: list[float] = []
+        tracker = latency_tracker if track_latency else None
+
+        with measure_latency(
+            tracker,
+            "robustness_check",
+            device=model.device,
+        ):
+            with torch.inference_mode():
+                base_perturbation = perturbation.detach()
+
+                for dimension in range(perturbation_width):
+                    for direction in (-1.0, 1.0):
+                        neighbor_perturbation = (
+                            base_perturbation.clone()
+                        )
+                        neighbor_perturbation[0, dimension] += (
+                            direction * robustness_radius
+                        )
+
+                        neighbor_features, _, _ = (
+                            reconstruct_candidate(
+                                neighbor_perturbation,
+                                track_latency=False,
+                            )
+                        )
+                        neighbor_probability = float(
+                            classify_candidate(
+                                neighbor_features,
+                                track_latency=False,
+                            ).item()
+                        )
+                        neighbor_probabilities.append(
+                            neighbor_probability
+                        )
+
+        neighbor_success_count = sum(
+            1
+            for probability_value in neighbor_probabilities
+            if probability_meets_target_class(
+                probability_value,
+                target_intent,
+                robust_neighbor_target_probability,
+            )
+        )
+        neighbor_count = len(neighbor_probabilities)
+        required_neighbor_count = int(
+            np.ceil(
+                robustness_required_fraction * neighbor_count
+                - 1e-12
+            )
+        )
+        neighbor_success_fraction = (
+            neighbor_success_count / neighbor_count
+            if neighbor_count
+            else 1.0
+        )
+
+        return {
+            "success": bool(
+                central_success
+                and neighbor_success_count >= required_neighbor_count
+            ),
+            "central_success": bool(central_success),
+            "neighbor_probabilities": neighbor_probabilities,
+            "neighbor_success_count": int(neighbor_success_count),
+            "neighbor_count": int(neighbor_count),
+            "neighbor_success_fraction": float(
+                neighbor_success_fraction
+            ),
+            "required_neighbor_count": int(
+                required_neighbor_count
+            ),
+        }
+
+    def candidate_meets_success(
+        perturbation: torch.Tensor,
+        central_probability: float,
+        *,
+        track_latency: bool = True,
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # Avoid the extra neighbor evaluations until the center pose has already
+        # reached the existing margin-shifted probability target.
+        if not probability_meets_target_class(
+            central_probability,
+            target_intent,
+            target_probability,
+        ):
+            return False, None
+
+        robustness = evaluate_local_robustness(
+            perturbation,
+            central_probability=central_probability,
+            track_latency=track_latency,
+        )
+        return bool(robustness["success"]), robustness
+
+    zero_hand_perturbation = torch.zeros(
+        (1, perturbation_width),
+        dtype=original_features.dtype,
+        device=model.device,
+    )
+
+    # No counterfactual is required only if the original pose satisfies BOTH
+    # the existing central margin and the new local-stability criterion.
+    original_success, original_robustness = candidate_meets_success(
+        zero_hand_perturbation,
         original_probability,
-        target_intent,
-        target_probability,
-    ):
+    )
+    if original_success:
+        assert original_robustness is not None
         return {
             "features": feature_array.copy(),
             "reached_target": True,
@@ -1787,12 +1980,32 @@ def find_minimal_perturbation(
             "original_probability": original_probability,
             "final_probability": original_probability,
             "target_probability": target_probability,
+            "robust_success": True,
+            "robustness_enabled": bool(robustness_enabled),
+            "robustness_radius": float(robustness_radius),
+            "robustness_required_fraction": float(
+                robustness_required_fraction
+            ),
+            "robust_neighbor_target_probability": float(
+                robust_neighbor_target_probability
+            ),
+            "robust_neighbor_probabilities": list(
+                original_robustness["neighbor_probabilities"]
+            ),
+            "robust_neighbor_success_count": int(
+                original_robustness["neighbor_success_count"]
+            ),
+            "robust_neighbor_count": int(
+                original_robustness["neighbor_count"]
+            ),
+            "robust_neighbor_success_fraction": float(
+                original_robustness["neighbor_success_fraction"]
+            ),
+            "robust_required_neighbor_count": int(
+                original_robustness["required_neighbor_count"]
+            ),
         }
 
-    # Optimize six values for both arms, or three values for one selected arm.
-    # both:  [left_dx, left_dy, left_dz, right_dx, right_dy, right_dz]
-    # single arm: [dx, dy, dz]
-    perturbation_width = 6 if object_arm == "both" else 3
     hand_perturbation = torch.zeros(
         (1, perturbation_width),
         dtype=original_features.dtype,
@@ -1868,6 +2081,7 @@ def find_minimal_perturbation(
 
     best_hand_perturbation: Optional[torch.Tensor] = None
     best_distance_squared = float("inf")
+    best_robustness: Optional[dict[str, Any]] = None
     last_probability = original_probability
 
     # Keep the best candidate seen even if the requested target boundary is never
@@ -1940,15 +2154,18 @@ def find_minimal_perturbation(
                     hand_perturbation,
                 )
 
-                if probability_meets_target_class(
-                    evaluated_probability,
-                    target_intent,
-                    target_probability,
-                ):
+                candidate_success, candidate_robustness = (
+                    candidate_meets_success(
+                        hand_perturbation.detach(),
+                        evaluated_probability,
+                    )
+                )
+                if candidate_success:
                     best_distance_squared = evaluated_distance_squared
                     best_hand_perturbation = (
                         hand_perturbation.detach().clone()
                     )
+                    best_robustness = candidate_robustness
                     break
 
                 with measure_latency(
@@ -1990,15 +2207,18 @@ def find_minimal_perturbation(
                     hand_perturbation,
                 )
 
-                if probability_meets_target_class(
-                    evaluated_probability,
-                    target_intent,
-                    target_probability,
-                ):
+                candidate_success, candidate_robustness = (
+                    candidate_meets_success(
+                        hand_perturbation.detach(),
+                        evaluated_probability,
+                    )
+                )
+                if candidate_success:
                     best_distance_squared = evaluated_distance_squared
                     best_hand_perturbation = (
                         hand_perturbation.detach().clone()
                     )
+                    best_robustness = candidate_robustness
                     break
 
                 delta = torch.empty_like(
@@ -2055,14 +2275,17 @@ def find_minimal_perturbation(
         # It is possible for the final post-step candidate to reach the requested
         # boundary. In that case treat it as a genuine success and continue into
         # the normal binary-search minimization path.
-        if probability_meets_target_class(
-            final_attempt_probability,
-            target_intent,
-            target_probability,
-        ):
+        final_attempt_success, final_attempt_robustness = (
+            candidate_meets_success(
+                hand_perturbation.detach(),
+                final_attempt_probability,
+            )
+        )
+        if final_attempt_success:
             best_hand_perturbation = (
                 hand_perturbation.detach().clone()
             )
+            best_robustness = final_attempt_robustness
         else:
             # No fully successful counterfactual was found. Return the candidate
             # that moved the model farthest toward the target class so it can be
@@ -2101,6 +2324,20 @@ def find_minimal_perturbation(
                 "original_probability": original_probability,
                 "final_probability": fallback_probability,
                 "target_probability": target_probability,
+                "robust_success": False,
+                "robustness_enabled": bool(robustness_enabled),
+                "robustness_radius": float(robustness_radius),
+                "robustness_required_fraction": float(
+                    robustness_required_fraction
+                ),
+                "robust_neighbor_target_probability": float(
+                    robust_neighbor_target_probability
+                ),
+                "robust_neighbor_probabilities": [],
+                "robust_neighbor_success_count": 0,
+                "robust_neighbor_count": 0,
+                "robust_neighbor_success_fraction": 0.0,
+                "robust_required_neighbor_count": 0,
             }
 
     # Reduce the successful movement along the line from zero to the first
@@ -2130,11 +2367,11 @@ def find_minimal_perturbation(
                     ).item()
                 )
 
-                if probability_meets_target_class(
+                scaled_success, _ = candidate_meets_success(
+                    scaled_hand_perturbation,
                     probability,
-                    target_intent,
-                    target_probability,
-                ):
+                )
+                if scaled_success:
                     high = scale
                 else:
                     low = scale
@@ -2151,11 +2388,12 @@ def find_minimal_perturbation(
                 ).item()
             )
 
-            if not probability_meets_target_class(
+            final_success, final_robustness = candidate_meets_success(
+                final_hand_perturbation,
                 final_probability,
-                target_intent,
-                target_probability,
-            ):
+            )
+
+            if not final_success:
                 final_features, _, _ = reconstruct_candidate(
                     best_hand_perturbation
                 )
@@ -2164,16 +2402,17 @@ def find_minimal_perturbation(
                         final_features
                     ).item()
                 )
+                fallback_success, fallback_robustness = (
+                    candidate_meets_success(
+                        best_hand_perturbation,
+                        fallback_probability,
+                    )
+                )
 
-                if not probability_meets_target_class(
-                    fallback_probability,
-                    target_intent,
-                    target_probability,
-                ):
+                if not fallback_success:
                     # This should be extremely rare because the stored candidate
-                    # already satisfied the target when it was recorded. Treat it
-                    # as a best-effort result rather than throwing away usable
-                    # guidance.
+                    # already satisfied both the central and robustness criteria
+                    # when it was recorded. Treat it as best-effort guidance.
                     if target_intent:
                         made_progress = (
                             fallback_probability > original_probability
@@ -2197,14 +2436,41 @@ def find_minimal_perturbation(
                         "original_probability": original_probability,
                         "final_probability": fallback_probability,
                         "target_probability": target_probability,
+                        "robust_success": False,
+                        "robustness_enabled": bool(robustness_enabled),
+                        "robustness_radius": float(robustness_radius),
+                        "robustness_required_fraction": float(
+                            robustness_required_fraction
+                        ),
+                        "robust_neighbor_target_probability": float(
+                            robust_neighbor_target_probability
+                        ),
+                        "robust_neighbor_probabilities": [],
+                        "robust_neighbor_success_count": 0,
+                        "robust_neighbor_count": 0,
+                        "robust_neighbor_success_fraction": 0.0,
+                        "robust_required_neighbor_count": 0,
                     }
 
                 final_probability = fallback_probability
+                final_robustness = fallback_robustness
+                final_hand_perturbation = best_hand_perturbation
+
+            if final_robustness is None:
+                # Defensive fallback; in normal operation a successful candidate
+                # always has robustness diagnostics from candidate_meets_success.
+                final_robustness = best_robustness
 
     if target_intent:
         made_progress = final_probability > original_probability
     else:
         made_progress = final_probability < original_probability
+
+    if final_robustness is None:
+        final_robustness = evaluate_local_robustness(
+            final_hand_perturbation,
+            central_probability=final_probability,
+        )
 
     return {
         "features": (
@@ -2220,6 +2486,30 @@ def find_minimal_perturbation(
         "original_probability": original_probability,
         "final_probability": final_probability,
         "target_probability": target_probability,
+        "robust_success": bool(final_robustness["success"]),
+        "robustness_enabled": bool(robustness_enabled),
+        "robustness_radius": float(robustness_radius),
+        "robustness_required_fraction": float(
+            robustness_required_fraction
+        ),
+        "robust_neighbor_target_probability": float(
+            robust_neighbor_target_probability
+        ),
+        "robust_neighbor_probabilities": list(
+            final_robustness["neighbor_probabilities"]
+        ),
+        "robust_neighbor_success_count": int(
+            final_robustness["neighbor_success_count"]
+        ),
+        "robust_neighbor_count": int(
+            final_robustness["neighbor_count"]
+        ),
+        "robust_neighbor_success_fraction": float(
+            final_robustness["neighbor_success_fraction"]
+        ),
+        "robust_required_neighbor_count": int(
+            final_robustness["required_neighbor_count"]
+        ),
     }
 
 
@@ -3689,9 +3979,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
- 
