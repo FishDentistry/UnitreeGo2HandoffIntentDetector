@@ -100,8 +100,9 @@ class HandoffInferenceNode(Node):
         # ---------------------------------------------------------
         # Person-presence gating / Nav2 slowdown
         # ---------------------------------------------------------
-        # RTMPose person presence is checked before the handoff model.
-        # When no valid person is present, detector.predict() is not called.
+        # Person presence is derived from the FIRST RTMPose pass that the
+        # detector wrapper already performs. This avoids running an extra
+        # RTMPose pass in the ROS node solely for person-presence gating.
         self.declare_parameter(
             "person_absence_grace_seconds",
             0.50,
@@ -1004,23 +1005,25 @@ class HandoffInferenceNode(Node):
             )
 
             # -----------------------------------------------------
-            # Person-presence gate
+            # Person presence + handoff inference
             # -----------------------------------------------------
-            # Do a lightweight RTMPose pass first. This intentionally uses
-            # the detector wrapper's existing keypoint detector and existing
-            # _is_valid_person() validator without changing the wrapper.
-            person_present = self._person_present_in_frame(rgb_image)
-            self._update_person_slowdown_state(person_present)
+            # IMPORTANT: do NOT run a separate RTMPose person-presence pass
+            # here. The detector wrapper already calls its RTMPose detector as
+            # the first stage of detector.predict(). We temporarily observe
+            # that first internal result, use it for the slowdown/person gate,
+            # and then let the wrapper continue normally. With person cropping
+            # enabled this reduces a person-visible frame from three RTMPose
+            # calls to the wrapper's original two calls.
+            (
+                classification,
+                confidence,
+                person_present,
+            ) = self._predict_and_capture_person_presence(
+                rgb_image,
+                depth_image,
+            )
 
-            # -----------------------------------------------------
-            # Handoff inference ONLY when a valid person is present
-            # -----------------------------------------------------
             if person_present:
-                classification, confidence = self.detector.predict(
-                    rgb_image,
-                    depth_image,
-                )
-
                 handoff_probability = (
                     self._handoff_probability_from_result(
                         classification,
@@ -1028,9 +1031,10 @@ class HandoffInferenceNode(Node):
                     )
                 )
             else:
-                # Publish a fresh explicit negative instead of allowing a
-                # previous handoff result to remain visible downstream. TabM
-                # (and the rest of detector.predict()) is not run here.
+                # The wrapper may return a negative itself when its first
+                # RTMPose pass finds no usable person. Publish an explicit
+                # no-person negative so downstream consumers never interpret
+                # wrapper confidence as handoff evidence for an empty frame.
                 classification = "not_handoff"
                 confidence = 1.0
                 handoff_probability = 0.0
@@ -1056,7 +1060,7 @@ class HandoffInferenceNode(Node):
                 )
             else:
                 self.get_logger().info(
-                    "No valid person detected; handoff classifier skipped."
+                    "No valid person detected in wrapper RTMPose gate."
                 )
 
             # -----------------------------------------------------
@@ -1163,7 +1167,7 @@ class HandoffInferenceNode(Node):
             # -----------------------------------------------------
             # Handoff interaction trigger
             # -----------------------------------------------------
-            # Person present -> slowdown + inference. Two consecutive handoff
+            # Person present -> slowdown + handoff evaluation. Two consecutive handoff
             # frames at/above threshold -> existing cancel/servo interval.
             if (
                 handoff_stop_condition
@@ -1192,50 +1196,131 @@ class HandoffInferenceNode(Node):
                 f"Exception: {exc}"
             )
 
-    def _person_present_in_frame(self, rgb_image) -> bool:
-        """Return True when RTMPose finds at least one valid person."""
+    def _people_contain_valid_person(self, people) -> bool:
+        """Return True when an RTMPose result contains a valid person."""
+        if not people:
+            return False
+
+        validator = getattr(self.detector, "_is_valid_person", None)
+        if callable(validator):
+            return any(bool(validator(person)) for person in people)
+
+        # Defensive fallback for an older wrapper without
+        # _is_valid_person(): require a geometrically valid upper body.
+        for person in people:
+            keypoints = person.get("keypoints", [])
+            try:
+                import numpy as np
+                keypoints = np.asarray(keypoints, dtype=np.float32)
+            except Exception:
+                continue
+
+            if (
+                keypoints.ndim == 2
+                and keypoints.shape[0] >= 11
+                and keypoints.shape[1] >= 2
+                and np.isfinite(keypoints[5:11, :2]).all()
+            ):
+                return True
+
+        return False
+
+    def _predict_and_capture_person_presence(
+        self,
+        rgb_image,
+        depth_image,
+    ):
+        """Run detector.predict once and reuse its first RTMPose result.
+
+        The deployed wrapper already performs an RTMPose call at the beginning
+        of its own inference path. When crop_around_object=True, that first pass
+        localizes the person on the full image and a second pass runs on the
+        crop for the classifier features.
+
+        Older versions of this ROS node ran a third, node-level RTMPose pass
+        before detector.predict() just to determine whether a person was
+        present. This helper removes that redundant inference by temporarily
+        observing the wrapper's first keypoint_detector.predict() result.
+        """
+        keypoint_detector = getattr(
+            self.detector,
+            "keypoint_detector",
+            None,
+        )
+
+        if keypoint_detector is None:
+            raise RuntimeError(
+                "Handoff detector does not expose keypoint_detector; "
+                "cannot reuse its RTMPose person-presence result."
+            )
+
+        original_predict = keypoint_detector.predict
+        first_call_seen = False
+        first_call_person_present = False
+
+        class _NoValidPersonDetected(Exception):
+            pass
+
+        def capture_first_rtmpose_result(*args, **kwargs):
+            nonlocal first_call_seen
+            nonlocal first_call_person_present
+
+            people = original_predict(*args, **kwargs)
+
+            if not first_call_seen:
+                first_call_seen = True
+                first_call_person_present = (
+                    self._people_contain_valid_person(people)
+                )
+
+                # Apply/release the slowdown as soon as the wrapper's first
+                # RTMPose result is available rather than waiting for the
+                # remainder of the handoff inference to finish.
+                self._update_person_slowdown_state(
+                    first_call_person_present
+                )
+
+                # Preserve the previous node-level gate without paying for a
+                # separate RTMPose pass: if the wrapper's own first RTMPose
+                # result does not contain a valid person, unwind immediately
+                # before the wrapper can run its cropped RTMPose pass, head
+                # pose/ResNet work, or TabM inference.
+                if not first_call_person_present:
+                    raise _NoValidPersonDetected()
+
+            return people
+
+        # The wrapper is intentionally left unmodified. Temporarily replace
+        # only this detector instance's bound predict method, then restore it
+        # even if inference raises. ROS spins this node serially under the
+        # normal single-threaded executor used by main().
+        keypoint_detector.predict = capture_first_rtmpose_result
         try:
-            # The wrapper converts incoming RGB to BGR before passing images
-            # into the same RTMPose detector, so mirror that preprocessing.
-            pose_image = cv2.cvtColor(
-                rgb_image,
-                cv2.COLOR_RGB2BGR,
+            try:
+                classification, confidence = self.detector.predict(
+                    rgb_image,
+                    depth_image,
+                )
+            except _NoValidPersonDetected:
+                classification = "not_handoff"
+                confidence = 1.0
+        finally:
+            keypoint_detector.predict = original_predict
+
+        if not first_call_seen:
+            # This should not happen for the current wrappers. Treat it as an
+            # error instead of silently claiming a person was absent, because
+            # that would mask a future wrapper/control-flow change.
+            raise RuntimeError(
+                "detector.predict() completed without invoking the exposed "
+                "RTMPose keypoint detector."
             )
-            people = self.detector.keypoint_detector.predict(pose_image)
 
-            if not people:
-                return False
-
-            validator = getattr(self.detector, "_is_valid_person", None)
-            if callable(validator):
-                return any(bool(validator(person)) for person in people)
-
-            # Defensive fallback for an older wrapper without
-            # _is_valid_person(): require a geometrically valid upper body.
-            for person in people:
-                keypoints = person.get("keypoints", [])
-                try:
-                    import numpy as np
-                    keypoints = np.asarray(keypoints, dtype=np.float32)
-                except Exception:
-                    continue
-
-                if (
-                    keypoints.ndim == 2
-                    and keypoints.shape[0] >= 11
-                    and keypoints.shape[1] >= 2
-                    and np.isfinite(keypoints[5:11, :2]).all()
-                ):
-                    return True
-
-            return False
-
-        except Exception as exc:
-            self.get_logger().warning(
-                "Person-presence RTMPose check failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            return False
+        return (
+            classification,
+            confidence,
+            first_call_person_present,
+        )
 
     def _update_person_slowdown_state(self, person_present: bool):
         """Apply slowdown on presence; restore speed after absence grace."""
