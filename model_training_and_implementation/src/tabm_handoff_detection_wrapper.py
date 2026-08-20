@@ -910,16 +910,6 @@ class HandoffDetector:
                 )
             )
 
-            nearest_shoulder_relative_depth = min(
-                left_shoulder_relative_depth,
-                right_shoulder_relative_depth,
-            )
-            nearest_shoulder_depth = (
-                shoulder_midpoint_depth
-                + nearest_shoulder_relative_depth
-            )
-            depth_scale = max(float(nearest_shoulder_depth), 1e-6)
-
             if keypoints.shape[1] >= 3:
                 confidence_threshold = self.person_presence_confidence
                 left_elbow_score = float(keypoints[7, 2])
@@ -943,12 +933,21 @@ class HandoffDetector:
                 right_arm_reliable = True
 
             def _arm_presentation_score(
+                shoulder_relative_depth,
                 elbow_relative_depth,
                 wrist_relative_depth,
             ):
+                # Compare each wrist to its OWN anatomical shoulder instead of
+                # using whichever shoulder happens to be nearest to the camera.
+                shoulder_depth = (
+                    shoulder_midpoint_depth
+                    + shoulder_relative_depth
+                )
+                depth_scale = max(float(shoulder_depth), 1e-6)
+
                 shoulder_forward_fraction = max(
                     0.0,
-                    (nearest_shoulder_relative_depth - wrist_relative_depth)
+                    (shoulder_relative_depth - wrist_relative_depth)
                     / depth_scale,
                 )
                 elbow_forward_fraction = max(
@@ -972,13 +971,18 @@ class HandoffDetector:
                         1.0,
                     )
                 )
-                # Weighted evidence replaces the old hard logical AND.
-                return 0.70 * shoulder_component + 0.30 * elbow_component
+
+                # A side-view arm should only count as genuinely presented
+                # when the wrist is meaningfully forward of BOTH its shoulder
+                # and its elbow. Using min() makes this conjunctive while
+                # retaining a continuous 0..1 score.
+                return min(shoulder_component, elbow_component)
 
             arm_scores = []
             if left_arm_reliable:
                 arm_scores.append(
                     _arm_presentation_score(
+                        left_shoulder_relative_depth,
                         left_elbow_relative_depth,
                         left_wrist_relative_depth,
                     )
@@ -986,6 +990,7 @@ class HandoffDetector:
             if right_arm_reliable:
                 arm_scores.append(
                     _arm_presentation_score(
+                        right_shoulder_relative_depth,
                         right_elbow_relative_depth,
                         right_wrist_relative_depth,
                     )
@@ -1184,12 +1189,8 @@ class HandoffDetector:
             and raw_handoff_probability
             >= self.side_correction_min_raw_probability
         ):
-            # Do not let an apparently forward-presented wrist completely
-            # erase strong side-view evidence. A perfect presentation score
-            # can reduce the side penalty by at most 50%.
-            presentation_relief = 0.50 * presentation_score
             suspicious_side_evidence = (
-                side_score * (1.0 - presentation_relief)
+                side_score * (1.0 - presentation_score)
             )
             side_probability_penalty = float(
                 np.clip(
