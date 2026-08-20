@@ -916,7 +916,7 @@ class HandoffInferenceNode(Node):
                 self.rgb_sub,
                 self.depth_sub,
             ],
-            queue_size=10,
+            queue_size=1,
             slop=0.05,
         )
 
