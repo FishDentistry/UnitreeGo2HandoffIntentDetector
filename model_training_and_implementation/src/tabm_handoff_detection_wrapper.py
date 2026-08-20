@@ -900,11 +900,14 @@ class HandoffDetector:
                 )
             )
 
-            # Unlike the previous OR, both independent side-view cues must
-            # agree before the correction becomes strong.
+            # Combine the two independent side-view cues without the strong
+            # suppression caused by multiplication. The weaker cue receives
+            # most of the weight, so both cues still need to agree for a high
+            # side score, while clear side views are penalized more strongly.
             side_score = float(
                 np.clip(
-                    side_score_2d * side_score_depth,
+                    0.35 * max(side_score_2d, side_score_depth)
+                    + 0.65 * min(side_score_2d, side_score_depth),
                     0.0,
                     1.0,
                 )
