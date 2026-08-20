@@ -1331,6 +1331,8 @@ def find_minimal_perturbation(
     original_probability: Optional[float] = None,
     classification_weight: float,
     reachability_weight: float,
+    cross_body_weight: float = 1000.0,
+    cross_body_margin: float = 0.05,
     max_iterations: int = 1000,
     bin_search_iterations: int = 10,
     step_size: float = 0.01,
@@ -1409,9 +1411,16 @@ def find_minimal_perturbation(
             Handoff probabilities for deterministic +/-XYZ hand-target
             neighbors around the returned successful perturbation.
 
+    Cross-body regularization adds one soft term to the optimization objective.
+    It penalizes only additional movement of an active hand beyond the torso
+    midline compared with that hand's original pose. A small cross_body_margin
+    permits natural near-midline positioning. It does not reward forward motion,
+    alter FABRIK, change elbow constraints, or add any whole-arm movement term.
+
     Robustness does NOT add another term to the optimization objective. The
-    original distance/classification/reachability objective is preserved. It
-    only changes the acceptance test for a successful counterfactual: the
+    distance/classification/reachability/cross-body objective is otherwise
+    unchanged. Robustness only changes the acceptance test for a successful
+    counterfactual: the
     center pose must satisfy threshold +/- probability_margin, and most small
     hand-target neighbors must remain on the target side of the ordinary model
     threshold (optionally shifted by robustness_neighbor_margin). Binary search
@@ -1435,6 +1444,16 @@ def find_minimal_perturbation(
     if reachability_weight < 0.0:
         raise ValueError(
             "reachability_weight must be nonnegative."
+        )
+
+    if cross_body_weight < 0.0:
+        raise ValueError(
+            "cross_body_weight must be nonnegative."
+        )
+
+    if cross_body_margin < 0.0:
+        raise ValueError(
+            "cross_body_margin must be nonnegative."
         )
 
     if probability_margin < 0.0:
@@ -1589,6 +1608,101 @@ def find_minimal_perturbation(
             "The following required joints are absent from the model's "
             "joint order: " + ", ".join(missing_joints)
         )
+
+    def get_original_joint_position(joint_name: str) -> torch.Tensor:
+        start = joint_indices[joint_name] * JOINT_POSITION_DIMS
+        return original_joint_features[
+            0,
+            start:start + JOINT_POSITION_DIMS,
+        ]
+
+    # Torso-local lateral axis. Positive points toward the person's left
+    # shoulder, so a left hand has a positive lateral coordinate when it is on
+    # its natural side of the torso, while a right hand has a negative one.
+    left_shoulder_position = get_original_joint_position("left_shoulder")
+    right_shoulder_position = get_original_joint_position("right_shoulder")
+    shoulder_midpoint = 0.5 * (
+        left_shoulder_position + right_shoulder_position
+    )
+    torso_lateral_axis = F.normalize(
+        left_shoulder_position - right_shoulder_position,
+        p=2,
+        dim=0,
+        eps=1e-8,
+    )
+
+    original_hand_positions = {
+        side: get_original_joint_position(f"{side}_hand")
+        for side in active_sides
+    }
+
+    def cross_body_loss_from_perturbation(
+        perturbation: torch.Tensor,
+    ) -> torch.Tensor:
+        """Penalize only *additional* cross-body hand displacement.
+
+        A hand may move freely toward the torso midline and up to
+        cross_body_margin meters beyond it. If the original hand already lies
+        farther across the body than that, the existing amount is treated as
+        the baseline and is not penalized. Only making that crossing worse
+        contributes loss.
+        """
+        loss = torch.zeros(
+            (),
+            dtype=perturbation.dtype,
+            device=perturbation.device,
+        )
+
+        if object_arm == "both":
+            hand_deltas = {
+                "left": perturbation[0, 0:3],
+                "right": perturbation[0, 3:6],
+            }
+        else:
+            hand_deltas = {
+                object_arm: perturbation[0, 0:3],
+            }
+
+        margin = torch.as_tensor(
+            cross_body_margin,
+            dtype=perturbation.dtype,
+            device=perturbation.device,
+        )
+
+        for side in active_sides:
+            original_hand = original_hand_positions[side]
+            candidate_hand = original_hand + hand_deltas[side]
+
+            original_lateral = torch.dot(
+                original_hand - shoulder_midpoint,
+                torso_lateral_axis,
+            )
+            candidate_lateral = torch.dot(
+                candidate_hand - shoulder_midpoint,
+                torso_lateral_axis,
+            )
+
+            if side == "left":
+                original_crossing = torch.relu(
+                    -original_lateral - margin
+                )
+                candidate_crossing = torch.relu(
+                    -candidate_lateral - margin
+                )
+            else:
+                original_crossing = torch.relu(
+                    original_lateral - margin
+                )
+                candidate_crossing = torch.relu(
+                    candidate_lateral - margin
+                )
+
+            additional_crossing = torch.relu(
+                candidate_crossing - original_crossing
+            )
+            loss = loss + additional_crossing.square()
+
+        return loss
 
     def build_projection_features(
         candidate_joint_features: torch.Tensor,
@@ -2037,6 +2151,9 @@ def find_minimal_perturbation(
         BCE is only the optimization surrogate used to reach that robust target.
         """
         distance_squared = perturbation.square().sum()
+        cross_body_loss = cross_body_loss_from_perturbation(
+            perturbation
+        )
 
         classification_target = torch.ones_like(probability) if target_intent else torch.zeros_like(probability)
         classification_loss = F.binary_cross_entropy(
@@ -2048,6 +2165,7 @@ def find_minimal_perturbation(
             distance_squared
             + classification_weight * classification_loss
             + reachability_weight * reachability_loss
+            + cross_body_weight * cross_body_loss
         )
         return loss, distance_squared
 
