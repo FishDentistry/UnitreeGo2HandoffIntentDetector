@@ -94,6 +94,10 @@ class HandoffDetector:
         side_wrist_beyond_elbow_depth_fraction=0.04,
         side_max_probability_penalty=0.45,
         side_correction_min_raw_probability=0.50,
+        side_probability_cap_enabled=True,
+        side_probability_cap_min_score_2d=0.70,
+        side_probability_cap_base=0.45,
+        side_probability_cap_presentation_gain=0.35,
     ):
         self.features_type = features_type
         self.threshold = float(threshold)
@@ -143,6 +147,19 @@ class HandoffDetector:
             side_correction_min_raw_probability
         )
 
+        self.side_probability_cap_enabled = bool(
+            side_probability_cap_enabled
+        )
+        self.side_probability_cap_min_score_2d = float(
+            side_probability_cap_min_score_2d
+        )
+        self.side_probability_cap_base = float(
+            side_probability_cap_base
+        )
+        self.side_probability_cap_presentation_gain = float(
+            side_probability_cap_presentation_gain
+        )
+
         if self.side_facing_max_torso_ratio <= 0.0:
             raise ValueError(
                 "side_facing_max_torso_ratio must be > 0.0."
@@ -168,6 +185,28 @@ class HandoffDetector:
                 "side_correction_min_raw_probability must be in [0.0, 1.0]."
             )
 
+        if not 0.0 <= self.side_probability_cap_min_score_2d <= 1.0:
+            raise ValueError(
+                "side_probability_cap_min_score_2d must be in [0.0, 1.0]."
+            )
+        if not 0.0 <= self.side_probability_cap_base <= 1.0:
+            raise ValueError(
+                "side_probability_cap_base must be in [0.0, 1.0]."
+            )
+        if self.side_probability_cap_presentation_gain < 0.0:
+            raise ValueError(
+                "side_probability_cap_presentation_gain must be >= 0.0."
+            )
+        if (
+            self.side_probability_cap_base
+            + self.side_probability_cap_presentation_gain
+            > 1.0
+        ):
+            raise ValueError(
+                "side_probability_cap_base + "
+                "side_probability_cap_presentation_gain must be <= 1.0."
+            )
+
         # Diagnostics from the latest successful model prediction.
         self.last_raw_handoff_probability = None
         self.last_adjusted_handoff_probability = None
@@ -175,6 +214,7 @@ class HandoffDetector:
         self.last_presentation_score = 1.0
         self.last_side_probability_penalty = 0.0
         self._side_metadata_for_last_features = {
+            "side_score_2d": 0.0,
             "side_score": 0.0,
             "presentation_score": 1.0,
             "valid": False,
@@ -1078,6 +1118,7 @@ class HandoffDetector:
             )
 
         self._side_metadata_for_last_features = {
+            "side_score_2d": float(side_score_2d),
             "side_score": float(side_score),
             "presentation_score": float(presentation_score),
             "valid": bool(side_correction_valid),
@@ -1113,6 +1154,7 @@ class HandoffDetector:
         # Reset transient correction metadata so an early return from feature
         # extraction can never reuse geometry from the previous frame.
         self._side_metadata_for_last_features = {
+            "side_score_2d": 0.0,
             "side_score": 0.0,
             "presentation_score": 1.0,
             "valid": False,
@@ -1175,6 +1217,9 @@ class HandoffDetector:
 
         raw_handoff_probability = handoff_probability
 
+        side_score_2d = float(
+            side_metadata.get("side_score_2d", 0.0)
+        )
         side_score = float(side_metadata.get("side_score", 0.0))
         presentation_score = float(
             side_metadata.get("presentation_score", 1.0)
@@ -1203,6 +1248,27 @@ class HandoffDetector:
             handoff_probability = (
                 raw_handoff_probability
                 * (1.0 - side_probability_penalty)
+            )
+
+        # For clearly side-facing views, high handoff probability must be
+        # justified by genuine arm presentation. This does NOT reject side
+        # views outright: stronger presentation raises the allowed ceiling.
+        if (
+            self.side_probability_cap_enabled
+            and side_correction_valid
+            and side_score_2d >= self.side_probability_cap_min_score_2d
+        ):
+            side_view_probability_cap = (
+                self.side_probability_cap_base
+                + self.side_probability_cap_presentation_gain
+                * presentation_score
+            )
+            side_view_probability_cap = float(
+                np.clip(side_view_probability_cap, 0.0, 1.0)
+            )
+            handoff_probability = min(
+                handoff_probability,
+                side_view_probability_cap,
             )
 
         handoff_probability = float(
