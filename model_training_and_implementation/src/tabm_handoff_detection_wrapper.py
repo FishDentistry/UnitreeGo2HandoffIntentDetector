@@ -267,6 +267,7 @@ class HandoffDetector:
             RTMPoseKeypointDetector(
                 confidence=confidence,
                 device=str(self.device),
+                mode = "lightweight"
             )
         )
 
