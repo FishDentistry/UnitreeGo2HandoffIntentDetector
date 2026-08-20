@@ -900,14 +900,11 @@ class HandoffDetector:
                 )
             )
 
-            # Combine the two independent side-view cues without the strong
-            # suppression caused by multiplication. The weaker cue receives
-            # most of the weight, so both cues still need to agree for a high
-            # side score, while clear side views are penalized more strongly.
+            # Unlike the previous OR, both independent side-view cues must
+            # agree before the correction becomes strong.
             side_score = float(
                 np.clip(
-                    0.35 * max(side_score_2d, side_score_depth)
-                    + 0.65 * min(side_score_2d, side_score_depth),
+                    side_score_2d * side_score_depth,
                     0.0,
                     1.0,
                 )
@@ -1187,8 +1184,12 @@ class HandoffDetector:
             and raw_handoff_probability
             >= self.side_correction_min_raw_probability
         ):
+            # Do not let an apparently forward-presented wrist completely
+            # erase strong side-view evidence. A perfect presentation score
+            # can reduce the side penalty by at most 50%.
+            presentation_relief = 0.50 * presentation_score
             suspicious_side_evidence = (
-                side_score * (1.0 - presentation_score)
+                side_score * (1.0 - presentation_relief)
             )
             side_probability_penalty = float(
                 np.clip(
