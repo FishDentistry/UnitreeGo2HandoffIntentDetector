@@ -33,15 +33,16 @@ class RandomNav2Patrol(Node):
       1. Exactly two clicked waypoints are collected: P1 and P2.
       2. The robot first moves to P1 and faces P2.
       3. It then shuttles continuously P1 <-> P2.
-      4. During a traversal, a random stop may be triggered after a random
-         travel interval. The active Nav2 goal is canceled, the robot rotates
-         in place, dwells for stop_duration_sec, then resumes toward the same
-         endpoint.
-      5. P1 -> P2 random stops only turn RIGHT by 0..180 degrees relative to
-         the P1->P2 travel heading.
-      6. P2 -> P1 random stops only turn LEFT by 0..180 degrees relative to
-         the P2->P1 travel heading.
-      7. On reaching an endpoint, the robot explicitly turns in place to face
+      4. Two candidate stopping positions are placed near the middle of the
+         P1-P2 segment. On each traversal, each candidate independently has a
+         configurable chance of being used. Unselected candidates are ignored.
+      5. At a selected candidate, the robot stops, rotates in place, dwells for
+         stop_duration_sec, then resumes toward the same endpoint.
+      6. P1 -> P2 stops only turn RIGHT by 0..180 degrees relative to the
+         P1->P2 route heading.
+      7. P2 -> P1 stops only turn LEFT by 0..180 degrees relative to the
+         P2->P1 route heading.
+      8. On reaching an endpoint, the robot explicitly turns in place to face
          the opposite endpoint before beginning the return traversal.
 
     ROS planar convention assumed here:
@@ -71,20 +72,17 @@ class RandomNav2Patrol(Node):
         self.declare_parameter('continue_on_failure', True)
 
         # -1 = nondeterministic randomness. Any non-negative value makes the
-        # random stop timing and stop angles reproducible.
+        # candidate-stop choices and stop angles reproducible.
         self.declare_parameter('random_seed', -1)
 
-        # Random stop behavior.
+        # Random stop behavior. The two stop fractions are measured from P1
+        # toward P2, so 0.40 and 0.60 place them on either side of path center.
+        # On every P1<->P2 traversal, each stop is independently selected with
+        # candidate_stop_probability.
         self.declare_parameter('stop_duration_sec', 5.0)
-        self.declare_parameter('random_stop_min_interval_sec', 5.0)
-        self.declare_parameter('random_stop_max_interval_sec', 10.0)
-
-        # Avoid initiating a random stop essentially on top of an endpoint.
-        # Set to 0.0 if this safeguard is not desired.
-        self.declare_parameter(
-            'min_random_stop_distance_from_endpoint_m',
-            0.5,
-        )
+        self.declare_parameter('candidate_stop_1_fraction', 0.40)
+        self.declare_parameter('candidate_stop_2_fraction', 0.60)
+        self.declare_parameter('candidate_stop_probability', 0.50)
 
         self.num_points = int(
             self.get_parameter('num_points').value
@@ -115,44 +113,31 @@ class RandomNav2Patrol(Node):
             self.get_parameter('stop_duration_sec').value
         )
 
-        self.random_stop_min_interval_sec = float(
-            self.get_parameter(
-                'random_stop_min_interval_sec'
-            ).value
+        self.candidate_stop_1_fraction = float(
+            self.get_parameter('candidate_stop_1_fraction').value
         )
-
-        self.random_stop_max_interval_sec = float(
-            self.get_parameter(
-                'random_stop_max_interval_sec'
-            ).value
+        self.candidate_stop_2_fraction = float(
+            self.get_parameter('candidate_stop_2_fraction').value
         )
-
-        self.min_random_stop_distance_from_endpoint_m = float(
-            self.get_parameter(
-                'min_random_stop_distance_from_endpoint_m'
-            ).value
+        self.candidate_stop_probability = float(
+            self.get_parameter('candidate_stop_probability').value
         )
 
         if self.stop_duration_sec < 0.0:
             raise ValueError('stop_duration_sec must be >= 0.')
 
-        if self.random_stop_min_interval_sec <= 0.0:
-            raise ValueError(
-                'random_stop_min_interval_sec must be > 0.'
-            )
-
-        if (
-            self.random_stop_max_interval_sec
-            < self.random_stop_min_interval_sec
+        if not (
+            0.0 < self.candidate_stop_1_fraction
+            < self.candidate_stop_2_fraction < 1.0
         ):
             raise ValueError(
-                'random_stop_max_interval_sec must be >= '
-                'random_stop_min_interval_sec.'
+                'candidate stop fractions must satisfy '
+                '0 < stop_1 < stop_2 < 1.'
             )
 
-        if self.min_random_stop_distance_from_endpoint_m < 0.0:
+        if not 0.0 <= self.candidate_stop_probability <= 1.0:
             raise ValueError(
-                'min_random_stop_distance_from_endpoint_m must be >= 0.'
+                'candidate_stop_probability must be between 0 and 1.'
             )
 
         random_seed = int(
@@ -187,8 +172,8 @@ class RandomNav2Patrol(Node):
         self.active_goal_handle = None
         self.active_goal_kind: Optional[str] = None
 
-        # Latest pose / distance reported by NavigateToPose feedback. The pose
-        # is used to create an in-place random orientation goal.
+        # Latest pose / distance reported by NavigateToPose feedback. These
+        # are retained from the prior node's feedback handling.
         self.latest_current_pose: Optional[PoseStamped] = None
         self.latest_distance_remaining: Optional[float] = None
 
@@ -197,21 +182,20 @@ class RandomNav2Patrol(Node):
         self.manual_pause_requested = False
         self.pause_cancel_requested = False
 
-        # Random-stop cancellation is separate from pause cancellation so a
-        # canceled travel goal can be handled correctly.
-        self.random_stop_cancel_requested = False
-
         # If an auxiliary orientation goal is canceled by a pause, retry it
         # when every external pause source is released.
         self.retry_goal_kind_after_pause: Optional[str] = None
 
-        # Random orientation selected for the current stop.
+        # Candidate stops selected for the current traversal. Each tuple is
+        # (name, waypoint), ordered in the actual direction of travel.
+        self.current_leg_stops = []
+        self.current_leg_stop_index = 0
+
+        # Random orientation selected for the current candidate stop.
         self.pending_random_yaw: Optional[float] = None
         self.pending_random_angle_deg: Optional[float] = None
-
-        # Absolute ROS clock time (nanoseconds) at which the next random stop
-        # becomes eligible during a travel goal.
-        self.next_random_stop_time_ns: Optional[int] = None
+        self.pending_stop_name: Optional[str] = None
+        self.pending_stop_waypoint: Optional[Waypoint] = None
 
         # One-shot dwell timer implemented with a normal ROS timer that is
         # canceled after its first callback.
@@ -262,13 +246,6 @@ class RandomNav2Patrol(Node):
             self.check_nav2_ready,
         )
 
-        # Check frequently enough that a scheduled random stop can occur at
-        # essentially any point during a traversal.
-        self.random_stop_timer = self.create_timer(
-            0.10,
-            self.random_stop_timer_callback,
-        )
-
         self._setup_keyboard_input()
 
         self.get_logger().info(
@@ -317,6 +294,13 @@ class RandomNav2Patrol(Node):
         endpoint has actually been reached.
         """
         if target_index == 1:
+            return self.forward_route_yaw()
+        return self.reverse_route_yaw()
+
+
+    def current_leg_yaw(self) -> float:
+        """Return the nominal route heading for the active traversal."""
+        if self.target_index == 1:
             return self.forward_route_yaw()
         return self.reverse_route_yaw()
 
@@ -465,17 +449,13 @@ class RandomNav2Patrol(Node):
         if not self.goal_in_progress:
             return
 
-        # Mark the cancellation as pause-related even when another cancel
-        # request (e.g. a random stop) is already in flight. The result
-        # callback gives an external pause priority over the random stop.
+        # Mark this cancellation as pause-related so the result callback
+        # preserves the current patrol/stop state instead of advancing it.
         self.pause_cancel_requested = True
 
         # The goal may have been sent but not accepted yet. The goal-response
         # callback will cancel it as soon as a handle exists.
         if self.active_goal_handle is None:
-            return
-
-        if self.random_stop_cancel_requested:
             return
 
         self.get_logger().info(
@@ -633,91 +613,61 @@ class RandomNav2Patrol(Node):
         self.send_initial_position_goal()
 
     # ==================================================================
-    # Random stop scheduling / behavior
+    # Candidate stop selection / behavior
     # ==================================================================
 
-    def schedule_next_random_stop(self) -> None:
-        delay_sec = self.random_generator.uniform(
-            self.random_stop_min_interval_sec,
-            self.random_stop_max_interval_sec,
-        )
+    def candidate_stop_waypoints(self):
+        """Return the two fixed candidate stops measured from P1 toward P2."""
+        p1 = self.points[0]
+        p2 = self.points[1]
 
-        now_ns = self.get_clock().now().nanoseconds
-        self.next_random_stop_time_ns = (
-            now_ns + int(delay_sec * 1.0e9)
-        )
+        def interpolate(fraction: float) -> Waypoint:
+            return Waypoint(
+                x=p1.x + fraction * (p2.x - p1.x),
+                y=p1.y + fraction * (p2.y - p1.y),
+                frame_id=p1.frame_id,
+            )
 
+        return [
+            ('S1', interpolate(self.candidate_stop_1_fraction)),
+            ('S2', interpolate(self.candidate_stop_2_fraction)),
+        ]
+
+    def prepare_stops_for_current_leg(self) -> None:
+        """Randomly choose which of the two candidate stops this leg uses."""
+        candidates = self.candidate_stop_waypoints()
+
+        # When traveling P2 -> P1, visit the same physical stops in reverse
+        # spatial order so the robot always progresses monotonically along the
+        # segment.
+        if self.target_index == 0:
+            candidates = list(reversed(candidates))
+
+        selected = []
+        decisions = []
+        for name, waypoint in candidates:
+            use_stop = (
+                self.random_generator.random()
+                < self.candidate_stop_probability
+            )
+            decisions.append(f'{name}={"STOP" if use_stop else "SKIP"}')
+            if use_stop:
+                selected.append((name, waypoint))
+
+        self.current_leg_stops = selected
+        self.current_leg_stop_index = 0
+
+        direction = 'P1 -> P2' if self.target_index == 1 else 'P2 -> P1'
         self.get_logger().info(
-            f'Next random orientation stop eligible in '
-            f'{delay_sec:.2f} s.'
+            f'Leg {self.leg_number} candidate stops ({direction}): '
+            + ', '.join(decisions)
         )
 
-    def clear_random_stop_schedule(self) -> None:
-        self.next_random_stop_time_ns = None
-
-    def random_stop_timer_callback(self) -> None:
-        # Random stops only occur during an actual P1<->P2 traversal.
-        if not self.initial_positioning_complete:
-            return
-
-        if self._patrol_paused():
-            return
-
-        if not self.goal_in_progress:
-            return
-
-        if self.active_goal_kind != 'travel':
-            return
-
-        if self.random_stop_cancel_requested:
-            return
-
-        if self.pause_cancel_requested:
-            return
-
-        if self.next_random_stop_time_ns is None:
-            return
-
-        if (
-            self.get_clock().now().nanoseconds
-            < self.next_random_stop_time_ns
-        ):
-            return
-
-        # Wait until Nav2 has supplied a current pose.
-        if self.latest_current_pose is None:
-            return
-
-        # Do not start a random orientation stop right on top of the endpoint.
-        if (
-            self.latest_distance_remaining is not None
-            and self.latest_distance_remaining
-            <= self.min_random_stop_distance_from_endpoint_m
-        ):
-            return
-
-        self.request_random_orientation_stop()
-
-    def request_random_orientation_stop(self) -> None:
-        """Cancel travel, then rotate in place to a legal random heading."""
-
-        if self.active_goal_kind != 'travel':
-            return
-
-        if self.active_goal_handle is None:
-            return
-
-        if self._patrol_paused():
-            return
-
-        # Choose the random orientation relative to the robot's observed
-        # heading at the moment the stop is requested. This guarantees the
-        # commanded rotation itself is right-only or left-only, even if the
-        # local planner has the robot slightly off the ideal straight-line
-        # route heading.
+    def choose_random_stop_orientation(self) -> None:
+        """Choose a legal route-relative orientation for the current stop."""
         angle_deg = self.random_generator.uniform(0.0, 180.0)
         angle_rad = math.radians(angle_deg)
-        base_yaw = self.yaw_from_pose(self.latest_current_pose)
+        base_yaw = self.current_leg_yaw()
 
         if self.target_index == 1:
             # P1 -> P2: RIGHT only. In standard ROS yaw, right is negative.
@@ -730,17 +680,11 @@ class RandomNav2Patrol(Node):
 
         self.pending_random_yaw = random_yaw
         self.pending_random_angle_deg = angle_deg
-        self.random_stop_cancel_requested = True
-        self.clear_random_stop_schedule()
 
+        stop_name = self.pending_stop_name or '?'
         self.get_logger().info(
-            f'Random stop triggered while heading toward P{self.target_index + 1}: '
-            f'{direction_text} turn of {angle_deg:.1f} deg.'
-        )
-
-        cancel_future = self.active_goal_handle.cancel_goal_async()
-        cancel_future.add_done_callback(
-            self.cancel_response_callback
+            f'{stop_name}: selected {direction_text} turn of '
+            f'{angle_deg:.1f} deg relative to route heading.'
         )
 
     def begin_random_stop_dwell(self) -> None:
@@ -768,11 +712,18 @@ class RandomNav2Patrol(Node):
                 pass
             self.dwell_timer = None
 
+        completed_stop = self.pending_stop_name
         self.pending_random_yaw = None
         self.pending_random_angle_deg = None
+        self.pending_stop_name = None
+        self.pending_stop_waypoint = None
+
+        # The selected candidate has now been fully serviced. Advance to the
+        # next selected candidate (if any), otherwise the endpoint.
+        self.current_leg_stop_index += 1
 
         self.get_logger().info(
-            'Random orientation dwell complete.'
+            f'{completed_stop or "Candidate stop"} dwell complete.'
         )
 
         if self._patrol_paused():
@@ -858,7 +809,7 @@ class RandomNav2Patrol(Node):
         )
 
     def send_current_goal(self) -> None:
-        """Send/resend the current endpoint travel goal."""
+        """Send/resend the next selected stop or current endpoint goal."""
 
         if self._patrol_paused():
             return
@@ -868,6 +819,29 @@ class RandomNav2Patrol(Node):
 
         if not self.initial_positioning_complete:
             self.send_initial_position_goal()
+            return
+
+        # Visit only the candidate stops selected for this traversal.
+        if self.current_leg_stop_index < len(self.current_leg_stops):
+            stop_name, stop = self.current_leg_stops[
+                self.current_leg_stop_index
+            ]
+            yaw = self.current_leg_yaw()
+
+            goal = self.make_goal(
+                stop.x,
+                stop.y,
+                stop.frame_id,
+                yaw,
+            )
+
+            self.send_goal(
+                goal,
+                'candidate_travel',
+                f'Heading to selected candidate {stop_name} '
+                f'({stop.x:.3f}, {stop.y:.3f}) on leg '
+                f'{self.leg_number}.',
+            )
             return
 
         waypoint = self.points[self.target_index]
@@ -880,17 +854,14 @@ class RandomNav2Patrol(Node):
             yaw,
         )
 
-        if self.target_index == 1:
-            direction_text = 'P1 -> P2'
-        else:
-            direction_text = 'P2 -> P1'
-
-        self.schedule_next_random_stop()
+        direction_text = (
+            'P1 -> P2' if self.target_index == 1 else 'P2 -> P1'
+        )
 
         self.send_goal(
             goal,
             'travel',
-            f'Starting leg {self.leg_number}: {direction_text}. '
+            f'Continuing leg {self.leg_number}: {direction_text}. '
             f'Target P{self.target_index + 1} '
             f'({waypoint.x:.3f}, {waypoint.y:.3f}).',
         )
@@ -908,23 +879,22 @@ class RandomNav2Patrol(Node):
             self.send_current_goal()
             return
 
-        if self.latest_current_pose is None:
+        if self.pending_stop_waypoint is None:
             self.get_logger().warning(
-                'No current Nav2 pose available for random stop; '
-                'resuming travel.'
+                'No pending candidate stop position; resuming travel.'
             )
             self.pending_random_yaw = None
             self.pending_random_angle_deg = None
+            self.pending_stop_name = None
             self.send_current_goal()
             return
 
-        pose = self.latest_current_pose
-        frame_id = pose.header.frame_id or self.frame_id
+        stop = self.pending_stop_waypoint
 
         goal = self.make_goal(
-            pose.pose.position.x,
-            pose.pose.position.y,
-            frame_id,
+            stop.x,
+            stop.y,
+            stop.frame_id,
             self.pending_random_yaw,
         )
 
@@ -937,8 +907,8 @@ class RandomNav2Patrol(Node):
         self.send_goal(
             goal,
             'random_orientation',
-            f'Rotating in place for random stop '
-            f'({angle_text} deg from travel heading).',
+            f'Rotating in place at {self.pending_stop_name or "candidate stop"} '
+            f'({angle_text} deg from route heading).',
         )
 
     def send_endpoint_turn_goal(self) -> None:
@@ -1058,10 +1028,7 @@ class RandomNav2Patrol(Node):
         self.active_goal_kind = None
 
         was_pause_cancel = self.pause_cancel_requested
-        was_random_stop_cancel = self.random_stop_cancel_requested
-
         self.pause_cancel_requested = False
-        self.random_stop_cancel_requested = False
 
         try:
             result = future.result()
@@ -1086,13 +1053,30 @@ class RandomNav2Patrol(Node):
                 self.initial_positioning_complete = True
                 self.target_index = 1
                 self.leg_number = 1
+                self.prepare_stops_for_current_leg()
                 self.send_current_goal()
                 return
 
+            if goal_kind == 'candidate_travel':
+                stop_name, stop = self.current_leg_stops[
+                    self.current_leg_stop_index
+                ]
+                self.pending_stop_name = stop_name
+                self.pending_stop_waypoint = stop
+                self.choose_random_stop_orientation()
+
+                self.get_logger().info(
+                    f'Reached selected candidate {stop_name}; '
+                    'starting in-place random orientation.'
+                )
+                self.send_random_orientation_goal()
+                return
+
             if goal_kind == 'travel':
-                self.clear_random_stop_schedule()
                 self.pending_random_yaw = None
                 self.pending_random_angle_deg = None
+                self.pending_stop_name = None
+                self.pending_stop_waypoint = None
                 self.get_logger().info(
                     f'Reached P{self.target_index + 1}.'
                 )
@@ -1113,6 +1097,7 @@ class RandomNav2Patrol(Node):
 
                 self.target_index = opposite_index
                 self.leg_number += 1
+                self.prepare_stops_for_current_leg()
                 self.send_current_goal()
                 return
 
@@ -1140,10 +1125,6 @@ class RandomNav2Patrol(Node):
                 f'{goal_kind} goal paused. Patrol state will be preserved.'
             )
 
-            if goal_kind == 'travel' and was_random_stop_cancel:
-                self.pending_random_yaw = None
-                self.pending_random_angle_deg = None
-
             if goal_kind in (
                 'random_orientation',
                 'endpoint_turn',
@@ -1156,30 +1137,6 @@ class RandomNav2Patrol(Node):
             # If all pause sources were already released while cancellation
             # was in flight, resume immediately.
             self.resume_patrol_if_possible()
-            return
-
-        # ------------------------------------------------------------
-        # Cancellation requested specifically to create a random stop
-        # ------------------------------------------------------------
-        if (
-            status == GoalStatus.STATUS_CANCELED
-            and was_random_stop_cancel
-            and goal_kind == 'travel'
-        ):
-            self.get_logger().info(
-                'Travel canceled at current position for random '
-                'orientation stop.'
-            )
-
-            if self._patrol_paused():
-                # External pause always wins. Do not perform the random turn
-                # after the user/system has requested a patrol pause.
-                self.pending_random_yaw = None
-                self.pending_random_angle_deg = None
-                self.resume_patrol_if_possible()
-                return
-
-            self.send_random_orientation_goal()
             return
 
         # ------------------------------------------------------------
@@ -1217,11 +1174,14 @@ class RandomNav2Patrol(Node):
         # Auxiliary turn failures should not cause an endpoint to be skipped.
         if goal_kind == 'random_orientation':
             self.get_logger().warning(
-                'Random orientation goal failed; resuming travel '
-                'toward the same endpoint.'
+                'Random orientation goal failed; skipping this stop and '
+                'resuming travel toward the same endpoint.'
             )
             self.pending_random_yaw = None
             self.pending_random_angle_deg = None
+            self.pending_stop_name = None
+            self.pending_stop_waypoint = None
+            self.current_leg_stop_index += 1
             self.send_current_goal()
             return
 
@@ -1236,6 +1196,7 @@ class RandomNav2Patrol(Node):
 
             self.target_index = opposite_index
             self.leg_number += 1
+            self.prepare_stops_for_current_leg()
             self.send_current_goal()
             return
 
@@ -1247,16 +1208,32 @@ class RandomNav2Patrol(Node):
             self.initial_positioning_complete = True
             self.target_index = 1
             self.leg_number = 1
+            self.prepare_stops_for_current_leg()
             self.send_current_goal()
             return
 
-        # Match the original continue_on_failure behavior for travel: skip the
-        # failed endpoint and continue toward the opposite endpoint.
+        if goal_kind == 'candidate_travel':
+            stop_name = '?'
+            if self.current_leg_stop_index < len(self.current_leg_stops):
+                stop_name = self.current_leg_stops[
+                    self.current_leg_stop_index
+                ][0]
+
+            self.get_logger().warning(
+                f'Candidate {stop_name} travel failed; skipping this '
+                'candidate and continuing toward the same endpoint.'
+            )
+            self.current_leg_stop_index += 1
+            self.send_current_goal()
+            return
+
+        # Match the original continue_on_failure behavior for endpoint travel:
+        # skip the failed endpoint and continue toward the opposite endpoint.
         if goal_kind == 'travel':
             failed_index = self.target_index
             self.target_index = 1 - failed_index
             self.leg_number += 1
-            self.clear_random_stop_schedule()
+            self.prepare_stops_for_current_leg()
 
             self.get_logger().warning(
                 f'Skipping failed P{failed_index + 1} and continuing '
@@ -1281,12 +1258,6 @@ class RandomNav2Patrol(Node):
         if self.keyboard_timer is not None:
             try:
                 self.keyboard_timer.cancel()
-            except Exception:
-                pass
-
-        if self.random_stop_timer is not None:
-            try:
-                self.random_stop_timer.cancel()
             except Exception:
                 pass
 
