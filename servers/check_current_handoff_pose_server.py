@@ -23,10 +23,11 @@ from quest_hand_intent_model_est.src.quest_joint_features import (
 )
 from quest_hand_intent_model_est.src.find_minimal_perturbation import find_minimal_perturbation
 from quest_hand_intent_model_est.src.text_guidance_from_pert import generate_text_guidance_from_perturbation
-from quest_hand_intent_model_est.src.posefix_guidance import (
-    configure_posefix_for_hand_guidance,
-    generate_posefix_guidance,
-)
+#Uncomment for text guidance
+# from quest_hand_intent_model_est.src.posefix_guidance import (
+#     configure_posefix_for_hand_guidance,
+#     generate_posefix_guidance,
+# )
 from shared.util.quest_joints_network_dat_str import QuestJointsPacket
 
 from model_training_and_implementation.src.resnet_encoder import ResNet18ImageEncoder
@@ -202,19 +203,19 @@ def format_perturbation_response(
     print(joint_position_perturbations)
 
     text_guidance = ""
-    if generate_text_guidance:
-        original_joint_poses_dict = feature_vector_to_joint_poses(
-                original_joints
-            )
-        text_guidance = generate_posefix_guidance(
-                original_joints=(
-                    original_joint_poses_dict
-                ),
-                perturbed_joints=(
-                    perturbed_joint_poses_dict
-                ),
-                simplified_instructions=True,
-            )
+    # if generate_text_guidance:
+    #     original_joint_poses_dict = feature_vector_to_joint_poses(
+    #             original_joints
+    #         )
+    #     text_guidance = generate_posefix_guidance(
+    #             original_joints=(
+    #                 original_joint_poses_dict
+    #             ),
+    #             perturbed_joints=(
+    #                 perturbed_joint_poses_dict
+    #             ),
+    #             simplified_instructions=True,
+    #         )
         
     return {
         "perturbations_needed": perturbations_needed,
@@ -342,7 +343,8 @@ def create_app(
             f"Invalid quest_model_type: {quest_model_type}"
         )
     
-    configure_posefix_for_hand_guidance()
+    
+    #configure_posefix_for_hand_guidance()
 
     # ------------------------------------------------------------------
     # Quest-side image models
@@ -675,7 +677,7 @@ def create_app(
         return res
 
 
-    configure_posefix_for_hand_guidance()
+    #configure_posefix_for_hand_guidance()
 
 
     @app.post("/quest_joints")
