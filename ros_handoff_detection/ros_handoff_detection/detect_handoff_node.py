@@ -62,7 +62,7 @@ class HandoffInferenceNode(Node):
         # frame confirmation required before patrol is paused.
         self.declare_parameter(
             "threshold",
-            0.6,
+            0.85,
         )
 
         # Require this many consecutive frames at/above the committed
