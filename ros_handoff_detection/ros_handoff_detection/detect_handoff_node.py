@@ -79,6 +79,13 @@ class HandoffInferenceNode(Node):
             "/handoff_pause_patrol",
         )
 
+        # Handoff inference is enabled only while the patrol node reports that
+        # the robot is stopped in its midpoint pickup state.
+        self.declare_parameter(
+            "pickup_state_topic",
+            "/pickup_state",
+        )
+
         self.declare_parameter(
             "show_output_window",
             False,
@@ -273,6 +280,12 @@ class HandoffInferenceNode(Node):
             .string_value
         )
 
+        pickup_state_topic = (
+            self.get_parameter("pickup_state_topic")
+            .get_parameter_value()
+            .string_value
+        )
+
         show_output_window = (
             self.get_parameter("show_output_window")
             .get_parameter_value()
@@ -448,6 +461,10 @@ class HandoffInferenceNode(Node):
         )
 
         self.get_logger().info(
+            f"  pickup_state_topic={pickup_state_topic}"
+        )
+
+        self.get_logger().info(
             f"  show_output_window={show_output_window}"
         )
 
@@ -550,6 +567,8 @@ class HandoffInferenceNode(Node):
             handoff_confirmation_frames
         )
         self.handoff_pause_topic = str(handoff_pause_topic)
+        self.pickup_state_topic = str(pickup_state_topic)
+        self.pickup_state_active = False
         self.show_output_window = bool(show_output_window)
         self.debug = bool(debug)
         self.output_window_name = "Handoff Classification"
@@ -958,6 +977,17 @@ class HandoffInferenceNode(Node):
             pause_qos,
         )
 
+        # Match the patrol node's transient-local pickup-state publisher so a
+        # newly started detector immediately receives the current state.
+        pickup_qos = QoSProfile(depth=1)
+        pickup_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.pickup_state_sub = self.create_subscription(
+            Bool,
+            self.pickup_state_topic,
+            self._pickup_state_callback,
+            pickup_qos,
+        )
+
         # Start in the non-paused state.
         self._publish_handoff_pause(False)
 
@@ -977,6 +1007,38 @@ class HandoffInferenceNode(Node):
             "Waiting for synchronized RGB-D frames..."
         )
 
+    def _pickup_state_callback(self, msg: Bool):
+        """Enable normal handoff detection only during the patrol pickup state."""
+        active = bool(msg.data)
+        if active == self.pickup_state_active:
+            return
+
+        self.pickup_state_active = active
+        self.get_logger().info(
+            "Pickup state " + ("ACTIVE" if active else "INACTIVE") + "."
+        )
+
+        if not active:
+            # Do not carry any positive evidence across pickup windows.
+            self._handoff_confirmation_count = 0
+            self._last_handoff_stop_condition = False
+            self._reset_aborted_attempt_candidate()
+            self._aborted_attempt_detection_armed = True
+
+            # Clear any latched downstream classification from the pickup
+            # window even though normal inference is now disabled.
+            classification_msg = String()
+            classification_msg.data = "not_handoff"
+            confidence_msg = Float32()
+            confidence_msg.data = 1.0
+            self.classification_pub.publish(classification_msg)
+            self.confidence_pub.publish(confidence_msg)
+
+            # Inference is skipped outside pickup state, so explicitly restore
+            # normal patrol speed rather than waiting for another RTMPose frame.
+            self._last_person_seen_monotonic = None
+            self._set_person_slowdown_desired(False)
+
     def image_callback(
         self,
         rgb_msg,
@@ -984,7 +1046,6 @@ class HandoffInferenceNode(Node):
     ):
         if not self._received_first_frame:
             self._received_first_frame = True
-
             self.get_logger().info(
                 "Received first synchronized RGB-D frame."
             )
@@ -997,107 +1058,97 @@ class HandoffInferenceNode(Node):
                 rgb_msg,
                 desired_encoding="rgb8",
             )
-
-            # Preserve native depth representation, e.g. uint16 Z16.
             depth_image = self.bridge.imgmsg_to_cv2(
                 depth_msg,
                 desired_encoding="passthrough",
             )
 
-            # -----------------------------------------------------
-            # Person presence + handoff inference
-            # -----------------------------------------------------
-            # IMPORTANT: do NOT run a separate RTMPose person-presence pass
-            # here. The detector wrapper already calls its RTMPose detector as
-            # the first stage of detector.predict(). We temporarily observe
-            # that first internal result, use it for the slowdown/person gate,
-            # and then let the wrapper continue normally. With person cropping
-            # enabled this reduces a person-visible frame from three RTMPose
-            # calls to the wrapper's original two calls.
-            (
-                classification,
-                confidence,
-                person_present,
-            ) = self._predict_and_capture_person_presence(
-                rgb_image,
-                depth_image,
-            )
+            # Default output while pickup is inactive. No model inference is
+            # performed in this state unless S is pressed for data collection.
+            classification = "not_handoff"
+            confidence = 1.0
+            person_present = False
+            handoff_probability = 0.0
+            handoff_stop_condition = False
 
-            if person_present:
-                handoff_probability = (
-                    self._handoff_probability_from_result(
-                        classification,
-                        float(confidence),
+            if self.pickup_state_active:
+                # -------------------------------------------------
+                # Normal person presence + handoff inference
+                # -------------------------------------------------
+                (
+                    classification,
+                    confidence,
+                    person_present,
+                ) = self._predict_and_capture_person_presence(
+                    rgb_image,
+                    depth_image,
+                    update_slowdown=True,
+                )
+
+                if person_present:
+                    handoff_probability = (
+                        self._handoff_probability_from_result(
+                            classification,
+                            float(confidence),
+                        )
                     )
-                )
-            else:
-                # The wrapper may return a negative itself when its first
-                # RTMPose pass finds no usable person. Publish an explicit
-                # no-person negative so downstream consumers never interpret
-                # wrapper confidence as handoff evidence for an empty frame.
-                classification = "not_handoff"
-                confidence = 1.0
-                handoff_probability = 0.0
+                else:
+                    classification = "not_handoff"
+                    confidence = 1.0
+                    handoff_probability = 0.0
 
-            # -----------------------------------------------------
-            # Publish result
-            # -----------------------------------------------------
-            classification_msg = String()
-            classification_msg.data = classification
+                # Publish normal inference results only while pickup is active.
+                classification_msg = String()
+                classification_msg.data = classification
+                confidence_msg = Float32()
+                confidence_msg.data = float(confidence)
+                self.classification_pub.publish(classification_msg)
+                self.confidence_pub.publish(confidence_msg)
 
-            confidence_msg = Float32()
-            confidence_msg.data = float(confidence)
+                if person_present:
+                    self.get_logger().info(
+                        f"[{self.model_type.upper()}] "
+                        f"{classification} "
+                        f"(confidence={confidence:.3f}, "
+                        f"P(handoff)={handoff_probability:.3f})"
+                    )
+                else:
+                    self.get_logger().info(
+                        "No valid person detected in wrapper RTMPose gate."
+                    )
 
-            self.classification_pub.publish(classification_msg)
-            self.confidence_pub.publish(confidence_msg)
-
-            if person_present:
-                self.get_logger().info(
-                    f"[{self.model_type.upper()}] "
-                    f"{classification} "
-                    f"(confidence={confidence:.3f}, "
-                    f"P(handoff)={handoff_probability:.3f})"
-                )
-            else:
-                self.get_logger().info(
-                    "No valid person detected in wrapper RTMPose gate."
+                raw_handoff_stop_condition = (
+                    person_present
+                    and classification == "handoff"
+                    and handoff_probability >= self.handoff_stop_threshold
                 )
 
-            # -----------------------------------------------------
-            # Debounce the committed handoff decision
-            # -----------------------------------------------------
-            raw_handoff_stop_condition = (
-                person_present
-                and classification == "handoff"
-                and handoff_probability >= self.handoff_stop_threshold
-            )
+                if raw_handoff_stop_condition:
+                    self._handoff_confirmation_count += 1
+                else:
+                    self._handoff_confirmation_count = 0
 
-            if raw_handoff_stop_condition:
-                self._handoff_confirmation_count += 1
+                handoff_stop_condition = (
+                    self._handoff_confirmation_count
+                    >= self.handoff_confirmation_frames
+                )
+
+                if (
+                    self.aborted_handoff_logging_enabled
+                    or self.robot_reaction_time_logging_enabled
+                ):
+                    self._update_aborted_handoff_attempt_tracking(
+                        handoff_probability,
+                        handoff_committed=handoff_stop_condition,
+                    )
             else:
-                # This explicitly resets across any person-tracking loss, so
-                # two positive frames separated by a missing-person frame do
-                # not count as consecutive evidence.
+                # Pickup inactive means no handoff evidence, no attempt state,
+                # and no committed trigger can accumulate.
                 self._handoff_confirmation_count = 0
-
-            handoff_stop_condition = (
-                self._handoff_confirmation_count
-                >= self.handoff_confirmation_frames
-            )
-
-            if (
-                self.aborted_handoff_logging_enabled
-                or self.robot_reaction_time_logging_enabled
-            ):
-                # P(handoff)=0 while no person is present lets any incipient
-                # attempt naturally clear through the existing hysteresis.
-                self._update_aborted_handoff_attempt_tracking(
-                    handoff_probability,
-                    handoff_committed=handoff_stop_condition,
-                )
+                self._last_handoff_stop_condition = False
 
             # -----------------------------------------------------
-            # Optional output window + existing S/Q key behavior
+            # Optional output window + Q/S key behavior
             # -----------------------------------------------------
             if self.show_output_window:
                 display_image = cv2.cvtColor(
@@ -1105,13 +1156,16 @@ class HandoffInferenceNode(Node):
                     cv2.COLOR_RGB2BGR,
                 )
 
-                if person_present:
-                    label = (
-                        f"{classification} | "
-                        f"P(handoff)={handoff_probability:.3f}"
-                    )
+                if self.pickup_state_active:
+                    if person_present:
+                        label = (
+                            f"{classification} | "
+                            f"P(handoff)={handoff_probability:.3f}"
+                        )
+                    else:
+                        label = "NO PERSON | handoff inference skipped"
                 else:
-                    label = "NO PERSON | handoff inference skipped"
+                    label = "PICKUP INACTIVE | detection disabled"
 
                 cv2.putText(
                     display_image,
@@ -1124,11 +1178,15 @@ class HandoffInferenceNode(Node):
                     cv2.LINE_AA,
                 )
 
-                speed_label = (
-                    "SLOW"
-                    if self._person_slowdown_desired
-                    else "NORMAL SPEED"
-                )
+                if self.pickup_state_active:
+                    speed_label = (
+                        "SLOW"
+                        if self._person_slowdown_desired
+                        else "NORMAL SPEED"
+                    )
+                else:
+                    speed_label = "S = EVALUATE/SAVE OVERRIDE"
+
                 cv2.putText(
                     display_image,
                     speed_label,
@@ -1147,41 +1205,99 @@ class HandoffInferenceNode(Node):
 
                 key = cv2.waitKey(1) & 0xFF
 
-                # Existing behavior: Q/q stops future study-server logging.
                 if key in (ord("q"), ord("Q")):
                     self._stop_server_logging()
 
-                # Existing behavior: S/s saves exactly the annotated frame
-                # being displayed and appends its P(handoff) to the CSV.
                 if (
                     self.save_viz_images
                     and key in (ord("s"), ord("S"))
                 ):
+                    if self.pickup_state_active:
+                        # Normal pickup-state save uses the inference result
+                        # already computed for this frame.
+                        save_display_image = display_image
+                        save_classification = classification
+                        save_confidence = float(confidence)
+                        save_handoff_probability = float(handoff_probability)
+                    else:
+                        # Explicit data-collection override: run the model once
+                        # for this exact frame, but do NOT publish, accumulate
+                        # detection evidence, log abort/reaction events, slow
+                        # Nav2, pause patrol, or activate the servo.
+                        (
+                            save_classification,
+                            save_confidence,
+                            save_person_present,
+                        ) = self._predict_and_capture_person_presence(
+                            rgb_image,
+                            depth_image,
+                            update_slowdown=False,
+                        )
+
+                        if save_person_present:
+                            save_handoff_probability = (
+                                self._handoff_probability_from_result(
+                                    save_classification,
+                                    float(save_confidence),
+                                )
+                            )
+                        else:
+                            save_classification = "not_handoff"
+                            save_confidence = 1.0
+                            save_handoff_probability = 0.0
+
+                        save_display_image = cv2.cvtColor(
+                            rgb_image,
+                            cv2.COLOR_RGB2BGR,
+                        )
+                        save_label = (
+                            f"{save_classification} | "
+                            f"P(handoff)={save_handoff_probability:.3f}"
+                        )
+                        cv2.putText(
+                            save_display_image,
+                            save_label,
+                            (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.0,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        cv2.putText(
+                            save_display_image,
+                            "S OVERRIDE | PICKUP INACTIVE",
+                            (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+
                     self._save_visualization_image(
-                        display_image=display_image,
-                        classification=classification,
-                        confidence=float(confidence),
-                        handoff_probability=float(handoff_probability),
+                        display_image=save_display_image,
+                        classification=save_classification,
+                        confidence=float(save_confidence),
+                        handoff_probability=float(save_handoff_probability),
                     )
 
             # -----------------------------------------------------
-            # Handoff interaction trigger
+            # Handoff interaction trigger -- pickup state only
             # -----------------------------------------------------
-            # Person present -> slowdown + handoff evaluation. Two consecutive handoff
-            # frames at/above threshold -> existing cancel/servo interval.
             if (
-                handoff_stop_condition
+                self.pickup_state_active
+                and handoff_stop_condition
                 and not self._last_handoff_stop_condition
                 and not self._handoff_active
             ):
                 self._start_handoff_interaction()
 
-            self._last_handoff_stop_condition = handoff_stop_condition
+            self._last_handoff_stop_condition = (
+                handoff_stop_condition if self.pickup_state_active else False
+            )
 
         except Exception as exc:
-            # A failed callback must not carry positive evidence into the next
-            # frame. The slowdown itself is released only through the person
-            # absence grace logic on subsequent successful callbacks.
             self._handoff_confirmation_count = 0
             self._last_handoff_stop_condition = False
 
@@ -1229,6 +1345,7 @@ class HandoffInferenceNode(Node):
         self,
         rgb_image,
         depth_image,
+        update_slowdown: bool = True,
     ):
         """Run detector.predict once and reuse its first RTMPose result.
 
@@ -1273,12 +1390,13 @@ class HandoffInferenceNode(Node):
                     self._people_contain_valid_person(people)
                 )
 
-                # Apply/release the slowdown as soon as the wrapper's first
-                # RTMPose result is available rather than waiting for the
-                # remainder of the handoff inference to finish.
-                self._update_person_slowdown_state(
-                    first_call_person_present
-                )
+                # Normal pickup-state inference may update the Nav2 slowdown.
+                # S-key override inference outside pickup state explicitly
+                # disables this side effect.
+                if update_slowdown:
+                    self._update_person_slowdown_state(
+                        first_call_person_present
+                    )
 
                 # Preserve the previous node-level gate without paying for a
                 # separate RTMPose pass: if the wrapper's own first RTMPose
@@ -1352,8 +1470,8 @@ class HandoffInferenceNode(Node):
 
         if should_slow:
             self.get_logger().info(
-                "Valid person detected: requesting reduced patrol speed and "
-                "enabling handoff inference."
+                "Valid person detected during pickup state: requesting "
+                "reduced patrol speed."
             )
         else:
             self.get_logger().info(
