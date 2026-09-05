@@ -167,7 +167,7 @@ class HandoffInferenceNode(Node):
 
         self.declare_parameter(
             "aborted_handoff_server_ip",
-            "10.237.193.186",
+            "192.168.1.62",
         )
 
         self.declare_parameter(
