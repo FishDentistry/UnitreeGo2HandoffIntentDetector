@@ -1,0 +1,189 @@
+{
+  "split": {
+    "strategy": "whole-session LOSO",
+    "train_session_ids": [
+      "quest_robot_forward_20260814T191833108Z",
+      "quest_robot_forward_20260814T192232594Z",
+      "quest_robot_forward_20260814T203404629Z",
+      "quest_robot_forward_20260814T215603516Z"
+    ],
+    "validation_session_id": "quest_robot_forward_20260814T182045301Z",
+    "test_session_id": "quest_robot_forward_20260814T181318899Z"
+  },
+  "counts": {
+    "raw_train": 7155,
+    "train_used": 973,
+    "train_thinned_out": 6182,
+    "validation": 1255,
+    "test": 1410
+  },
+  "oa": {
+    "checkpoint": "/home/christianfronk/.cache/huggingface/hub/models--Viglong--Orient-Anything/blobs/ff45ca7809b2f1f29106405e0c2efb4697d46bba68ae3b728393c6757cc9b839",
+    "scale": "small",
+    "output_dim": 722,
+    "yaw_map_sign": 1,
+    "yaw_map_offset_deg": 171,
+    "mapping_mode": "auto",
+    "mapping_samples": 973,
+    "mapping_mean_error_deg": 62.34949132227334,
+    "mapping_median_error_deg": 20.57647705078125
+  },
+  "training": {
+    "target_mode": "signed",
+    "target_sigma_deg": 10.0,
+    "temporal_thin_seconds": 0.5,
+    "session_balanced_sampling": true,
+    "best_epoch": 45,
+    "best_validation_mean_error_deg": 7.67873487451162
+  },
+  "constant_baseline": {
+    "prediction_deg": 178.0,
+    "train": {
+      "n": 973,
+      "mean_error_deg": 85.69450092643814,
+      "median_error_deg": 82.47854169634576,
+      "p90_error_deg": 167.22612792954519,
+      "p95_error_deg": 174.35065188443625,
+      "within_5_deg": 0.0565262076053443,
+      "within_10_deg": 0.0986639260020555,
+      "within_15_deg": 0.1366906474820144,
+      "within_30_deg": 0.25488180883864336
+    },
+    "validation": {
+      "n": 1255,
+      "mean_error_deg": 99.88752404259672,
+      "median_error_deg": 101.222143009462,
+      "p90_error_deg": 157.24122363702043,
+      "p95_error_deg": 168.18962298435008,
+      "within_5_deg": 0.014342629482071713,
+      "within_10_deg": 0.027888446215139442,
+      "within_15_deg": 0.04223107569721116,
+      "within_30_deg": 0.08525896414342629
+    },
+    "test": {
+      "n": 1410,
+      "mean_error_deg": 102.06261029365794,
+      "median_error_deg": 113.15699986138648,
+      "p90_error_deg": 175.7121508360675,
+      "p95_error_deg": 178.68395613637463,
+      "within_5_deg": 0.029787234042553193,
+      "within_10_deg": 0.05673758865248227,
+      "within_15_deg": 0.08652482269503546,
+      "within_30_deg": 0.18936170212765957
+    }
+  },
+  "pretrained": {
+    "validation_argmax": {
+      "n": 1255,
+      "mean_error_deg": 78.65919199474304,
+      "median_error_deg": 81.55706787109375,
+      "p90_error_deg": 165.60902557373046,
+      "p95_error_deg": 170.55684127807618,
+      "within_5_deg": 0.09083665338645418,
+      "within_10_deg": 0.14422310756972112,
+      "within_15_deg": 0.20398406374501993,
+      "within_30_deg": 0.33306772908366533
+    },
+    "validation_mean": {
+      "n": 1255,
+      "mean_error_deg": 73.15995179213495,
+      "median_error_deg": 67.00690841674805,
+      "p90_error_deg": 159.26477966308596,
+      "p95_error_deg": 169.72495117187498,
+      "within_5_deg": 0.04780876494023904,
+      "within_10_deg": 0.08924302788844622,
+      "within_15_deg": 0.13864541832669322,
+      "within_30_deg": 0.2852589641434263
+    },
+    "test_argmax": {
+      "n": 1410,
+      "mean_error_deg": 82.56015964294949,
+      "median_error_deg": 68.57976531982422,
+      "p90_error_deg": 174.79193639755252,
+      "p95_error_deg": 177.18101835250854,
+      "within_5_deg": 0.10070921985815603,
+      "within_10_deg": 0.21063829787234042,
+      "within_15_deg": 0.29858156028368793,
+      "within_30_deg": 0.41914893617021276
+    },
+    "test_mean": {
+      "n": 1410,
+      "mean_error_deg": 82.56272480638684,
+      "median_error_deg": 71.83293628692627,
+      "p90_error_deg": 169.62511129379274,
+      "p95_error_deg": 174.45526771545408,
+      "within_5_deg": 0.062411347517730496,
+      "within_10_deg": 0.14468085106382977,
+      "within_15_deg": 0.20212765957446807,
+      "within_30_deg": 0.30638297872340425
+    }
+  },
+  "final": {
+    "train_argmax": {
+      "n": 973,
+      "mean_error_deg": 0.6142494367303486,
+      "median_error_deg": 0.4834747314453125,
+      "p90_error_deg": 1.3498001098632812,
+      "p95_error_deg": 1.7165451049804683,
+      "within_5_deg": 1.0,
+      "within_10_deg": 1.0,
+      "within_15_deg": 1.0,
+      "within_30_deg": 1.0
+    },
+    "train_mean": {
+      "n": 973,
+      "mean_error_deg": 0.4456862871786857,
+      "median_error_deg": 0.2999753952026367,
+      "p90_error_deg": 1.0211791992187504,
+      "p95_error_deg": 1.3279396057128907,
+      "within_5_deg": 1.0,
+      "within_10_deg": 1.0,
+      "within_15_deg": 1.0,
+      "within_30_deg": 1.0
+    },
+    "validation_argmax": {
+      "n": 1255,
+      "mean_error_deg": 7.577234539662699,
+      "median_error_deg": 3.0809288024902344,
+      "p90_error_deg": 7.77475967407227,
+      "p95_error_deg": 10.266823577880858,
+      "within_5_deg": 0.7227091633466135,
+      "within_10_deg": 0.9458167330677291,
+      "within_15_deg": 0.9737051792828685,
+      "within_30_deg": 0.9752988047808765
+    },
+    "validation_mean": {
+      "n": 1255,
+      "mean_error_deg": 7.67873487451162,
+      "median_error_deg": 3.2387313842773438,
+      "p90_error_deg": 7.69985809326172,
+      "p95_error_deg": 10.68980484008789,
+      "within_5_deg": 0.7250996015936255,
+      "within_10_deg": 0.9426294820717132,
+      "within_15_deg": 0.9729083665338646,
+      "within_30_deg": 0.9745019920318725
+    },
+    "test_argmax": {
+      "n": 1410,
+      "mean_error_deg": 2.504177773762362,
+      "median_error_deg": 1.8369684219360352,
+      "p90_error_deg": 5.6654296875,
+      "p95_error_deg": 7.04079475402832,
+      "within_5_deg": 0.8574468085106383,
+      "within_10_deg": 0.9950354609929078,
+      "within_15_deg": 1.0,
+      "within_30_deg": 1.0
+    },
+    "test_mean": {
+      "n": 1410,
+      "mean_error_deg": 2.4782951011025207,
+      "median_error_deg": 1.8061294555664062,
+      "p90_error_deg": 5.6412082672119155,
+      "p95_error_deg": 6.936843490600584,
+      "within_5_deg": 0.8567375886524823,
+      "within_10_deg": 0.9971631205673759,
+      "within_15_deg": 1.0,
+      "within_30_deg": 1.0
+    }
+  }
+}

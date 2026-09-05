@@ -4,20 +4,19 @@ import math
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from robot_pose_prediction.src.lstm_model import RobotPoseLSTM
+from robot_pose_prediction.src.lstm_model import RobotPoseMDNLSTM
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SequenceConfig:
@@ -32,572 +31,160 @@ class SequenceConfig:
 
     @property
     def history_steps(self) -> int:
-        return int(
-            round(
-                self.history_seconds
-                * self.sample_rate_hz
-            )
-        )
+        return int(round(self.history_seconds * self.sample_rate_hz))
 
     @property
     def prediction_steps(self) -> int:
-        return int(
-            round(
-                self.prediction_seconds
-                * self.sample_rate_hz
-            )
-        )
+        return int(round(self.prediction_seconds * self.sample_rate_hz))
 
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-class FrameInvariantRobotPoseLSTM(RobotPoseLSTM):
-    """
-    Shared LSTM encoder with two heads:
-
-      1. Future trajectory head:
-         Predicts the robot's future pose sequence relative to the TRUE robot
-         pose at the prediction anchor.
-
-      2. Current relative-state head:
-         Predicts the TRUE robot motion from the start of the observed history
-         to the prediction anchor.
-
-    Both targets are expressed in locally normalized robot-relative frames.
-    No robot-map <-> Quest-world transform is estimated, stored, or assumed.
-    """
-
-    def __init__(
-        self,
-        input_size: int = 7,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        prediction_steps: int = 40,
-        decoder_hidden_size: int = 128,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            prediction_steps=prediction_steps,
-            decoder_hidden_size=decoder_hidden_size,
-            dropout=dropout,
-        )
-
-        self.current_state_decoder = nn.Sequential(
-            nn.Linear(
-                hidden_size,
-                decoder_hidden_size,
-            ),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(
-                decoder_hidden_size,
-                4,
-            ),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """
-        Returns:
-            future_prediction:
-                (B, prediction_steps, 4)
-                [x, z, heading_x, heading_z]
-
-            current_state_prediction:
-                (B, 4)
-                true motion from history start -> current anchor:
-                [delta_x, delta_z, heading_x, heading_z]
-        """
-        _, (hidden, _) = self.lstm(x)
-
-        encoded = hidden[-1]
-
-        future_output = self.decoder(
-            encoded
-        )
-
-        future_output = future_output.view(
-            x.shape[0],
-            self.prediction_steps,
-            4,
-        )
-
-        future_position = (
-            future_output[..., :2]
-        )
-
-        future_heading = F.normalize(
-            future_output[..., 2:4],
-            p=2,
-            dim=-1,
-            eps=1e-8,
-        )
-
-        future_prediction = torch.cat(
-            [
-                future_position,
-                future_heading,
-            ],
-            dim=-1,
-        )
-
-        current_output = (
-            self.current_state_decoder(
-                encoded
-            )
-        )
-
-        current_position = (
-            current_output[..., :2]
-        )
-
-        current_heading = F.normalize(
-            current_output[..., 2:4],
-            p=2,
-            dim=-1,
-            eps=1e-8,
-        )
-
-        current_state_prediction = (
-            torch.cat(
-                [
-                    current_position,
-                    current_heading,
-                ],
-                dim=-1,
-            )
-        )
-
-        return (
-            future_prediction,
-            current_state_prediction,
-        )
-
-    def get_config(self) -> dict:
-        config = super().get_config()
-
-        config.update(
-            {
-                "model_type": (
-                    "frame_invariant_dual_head_lstm"
-                ),
-                "current_state_output_size": 4,
-            }
-        )
-
-        return config
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
 
 class RobotTrajectoryDataset(Dataset):
     def __init__(
         self,
         inputs: np.ndarray,
-        future_targets: np.ndarray,
-        current_state_targets: np.ndarray,
+        targets: np.ndarray,
         input_mean: np.ndarray,
         input_std: np.ndarray,
     ) -> None:
-        self.inputs = (
-            (inputs - input_mean)
-            / input_std
-        ).astype(np.float32)
-
-        self.future_targets = (
-            future_targets.astype(
-                np.float32
-            )
-        )
-
-        self.current_state_targets = (
-            current_state_targets.astype(
-                np.float32
-            )
-        )
+        self.inputs = ((inputs - input_mean) / input_std).astype(np.float32)
+        self.targets = targets.astype(np.float32)
 
     def __len__(self) -> int:
         return len(self.inputs)
 
-    def __getitem__(
-        self,
-        index: int,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return (
-            torch.from_numpy(
-                self.inputs[index]
-            ),
-            torch.from_numpy(
-                self.future_targets[index]
-            ),
-            torch.from_numpy(
-                self.current_state_targets[
-                    index
-                ]
-            ),
+            torch.from_numpy(self.inputs[index]),
+            torch.from_numpy(self.targets[index]),
         )
 
 
 # ---------------------------------------------------------------------------
-# Utility functions
+# Data loading and robot-relative example construction
 # ---------------------------------------------------------------------------
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def load_motion_window(
+def _first_existing_key(
+    data: np.lib.npyio.NpzFile,
+    candidates: Sequence[str],
+) -> str:
+    for key in candidates:
+        if key in data:
+            return key
+    raise KeyError("None of these keys were present: " + ", ".join(candidates))
+
+
+def load_robot_motion_window(
     path: Path,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load one temporally aligned motion window.
+    Load robot-only motion from an .npz file.
 
-    The saved file must contain both:
+    Preferred keys:
+        robot_time_from_window_start  (N,)
+        robot_positions               (N, 3)
+        robot_headings                (N, 3)
 
-        Quest-estimated robot motion:
-            quest_time_from_window_start
-            quest_positions
-            quest_headings
+    Existing aligned recordings are also accepted, but ONLY the robot stream is
+    read:
+        robot_ground_truth_timestamps
+        robot_ground_truth_positions
+        robot_ground_truth_headings
 
-        Robot ground truth aligned to the Quest timestamps:
-            robot_ground_truth_positions
-            robot_ground_truth_headings
-
-    Returns:
-        times:
-            (N,)
-            Quest-relative time in seconds.
-
-        quest_positions:
-            (N, 3)
-            Noisy observer-side robot positions.
-
-        quest_headings:
-            (N, 3)
-            Noisy/delayed observer-side robot forward vectors.
-
-        ground_truth_positions:
-            (N, 3)
-            Robot ground-truth positions aligned to the same samples.
-
-        ground_truth_headings:
-            (N, 3)
-            Robot ground-truth forward vectors aligned to the same samples.
+    Generic timestamps/positions/headings are also accepted.
     """
-
-    required_keys = [
-        "quest_time_from_window_start",
-        "quest_positions",
-        "quest_headings",
-        "robot_ground_truth_positions",
-        "robot_ground_truth_headings",
-    ]
-
-    with np.load(
-        path,
-        allow_pickle=False,
-    ) as data:
-        missing_keys = [
-            key
-            for key in required_keys
-            if key not in data
-        ]
-
-        if missing_keys:
-            raise ValueError(
-                f"{path.name}: missing aligned-data keys: "
-                f"{', '.join(missing_keys)}. "
-                "This training script requires data collected "
-                "with the Quest + robot-ground-truth alignment server."
-            )
-
-        times = np.asarray(
-            data[
-                "quest_time_from_window_start"
-            ],
-            dtype=np.float64,
-        )
-
-        quest_positions = np.asarray(
-            data["quest_positions"],
-            dtype=np.float64,
-        )
-
-        quest_headings = np.asarray(
-            data["quest_headings"],
-            dtype=np.float64,
-        )
-
-        ground_truth_positions = np.asarray(
-            data[
-                "robot_ground_truth_positions"
-            ],
-            dtype=np.float64,
-        )
-
-        ground_truth_headings = np.asarray(
-            data[
-                "robot_ground_truth_headings"
-            ],
-            dtype=np.float64,
-        )
-
-        # The alignment server stores both absolute timestamp arrays.
-        # They should already match exactly because the robot ground truth
-        # was interpolated onto the Quest timestamps. Verify this when
-        # those keys are present.
-        if (
-            "quest_timestamps" in data
-            and "robot_ground_truth_timestamps"
-            in data
-        ):
-            quest_timestamps = np.asarray(
-                data["quest_timestamps"],
-                dtype=np.float64,
-            )
-
-            ground_truth_timestamps = np.asarray(
-                data[
-                    "robot_ground_truth_timestamps"
+    with np.load(path, allow_pickle=False) as data:
+        try:
+            time_key = _first_existing_key(
+                data,
+                [
+                    "robot_time_from_window_start",
+                    "robot_timestamps",
+                    "robot_ground_truth_timestamps",
+                    "time_from_window_start",
+                    "timestamps",
                 ],
-                dtype=np.float64,
             )
-
-            if (
-                quest_timestamps.shape
-                != ground_truth_timestamps.shape
-            ):
-                raise ValueError(
-                    f"{path.name}: Quest and ground-truth "
-                    "timestamp arrays have different shapes."
-                )
-
-            if not np.allclose(
-                quest_timestamps,
-                ground_truth_timestamps,
-                rtol=0.0,
-                atol=1e-6,
-            ):
-                max_difference = float(
-                    np.max(
-                        np.abs(
-                            quest_timestamps
-                            - ground_truth_timestamps
-                        )
-                    )
-                )
-
-                raise ValueError(
-                    f"{path.name}: aligned Quest and robot "
-                    "ground-truth timestamps do not match. "
-                    f"Maximum difference: "
-                    f"{max_difference:.6f} seconds."
-                )
-
-        if (
-            "alignment_warning" in data
-            and bool(
-                np.asarray(
-                    data["alignment_warning"]
-                ).item()
+            position_key = _first_existing_key(
+                data,
+                [
+                    "robot_positions",
+                    "robot_ground_truth_positions",
+                    "positions",
+                ],
             )
-        ):
-            max_gap = None
+            heading_key = _first_existing_key(
+                data,
+                [
+                    "robot_headings",
+                    "robot_ground_truth_headings",
+                    "headings",
+                ],
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"{path.name}: unrecognized robot-motion schema. {exc}"
+            ) from exc
 
-            if (
-                "alignment_max_interpolation_gap_seconds"
-                in data
-            ):
-                max_gap = float(
-                    np.asarray(
-                        data[
-                            "alignment_max_interpolation_gap_seconds"
-                        ]
-                    ).item()
-                )
+        times = np.asarray(data[time_key], dtype=np.float64)
+        positions = np.asarray(data[position_key], dtype=np.float64)
+        headings = np.asarray(data[heading_key], dtype=np.float64)
 
-            if max_gap is None:
-                print(
-                    f"WARNING: {path.name} has an "
-                    "alignment warning."
-                )
-            else:
-                print(
-                    f"WARNING: {path.name} has an "
-                    "alignment warning; maximum robot "
-                    "interpolation gap was "
-                    f"{max_gap:.3f} seconds."
-                )
+    if times.ndim != 1:
+        raise ValueError(f"{path.name}: timestamps must have shape (N,).")
 
-    sample_count = len(times)
-
-    if sample_count < 2:
+    n = len(times)
+    if n < 2:
+        raise ValueError(f"{path.name}: fewer than two samples.")
+    if positions.shape != (n, 3):
         raise ValueError(
-            f"{path.name}: fewer than two samples."
+            f"{path.name}: positions shape {positions.shape}, expected {(n, 3)}."
+        )
+    if headings.shape != (n, 3):
+        raise ValueError(
+            f"{path.name}: headings shape {headings.shape}, expected {(n, 3)}."
         )
 
-    expected_shape = (
-        sample_count,
-        3,
-    )
+    if not np.all(np.isfinite(times)):
+        raise ValueError(f"{path.name}: non-finite timestamps.")
+    if not np.all(np.isfinite(positions)):
+        raise ValueError(f"{path.name}: non-finite positions.")
+    if not np.all(np.isfinite(headings)):
+        raise ValueError(f"{path.name}: non-finite headings.")
 
-    arrays_to_check = {
-        "quest_positions": quest_positions,
-        "quest_headings": quest_headings,
-        "robot_ground_truth_positions": (
-            ground_truth_positions
-        ),
-        "robot_ground_truth_headings": (
-            ground_truth_headings
-        ),
-    }
-
-    for name, array in arrays_to_check.items():
-        if array.shape != expected_shape:
-            raise ValueError(
-                f"{path.name}: invalid {name} shape "
-                f"{array.shape}; expected "
-                f"{expected_shape}."
-            )
-
-        if not np.all(
-            np.isfinite(array)
-        ):
-            raise ValueError(
-                f"{path.name}: {name} contains "
-                "non-finite values."
-            )
-
-    if not np.all(
-        np.isfinite(times)
-    ):
-        raise ValueError(
-            f"{path.name}: timestamps contain "
-            "non-finite values."
-        )
-
-    # Sort once and apply the same ordering to BOTH streams so their
-    # temporal correspondence is preserved.
     order = np.argsort(times)
-
     times = times[order]
-    quest_positions = (
-        quest_positions[order]
-    )
-    quest_headings = (
-        quest_headings[order]
-    )
-    ground_truth_positions = (
-        ground_truth_positions[order]
-    )
-    ground_truth_headings = (
-        ground_truth_headings[order]
-    )
+    positions = positions[order]
+    headings = headings[order]
 
-    # Remove duplicate relative timestamps while preserving alignment.
-    unique_times, unique_indices = np.unique(
-        times,
-        return_index=True,
-    )
+    times, unique_indices = np.unique(times, return_index=True)
+    positions = positions[unique_indices]
+    headings = headings[unique_indices]
 
-    times = unique_times
+    if len(times) < 2:
+        raise ValueError(f"{path.name}: fewer than two unique timestamps.")
 
-    quest_positions = (
-        quest_positions[
-            unique_indices
-        ]
-    )
+    # Internal time is always relative; absolute ROS timestamps are fine.
+    times = times - times[0]
+    return times, positions, headings
 
-    quest_headings = (
-        quest_headings[
-            unique_indices
-        ]
-    )
 
-    ground_truth_positions = (
-        ground_truth_positions[
-            unique_indices
-        ]
-    )
-
-    ground_truth_headings = (
-        ground_truth_headings[
-            unique_indices
-        ]
-    )
-
-    return (
-        times,
-        quest_positions,
-        quest_headings,
-        ground_truth_positions,
-        ground_truth_headings,
-    )
-
-def heading_vectors_to_unwrapped_yaw(
-    headings: np.ndarray,
-) -> np.ndarray:
-    """
-    Convert world-space heading vectors into continuous yaw.
-
-    Assumes Unity-style coordinates:
-
-        +X = right
-        +Y = up
-        +Z = forward
-
-    yaw = atan2(heading_x, heading_z)
-    """
-
+def heading_vectors_to_unwrapped_yaw(headings: np.ndarray) -> np.ndarray:
+    """Unity-style yaw: atan2(+X component, +Z component)."""
     hx = headings[:, 0]
     hz = headings[:, 2]
-
-    horizontal_norm = np.sqrt(
-        hx * hx + hz * hz
-    )
-
-    if np.any(horizontal_norm < 1e-6):
-        raise ValueError(
-            "At least one heading has near-zero "
-            "horizontal magnitude."
-        )
-
-    hx = hx / horizontal_norm
-    hz = hz / horizontal_norm
-
-    yaw = np.arctan2(
-        hx,
-        hz,
-    )
-
-    return np.unwrap(yaw)
+    norm = np.sqrt(hx * hx + hz * hz)
+    if np.any(norm < 1e-6):
+        raise ValueError("At least one heading has near-zero horizontal norm.")
+    return np.unwrap(np.arctan2(hx / norm, hz / norm))
 
 
 def world_positions_to_robot_frame(
@@ -607,81 +194,43 @@ def world_positions_to_robot_frame(
     anchor_z: float,
     anchor_yaw: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Transform world-space X/Z positions into the robot frame
-    at the prediction anchor.
-
-    At the anchor:
-        position = (0, 0)
-        heading = +Z
-    """
-
+    """Translate/rotate positions into the robot frame at the current anchor."""
     dx = world_x - anchor_x
     dz = world_z - anchor_z
-
-    sin_yaw = math.sin(anchor_yaw)
-    cos_yaw = math.cos(anchor_yaw)
-
-    relative_x = (
-        dx * cos_yaw
-        - dz * sin_yaw
-    )
-
-    relative_z = (
-        dx * sin_yaw
-        + dz * cos_yaw
-    )
-
-    return (
-        relative_x,
-        relative_z,
-    )
+    s = math.sin(anchor_yaw)
+    c = math.cos(anchor_yaw)
+    relative_x = dx * c - dz * s
+    relative_z = dx * s + dz * c
+    return relative_x, relative_z
 
 
 def build_example(
     times: np.ndarray,
-    quest_positions: np.ndarray,
-    quest_yaw_world: np.ndarray,
-    ground_truth_positions: np.ndarray,
-    ground_truth_yaw_world: np.ndarray,
+    positions: np.ndarray,
+    yaw_world: np.ndarray,
     anchor_time: float,
     config: SequenceConfig,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Build one frame-invariant supervised example.
+    Build one paper-style robot-relative training example.
 
-    INPUT
-    -----
-    The previous `history_seconds` of QUEST-ESTIMATED motion, normalized
-    relative to the Quest-estimated pose at the prediction anchor.
+    Input, shape (history_steps, 7):
+        [relative_x, relative_z,
+         velocity_x, velocity_z,
+         sin(relative_yaw), cos(relative_yaw), yaw_rate]
 
-    FUTURE TARGET
-    -------------
-    The next `prediction_seconds` of ROBOT GROUND-TRUTH motion, normalized
-    relative to the TRUE robot pose at the same prediction anchor.
+    relative_yaw is each historical robot heading expressed relative to the
+    robot heading at the prediction anchor. Therefore the final historical
+    heading is always 0 rad, represented as sin=0, cos=1. yaw_rate is computed
+    from the unwrapped relative-yaw history.
 
-    CURRENT-STATE AUXILIARY TARGET
-    ------------------------------
-    The TRUE robot motion from the beginning of the observed history to the
-    prediction anchor, normalized relative to the TRUE robot pose at the
-    beginning of the history.
+    Target, shape (prediction_steps, 2):
+        [future_relative_x, future_relative_z]
 
-    QUEST CURRENT-STATE BASELINE
-    ----------------------------
-    The same start->current relative motion computed from Quest measurements.
-    This is used only for evaluation so we can ask whether the learned state
-    head improves on the raw Quest temporal estimate.
-
-    Crucially, Quest and robot ground truth are normalized independently.
-    No absolute transform between their global coordinate systems is ever
-    computed or assumed.
+    The current robot pose defines the local frame. Thus the current position is
+    exactly (0, 0), the current robot faces +Z, and neither robot-map coordinates
+    nor Quest-world coordinates are learned by the network.
     """
-
     dt = config.dt
 
     history_relative_times = np.linspace(
@@ -690,7 +239,6 @@ def build_example(
         config.history_steps,
         dtype=np.float64,
     )
-
     future_relative_times = np.linspace(
         dt,
         config.prediction_seconds,
@@ -698,1884 +246,734 @@ def build_example(
         dtype=np.float64,
     )
 
-    history_query_times = (
-        anchor_time
-        + history_relative_times
+    history_query = anchor_time + history_relative_times
+    future_query = anchor_time + future_relative_times
+
+    anchor_x = float(np.interp(anchor_time, times, positions[:, 0]))
+    anchor_z = float(np.interp(anchor_time, times, positions[:, 2]))
+    anchor_yaw = float(np.interp(anchor_time, times, yaw_world))
+
+    history_x = np.interp(history_query, times, positions[:, 0])
+    history_z = np.interp(history_query, times, positions[:, 2])
+    future_x = np.interp(future_query, times, positions[:, 0])
+    future_z = np.interp(future_query, times, positions[:, 2])
+
+    # Interpolate the unwrapped robot yaw over the observation history. Express
+    # all historical headings relative to the current anchor heading so the
+    # orientation features are robot-relative just like the position features.
+    history_yaw = np.interp(history_query, times, yaw_world)
+    history_relative_yaw = history_yaw - anchor_yaw
+
+    history_x_rel, history_z_rel = world_positions_to_robot_frame(
+        history_x,
+        history_z,
+        anchor_x,
+        anchor_z,
+        anchor_yaw,
+    )
+    future_x_rel, future_z_rel = world_positions_to_robot_frame(
+        future_x,
+        future_z,
+        anchor_x,
+        anchor_z,
+        anchor_yaw,
     )
 
-    future_query_times = (
-        anchor_time
-        + future_relative_times
-    )
+    # As in the published method, translational velocity is an explicit input
+    # feature.
+    velocity_x = np.gradient(history_x_rel, dt)
+    velocity_z = np.gradient(history_z_rel, dt)
 
-    history_start_time = float(
-        history_query_times[0]
-    )
-
-    # ------------------------------------------------------------------
-    # Quest pose at CURRENT prediction anchor.
-    # Defines the LSTM input frame.
-    # ------------------------------------------------------------------
-
-    quest_anchor_x = float(
-        np.interp(
-            anchor_time,
-            times,
-            quest_positions[:, 0],
-        )
-    )
-
-    quest_anchor_z = float(
-        np.interp(
-            anchor_time,
-            times,
-            quest_positions[:, 2],
-        )
-    )
-
-    quest_anchor_yaw = float(
-        np.interp(
-            anchor_time,
-            times,
-            quest_yaw_world,
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # Robot GT pose at CURRENT prediction anchor.
-    # Defines the future-target frame.
-    # ------------------------------------------------------------------
-
-    ground_truth_anchor_x = float(
-        np.interp(
-            anchor_time,
-            times,
-            ground_truth_positions[:, 0],
-        )
-    )
-
-    ground_truth_anchor_z = float(
-        np.interp(
-            anchor_time,
-            times,
-            ground_truth_positions[:, 2],
-        )
-    )
-
-    ground_truth_anchor_yaw = float(
-        np.interp(
-            anchor_time,
-            times,
-            ground_truth_yaw_world,
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # Pose at the START of the observed history for both streams.
-    # These anchors are independent.
-    # ------------------------------------------------------------------
-
-    quest_history_start_x = float(
-        np.interp(
-            history_start_time,
-            times,
-            quest_positions[:, 0],
-        )
-    )
-
-    quest_history_start_z = float(
-        np.interp(
-            history_start_time,
-            times,
-            quest_positions[:, 2],
-        )
-    )
-
-    quest_history_start_yaw = float(
-        np.interp(
-            history_start_time,
-            times,
-            quest_yaw_world,
-        )
-    )
-
-    ground_truth_history_start_x = float(
-        np.interp(
-            history_start_time,
-            times,
-            ground_truth_positions[:, 0],
-        )
-    )
-
-    ground_truth_history_start_z = float(
-        np.interp(
-            history_start_time,
-            times,
-            ground_truth_positions[:, 2],
-        )
-    )
-
-    ground_truth_history_start_yaw = float(
-        np.interp(
-            history_start_time,
-            times,
-            ground_truth_yaw_world,
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # Resample Quest HISTORY.
-    # ------------------------------------------------------------------
-
-    history_quest_x_world = np.interp(
-        history_query_times,
-        times,
-        quest_positions[:, 0],
-    )
-
-    history_quest_z_world = np.interp(
-        history_query_times,
-        times,
-        quest_positions[:, 2],
-    )
-
-    history_quest_yaw_world = np.interp(
-        history_query_times,
-        times,
-        quest_yaw_world,
-    )
-
-    # ------------------------------------------------------------------
-    # Resample robot GT FUTURE.
-    # ------------------------------------------------------------------
-
-    future_ground_truth_x_world = np.interp(
-        future_query_times,
-        times,
-        ground_truth_positions[:, 0],
-    )
-
-    future_ground_truth_z_world = np.interp(
-        future_query_times,
-        times,
-        ground_truth_positions[:, 2],
-    )
-
-    future_ground_truth_yaw_world = np.interp(
-        future_query_times,
-        times,
-        ground_truth_yaw_world,
-    )
-
-    # ------------------------------------------------------------------
-    # Quest history -> Quest CURRENT-anchor-relative coordinates.
-    # Current estimated pose is therefore (0, 0, +Z).
-    # ------------------------------------------------------------------
-
-    (
-        history_x_rel,
-        history_z_rel,
-    ) = world_positions_to_robot_frame(
-        world_x=history_quest_x_world,
-        world_z=history_quest_z_world,
-        anchor_x=quest_anchor_x,
-        anchor_z=quest_anchor_z,
-        anchor_yaw=quest_anchor_yaw,
-    )
-
-    history_yaw_rel = (
-        history_quest_yaw_world
-        - quest_anchor_yaw
-    )
-
-    history_heading_x = np.sin(
-        history_yaw_rel
-    )
-
-    history_heading_z = np.cos(
-        history_yaw_rel
-    )
-
-    # ------------------------------------------------------------------
-    # Robot GT future -> TRUE CURRENT-anchor-relative coordinates.
-    # ------------------------------------------------------------------
-
-    (
-        future_x_rel,
-        future_z_rel,
-    ) = world_positions_to_robot_frame(
-        world_x=(
-            future_ground_truth_x_world
-        ),
-        world_z=(
-            future_ground_truth_z_world
-        ),
-        anchor_x=ground_truth_anchor_x,
-        anchor_z=ground_truth_anchor_z,
-        anchor_yaw=ground_truth_anchor_yaw,
-    )
-
-    future_yaw_rel = (
-        future_ground_truth_yaw_world
-        - ground_truth_anchor_yaw
-    )
-
-    future_heading_x = np.sin(
-        future_yaw_rel
-    )
-
-    future_heading_z = np.cos(
-        future_yaw_rel
-    )
-
-    # ------------------------------------------------------------------
-    # TRUE current relative state:
-    #
-    # Ground-truth motion from HISTORY START -> CURRENT ANCHOR,
-    # expressed in the GT frame at history start.
-    #
-    # This is invariant to arbitrary robot-map origin/orientation.
-    # ------------------------------------------------------------------
-
-    (
-        current_gt_x_rel_array,
-        current_gt_z_rel_array,
-    ) = world_positions_to_robot_frame(
-        world_x=np.asarray(
-            [ground_truth_anchor_x],
-            dtype=np.float64,
-        ),
-        world_z=np.asarray(
-            [ground_truth_anchor_z],
-            dtype=np.float64,
-        ),
-        anchor_x=(
-            ground_truth_history_start_x
-        ),
-        anchor_z=(
-            ground_truth_history_start_z
-        ),
-        anchor_yaw=(
-            ground_truth_history_start_yaw
-        ),
-    )
-
-    current_gt_yaw_rel = (
-        ground_truth_anchor_yaw
-        - ground_truth_history_start_yaw
-    )
-
-    current_state_target = np.asarray(
-        [
-            float(
-                current_gt_x_rel_array[0]
-            ),
-            float(
-                current_gt_z_rel_array[0]
-            ),
-            math.sin(
-                current_gt_yaw_rel
-            ),
-            math.cos(
-                current_gt_yaw_rel
-            ),
-        ],
-        dtype=np.float32,
-    )
-
-    # ------------------------------------------------------------------
-    # QUEST current-state baseline:
-    #
-    # Quest-estimated motion over the same HISTORY START -> CURRENT interval,
-    # expressed in the Quest frame at history start.
-    #
-    # This gives a directly comparable, frame-invariant baseline for the
-    # auxiliary state head.
-    # ------------------------------------------------------------------
-
-    (
-        current_quest_x_rel_array,
-        current_quest_z_rel_array,
-    ) = world_positions_to_robot_frame(
-        world_x=np.asarray(
-            [quest_anchor_x],
-            dtype=np.float64,
-        ),
-        world_z=np.asarray(
-            [quest_anchor_z],
-            dtype=np.float64,
-        ),
-        anchor_x=quest_history_start_x,
-        anchor_z=quest_history_start_z,
-        anchor_yaw=quest_history_start_yaw,
-    )
-
-    current_quest_yaw_rel = (
-        quest_anchor_yaw
-        - quest_history_start_yaw
-    )
-
-    quest_current_state_baseline = (
-        np.asarray(
-            [
-                float(
-                    current_quest_x_rel_array[0]
-                ),
-                float(
-                    current_quest_z_rel_array[0]
-                ),
-                math.sin(
-                    current_quest_yaw_rel
-                ),
-                math.cos(
-                    current_quest_yaw_rel
-                ),
-            ],
-            dtype=np.float32,
-        )
-    )
-
-    # ------------------------------------------------------------------
-    # Derive observed motion features ONLY from the Quest history.
-    # ------------------------------------------------------------------
-
-    velocity_x = np.gradient(
-        history_x_rel,
-        dt,
-    )
-
-    velocity_z = np.gradient(
-        history_z_rel,
-        dt,
-    )
-
-    yaw_rate = np.gradient(
-        history_yaw_rel,
-        dt,
-    )
+    # New heading-dynamics features. sin/cos avoid the discontinuity at +/-pi.
+    relative_heading_sin = np.sin(history_relative_yaw)
+    relative_heading_cos = np.cos(history_relative_yaw)
+    yaw_rate = np.gradient(history_relative_yaw, dt)
 
     inputs = np.stack(
         [
             history_x_rel,
             history_z_rel,
-            history_heading_x,
-            history_heading_z,
             velocity_x,
             velocity_z,
+            relative_heading_sin,
+            relative_heading_cos,
             yaw_rate,
         ],
         axis=-1,
     )
+    targets = np.stack([future_x_rel, future_z_rel], axis=-1)
 
-    future_targets = np.stack(
-        [
-            future_x_rel,
-            future_z_rel,
-            future_heading_x,
-            future_heading_z,
-        ],
-        axis=-1,
-    )
+    return inputs.astype(np.float32), targets.astype(np.float32)
 
-    return (
-        inputs.astype(np.float32),
-        future_targets.astype(
-            np.float32
-        ),
-        current_state_target,
-        quest_current_state_baseline,
+
+def recent_history_mean_speed(
+    inputs: np.ndarray,
+    config: SequenceConfig,
+    movement_check_seconds: float,
+) -> float:
+    """
+    Estimate how fast the robot is moving immediately before the prediction
+    anchor using ONLY the observed history.
+
+    The input velocity channels are:
+        inputs[..., 2] = relative_velocity_x
+        inputs[..., 3] = relative_velocity_z
+
+    We average speed magnitude over the final movement_check_seconds of the
+    history. This is causal: no future target information is used to decide
+    whether an anchor is retained.
+    """
+    if movement_check_seconds <= 0.0:
+        raise ValueError("movement_check_seconds must be > 0.")
+
+    check_steps = max(
+        1,
+        int(round(movement_check_seconds * config.sample_rate_hz)),
     )
+    check_steps = min(check_steps, inputs.shape[0])
+
+    recent_velocity = inputs[-check_steps:, 2:4]
+    recent_speed = np.linalg.norm(recent_velocity, axis=-1)
+
+    return float(recent_speed.mean())
+
 
 def extract_examples_from_file(
     path: Path,
     config: SequenceConfig,
-) -> Tuple[
-    List[np.ndarray],
-    List[np.ndarray],
-    List[np.ndarray],
-    List[np.ndarray],
-]:
-    (
-        times,
-        quest_positions,
-        quest_headings,
-        ground_truth_positions,
-        ground_truth_headings,
-    ) = load_motion_window(
-        path
-    )
+    min_recent_speed: float,
+    movement_check_seconds: float,
+) -> Tuple[List[np.ndarray], List[np.ndarray], int, int]:
+    times, positions, headings = load_robot_motion_window(path)
+    yaw_world = heading_vectors_to_unwrapped_yaw(headings)
 
-    quest_yaw_world = (
-        heading_vectors_to_unwrapped_yaw(
-            quest_headings
-        )
-    )
-
-    ground_truth_yaw_world = (
-        heading_vectors_to_unwrapped_yaw(
-            ground_truth_headings
-        )
-    )
-
-    first_anchor = (
-        times[0]
-        + config.history_seconds
-    )
-
-    last_anchor = (
-        times[-1]
-        - config.prediction_seconds
-    )
+    first_anchor = times[0] + config.history_seconds
+    last_anchor = times[-1] - config.prediction_seconds
 
     if last_anchor < first_anchor:
-        duration = float(
-            times[-1] - times[0]
-        )
-
-        required_duration = (
-            config.history_seconds
-            + config.prediction_seconds
-        )
-
+        duration = float(times[-1] - times[0])
+        required = config.history_seconds + config.prediction_seconds
         print(
-            f"Skipping {path.name}: "
-            f"duration={duration:.3f}s, "
-            f"required>={required_duration:.3f}s."
+            f"Skipping {path.name}: duration={duration:.3f}s, "
+            f"required>={required:.3f}s."
         )
-
-        return [], [], [], []
+        return [], [], 0, 0
 
     inputs: List[np.ndarray] = []
-    future_targets: List[np.ndarray] = []
-    current_state_targets: List[
-        np.ndarray
-    ] = []
-    quest_current_state_baselines: List[
-        np.ndarray
-    ] = []
+    targets: List[np.ndarray] = []
+
+    candidate_count = 0
+    filtered_stationary_count = 0
 
     anchor_time = first_anchor
-
-    while (
-        anchor_time
-        <= last_anchor + 1e-9
-    ):
+    while anchor_time <= last_anchor + 1e-9:
         try:
-            (
-                x,
-                future_y,
-                current_state_y,
-                quest_state_baseline,
-            ) = build_example(
+            x, y = build_example(
                 times=times,
-                quest_positions=(
-                    quest_positions
-                ),
-                quest_yaw_world=(
-                    quest_yaw_world
-                ),
-                ground_truth_positions=(
-                    ground_truth_positions
-                ),
-                ground_truth_yaw_world=(
-                    ground_truth_yaw_world
-                ),
+                positions=positions,
+                yaw_world=yaw_world,
                 anchor_time=anchor_time,
                 config=config,
             )
 
-            if (
-                np.all(np.isfinite(x))
-                and np.all(
-                    np.isfinite(
-                        future_y
-                    )
-                )
-                and np.all(
-                    np.isfinite(
-                        current_state_y
-                    )
-                )
-                and np.all(
-                    np.isfinite(
-                        quest_state_baseline
-                    )
-                )
-            ):
-                inputs.append(x)
+            candidate_count += 1
 
-                future_targets.append(
-                    future_y
+            if np.all(np.isfinite(x)) and np.all(np.isfinite(y)):
+                mean_recent_speed = recent_history_mean_speed(
+                    inputs=x,
+                    config=config,
+                    movement_check_seconds=movement_check_seconds,
                 )
 
-                current_state_targets.append(
-                    current_state_y
-                )
-
-                quest_current_state_baselines.append(
-                    quest_state_baseline
-                )
-
+                if mean_recent_speed < min_recent_speed:
+                    filtered_stationary_count += 1
+                else:
+                    inputs.append(x)
+                    targets.append(y)
         except ValueError as exc:
-            print(
-                f"Skipping example from "
-                f"{path.name}: {exc}"
-            )
+            print(f"Skipping example from {path.name}: {exc}")
 
-        anchor_time += (
-            config.anchor_stride_seconds
-        )
+        anchor_time += config.anchor_stride_seconds
 
     return (
         inputs,
-        future_targets,
-        current_state_targets,
-        quest_current_state_baselines,
+        targets,
+        candidate_count,
+        filtered_stationary_count,
     )
 
 
 def build_dataset_arrays(
     files: Sequence[Path],
     config: SequenceConfig,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
+    min_recent_speed: float,
+    movement_check_seconds: float,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     all_inputs: List[np.ndarray] = []
-    all_future_targets: List[
-        np.ndarray
-    ] = []
-    all_current_state_targets: List[
-        np.ndarray
-    ] = []
-    all_quest_state_baselines: List[
-        np.ndarray
-    ] = []
+    all_targets: List[np.ndarray] = []
+
+    candidate_count = 0
+    filtered_stationary_count = 0
 
     for path in files:
         (
             inputs,
-            future_targets,
-            current_state_targets,
-            quest_state_baselines,
+            targets,
+            file_candidate_count,
+            file_filtered_stationary_count,
         ) = extract_examples_from_file(
-            path,
-            config,
+            path=path,
+            config=config,
+            min_recent_speed=min_recent_speed,
+            movement_check_seconds=movement_check_seconds,
         )
 
-        all_inputs.extend(
-            inputs
-        )
+        all_inputs.extend(inputs)
+        all_targets.extend(targets)
 
-        all_future_targets.extend(
-            future_targets
-        )
-
-        all_current_state_targets.extend(
-            current_state_targets
-        )
-
-        all_quest_state_baselines.extend(
-            quest_state_baselines
-        )
+        candidate_count += file_candidate_count
+        filtered_stationary_count += file_filtered_stationary_count
 
     if not all_inputs:
         raise RuntimeError(
-            "No valid trajectory examples could be "
-            "generated from these files."
+            "No valid moving robot trajectory examples were generated. "
+            "Try lowering --min-recent-speed."
         )
 
+    stats = {
+        "candidate_examples": candidate_count,
+        "filtered_stationary_examples": filtered_stationary_count,
+        "retained_moving_examples": len(all_inputs),
+    }
+
     return (
-        np.stack(
-            all_inputs
-        ),
-        np.stack(
-            all_future_targets
-        ),
-        np.stack(
-            all_current_state_targets
-        ),
-        np.stack(
-            all_quest_state_baselines
-        ),
+        np.stack(all_inputs),
+        np.stack(all_targets),
+        stats,
     )
 
-
-# ---------------------------------------------------------------------------
-# Data splitting
-# ---------------------------------------------------------------------------
 
 def split_files(
     files: Sequence[Path],
     seed: int,
     train_fraction: float = 0.70,
     validation_fraction: float = 0.15,
-) -> Tuple[
-    List[Path],
-    List[Path],
-    List[Path],
-]:
+) -> Tuple[List[Path], List[Path], List[Path]]:
     files = list(files)
-
     if len(files) < 3:
-        raise RuntimeError(
-            "At least 3 .npz motion-window files are "
-            "required for train/validation/test splitting."
-        )
+        raise RuntimeError("At least 3 .npz files are required for file-level splitting.")
 
     rng = random.Random(seed)
     rng.shuffle(files)
-
     count = len(files)
 
-    train_count = max(
-        1,
-        int(round(count * train_fraction)),
-    )
-
-    validation_count = max(
-        1,
-        int(
-            round(
-                count * validation_fraction
-            )
-        ),
-    )
-
-    if (
-        train_count
-        + validation_count
-        >= count
-    ):
+    train_count = max(1, int(round(count * train_fraction)))
+    validation_count = max(1, int(round(count * validation_fraction)))
+    if train_count + validation_count >= count:
         train_count = count - 2
         validation_count = 1
 
-    train_files = files[:train_count]
-
-    validation_files = files[
-        train_count:
-        train_count + validation_count
-    ]
-
-    test_files = files[
-        train_count + validation_count:
-    ]
-
     return (
-        train_files,
-        validation_files,
-        test_files,
+        files[:train_count],
+        files[train_count:train_count + validation_count],
+        files[train_count + validation_count:],
     )
+
+
+def has_robot_motion_data(path: Path) -> bool:
+    try:
+        load_robot_motion_window(path)
+        return True
+    except Exception as exc:
+        print(f"Ignoring incompatible file {path.name}: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Loss and metrics
+# Per-horizon bivariate GMM likelihood
 # ---------------------------------------------------------------------------
 
-def pose_loss(
+
+def bivariate_component_log_prob(
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    rho: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Log density of each correlated bivariate Gaussian component.
+
+    Args:
+        mean:   (B, T, K, 2)
+        std:    (B, T, K, 2)
+        rho:    (B, T, K)
+        target: (B, T, 2)
+
+    Returns:
+        (B, T, K)
+    """
+    target = target.unsqueeze(2)
+
+    sigma_x = std[..., 0]
+    sigma_z = std[..., 1]
+    z_x = (target[..., 0] - mean[..., 0]) / sigma_x
+    z_z = (target[..., 1] - mean[..., 1]) / sigma_z
+
+    one_minus_rho2 = torch.clamp(1.0 - rho * rho, min=1e-6)
+    quadratic = (
+        z_x * z_x
+        + z_z * z_z
+        - 2.0 * rho * z_x * z_z
+    ) / (2.0 * one_minus_rho2)
+
+    log_normalizer = (
+        math.log(2.0 * math.pi)
+        + torch.log(sigma_x)
+        + torch.log(sigma_z)
+        + 0.5 * torch.log(one_minus_rho2)
+    )
+
+    return -quadratic - log_normalizer
+
+
+def mdn_nll(
+    model: RobotPoseMDNLSTM,
+    output: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Published-style MDN NLL: one bivariate Gaussian mixture per future horizon,
+    then average the negative log likelihood over batch and horizons.
+    """
+    params = model.parameters_from_output(output)
+    component_log_prob = bivariate_component_log_prob(
+        mean=params["mean"],
+        std=params["std"],
+        rho=params["rho"],
+        target=target,
+    )
+    log_weights = torch.log_softmax(params["logits"], dim=-1)
+    mixture_log_prob = torch.logsumexp(
+        log_weights + component_log_prob,
+        dim=-1,
+    )
+    return -mixture_log_prob.mean()
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+
+def displacement_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
-    heading_weight: float = 1.0,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-example ADE and FDE for tensors shaped (B, T, 2)."""
+    errors = torch.linalg.vector_norm(prediction - target, dim=-1)
+    return errors.mean(dim=-1), errors[:, -1]
+
+
+def sample_mdn_trajectories(
+    model: RobotPoseMDNLSTM,
+    output: torch.Tensor,
+    num_samples: int,
+) -> torch.Tensor:
     """
-    Loss for one pose or a sequence of poses represented as:
+    Sample K complete hypotheses from the paper's independent per-horizon GMMs.
 
-        [x, z, heading_x, heading_z]
+    Returns:
+        (num_samples, B, T, 2)
+
+    Each future horizon samples its own mixture component, matching the official
+    evaluation formulation rather than imposing a trajectory-level latent mode.
     """
-    position_loss = F.smooth_l1_loss(
-        prediction[..., :2],
-        target[..., :2],
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive.")
+
+    params = model.parameters_from_output(output)
+    probabilities = params["probabilities"]  # (B,T,K)
+    mean = params["mean"]                    # (B,T,K,2)
+    std = params["std"]                      # (B,T,K,2)
+    rho = params["rho"]                      # (B,T,K)
+
+    b, t, k = probabilities.shape
+
+    flat_probs = probabilities.reshape(-1, k)
+    component_indices = torch.multinomial(
+        flat_probs,
+        num_samples=num_samples,
+        replacement=True,
+    )
+    # (B*T, S) -> (S, B, T)
+    component_indices = component_indices.view(b, t, num_samples).permute(2, 0, 1)
+
+    mean_expanded = mean.unsqueeze(0).expand(num_samples, -1, -1, -1, -1)
+    std_expanded = std.unsqueeze(0).expand(num_samples, -1, -1, -1, -1)
+    rho_expanded = rho.unsqueeze(0).expand(num_samples, -1, -1, -1)
+
+    gather_index_2 = component_indices[..., None, None].expand(-1, -1, -1, 1, 2)
+    gather_index_1 = component_indices[..., None].expand(-1, -1, -1, 1)
+
+    selected_mean = torch.gather(mean_expanded, 3, gather_index_2).squeeze(3)
+    selected_std = torch.gather(std_expanded, 3, gather_index_2).squeeze(3)
+    selected_rho = torch.gather(rho_expanded, 3, gather_index_1).squeeze(3)
+
+    eps_x = torch.randn_like(selected_rho)
+    eps_z = torch.randn_like(selected_rho)
+    correlated_z = (
+        selected_rho * eps_x
+        + torch.sqrt(torch.clamp(1.0 - selected_rho ** 2, min=1e-6)) * eps_z
     )
 
-    predicted_heading = F.normalize(
-        prediction[..., 2:4],
-        dim=-1,
-        eps=1e-8,
-    )
+    sample_x = selected_mean[..., 0] + selected_std[..., 0] * eps_x
+    sample_z = selected_mean[..., 1] + selected_std[..., 1] * correlated_z
 
-    target_heading = F.normalize(
-        target[..., 2:4],
-        dim=-1,
-        eps=1e-8,
-    )
-
-    cosine_similarity = (
-        predicted_heading
-        * target_heading
-    ).sum(dim=-1)
-
-    heading_loss = (
-        1.0
-        - cosine_similarity
-    ).mean()
-
-    total_loss = (
-        position_loss
-        + heading_weight
-        * heading_loss
-    )
-
-    return (
-        total_loss,
-        position_loss,
-        heading_loss,
-    )
-
-
-def combined_loss(
-    future_prediction: torch.Tensor,
-    future_target: torch.Tensor,
-    current_state_prediction: torch.Tensor,
-    current_state_target: torch.Tensor,
-    future_heading_weight: float,
-    current_state_weight: float,
-    current_state_heading_weight: float,
-) -> dict:
-    (
-        future_loss,
-        future_position_loss,
-        future_heading_loss,
-    ) = pose_loss(
-        prediction=future_prediction,
-        target=future_target,
-        heading_weight=(
-            future_heading_weight
-        ),
-    )
-
-    (
-        current_state_loss,
-        current_state_position_loss,
-        current_state_heading_loss,
-    ) = pose_loss(
-        prediction=(
-            current_state_prediction
-        ),
-        target=current_state_target,
-        heading_weight=(
-            current_state_heading_weight
-        ),
-    )
-
-    total_loss = (
-        future_loss
-        + current_state_weight
-        * current_state_loss
-    )
-
-    return {
-        "loss": total_loss,
-        "future_loss": future_loss,
-        "future_position_loss": (
-            future_position_loss
-        ),
-        "future_heading_loss": (
-            future_heading_loss
-        ),
-        "current_state_loss": (
-            current_state_loss
-        ),
-        "current_state_position_loss": (
-            current_state_position_loss
-        ),
-        "current_state_heading_loss": (
-            current_state_heading_loss
-        ),
-    }
-
-
-def pose_error_arrays_torch(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-]:
-    position_error = (
-        torch.linalg.vector_norm(
-            prediction[..., :2]
-            - target[..., :2],
-            dim=-1,
-        )
-    )
-
-    predicted_heading = F.normalize(
-        prediction[..., 2:4],
-        dim=-1,
-        eps=1e-8,
-    )
-
-    target_heading = F.normalize(
-        target[..., 2:4],
-        dim=-1,
-        eps=1e-8,
-    )
-
-    cosine = (
-        predicted_heading
-        * target_heading
-    ).sum(dim=-1)
-
-    cosine = torch.clamp(
-        cosine,
-        -1.0,
-        1.0,
-    )
-
-    heading_error_degrees = (
-        torch.acos(cosine)
-        * 180.0
-        / math.pi
-    )
-
-    return (
-        position_error,
-        heading_error_degrees,
-    )
+    return torch.stack([sample_x, sample_z], dim=-1)
 
 
 @torch.no_grad()
-def compute_metrics(
-    model: FrameInvariantRobotPoseLSTM,
-    loader: DataLoader,
-    device: torch.device,
-) -> dict:
-    model.eval()
-
-    all_position_errors = []
-    all_heading_errors = []
-
-    for (
-        inputs,
-        future_targets,
-        _,
-    ) in loader:
-        inputs = inputs.to(
-            device
-        )
-
-        future_targets = (
-            future_targets.to(
-                device
-            )
-        )
-
-        (
-            future_predictions,
-            _,
-        ) = model(inputs)
-
-        (
-            position_error,
-            heading_error_degrees,
-        ) = pose_error_arrays_torch(
-            future_predictions,
-            future_targets,
-        )
-
-        all_position_errors.append(
-            position_error.cpu()
-        )
-
-        all_heading_errors.append(
-            heading_error_degrees.cpu()
-        )
-
-    position_errors = torch.cat(
-        all_position_errors,
-        dim=0,
-    )
-
-    heading_errors_degrees = torch.cat(
-        all_heading_errors,
-        dim=0,
-    )
-
-    return {
-        "ade_meters": float(
-            position_errors.mean()
-        ),
-        "fde_meters": float(
-            position_errors[:, -1].mean()
-        ),
-        "mean_heading_error_degrees": float(
-            heading_errors_degrees.mean()
-        ),
-        "final_heading_error_degrees": float(
-            heading_errors_degrees[:, -1].mean()
-        ),
-    }
-
-
-@torch.no_grad()
-def compute_horizon_metrics(
-    model: FrameInvariantRobotPoseLSTM,
+def evaluate_model(
+    model: RobotPoseMDNLSTM,
     loader: DataLoader,
     device: torch.device,
     config: SequenceConfig,
-) -> dict:
+    num_samples: int = 20,
+) -> Dict[str, object]:
     model.eval()
 
-    predictions_all = []
-    targets_all = []
+    total_nll = 0.0
+    total_count = 0
 
-    for (
-        inputs,
-        future_targets,
-        _,
-    ) in loader:
-        inputs = inputs.to(
-            device
-        )
+    expected_ade: List[torch.Tensor] = []
+    expected_fde: List[torch.Tensor] = []
+    modal_ade: List[torch.Tensor] = []
+    modal_fde: List[torch.Tensor] = []
+    min_ade: List[torch.Tensor] = []
+    min_fde: List[torch.Tensor] = []
+    paper_style_min_ade: List[torch.Tensor] = []
+    paper_style_min_fde: List[torch.Tensor] = []
 
-        (
-            future_predictions,
-            _,
-        ) = model(inputs)
-
-        predictions_all.append(
-            future_predictions.cpu()
-        )
-
-        targets_all.append(
-            future_targets
-        )
-
-    predictions = torch.cat(
-        predictions_all,
-        dim=0,
+    # The official evaluator samples/evaluates at 0.8 s intervals (indices
+    # 7,15,23,... at 10 Hz). For our 4.0 s horizon that becomes
+    # 0.8, 1.6, 2.4, 3.2, and 4.0 seconds. We report both this paper-style
+    # metric and the stricter all-40-timestep metric.
+    paper_stride_steps = max(1, int(round(0.8 * config.sample_rate_hz)))
+    paper_indices = list(
+        range(paper_stride_steps - 1, config.prediction_steps, paper_stride_steps)
     )
+    if not paper_indices or paper_indices[-1] != config.prediction_steps - 1:
+        paper_indices.append(config.prediction_steps - 1)
 
-    targets = torch.cat(
-        targets_all,
-        dim=0,
-    )
+    horizon_expected: Dict[int, List[torch.Tensor]] = {}
+    horizon_modal: Dict[int, List[torch.Tensor]] = {}
+    horizon_min_sample: Dict[int, List[torch.Tensor]] = {}
 
-    results = {}
+    whole_seconds = range(1, int(math.floor(config.prediction_seconds)) + 1)
+    horizon_indices = {
+        seconds: int(round(seconds * config.sample_rate_hz)) - 1
+        for seconds in whole_seconds
+        if int(round(seconds * config.sample_rate_hz)) - 1 < config.prediction_steps
+    }
 
-    whole_second_horizons = range(
-        1,
-        int(
-            math.floor(
-                config.prediction_seconds
+    for seconds in horizon_indices:
+        horizon_expected[seconds] = []
+        horizon_modal[seconds] = []
+        horizon_min_sample[seconds] = []
+
+    for inputs, targets in loader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        output = model(inputs)
+        loss = mdn_nll(model, output, targets)
+
+        batch_size = inputs.shape[0]
+        total_nll += float(loss.item()) * batch_size
+        total_count += batch_size
+
+        expected = model.expected_position(output)
+        modal = model.modal_component_position(output)
+        samples = sample_mdn_trajectories(model, output, num_samples)
+
+        ade, fde = displacement_metrics(expected, targets)
+        expected_ade.append(ade.cpu())
+        expected_fde.append(fde.cpu())
+
+        ade, fde = displacement_metrics(modal, targets)
+        modal_ade.append(ade.cpu())
+        modal_fde.append(fde.cpu())
+
+        sample_errors = torch.linalg.vector_norm(
+            samples - targets.unsqueeze(0),
+            dim=-1,
+        )  # (S,B,T)
+        sample_ade = sample_errors.mean(dim=-1)  # (S,B)
+        sample_fde = sample_errors[..., -1]      # (S,B)
+        min_ade.append(sample_ade.min(dim=0).values.cpu())
+        min_fde.append(sample_fde.min(dim=0).values.cpu())
+
+        paper_errors = sample_errors[:, :, paper_indices]
+        paper_style_min_ade.append(
+            paper_errors.mean(dim=-1).min(dim=0).values.cpu()
+        )
+        paper_style_min_fde.append(
+            paper_errors[..., -1].min(dim=0).values.cpu()
+        )
+
+        for seconds, index in horizon_indices.items():
+            horizon_expected[seconds].append(
+                torch.linalg.vector_norm(
+                    expected[:, index] - targets[:, index],
+                    dim=-1,
+                ).cpu()
             )
-        ) + 1,
-    )
-
-    for seconds in whole_second_horizons:
-        index = int(
-            round(
-                seconds
-                * config.sample_rate_hz
+            horizon_modal[seconds].append(
+                torch.linalg.vector_norm(
+                    modal[:, index] - targets[:, index],
+                    dim=-1,
+                ).cpu()
             )
-        ) - 1
+            horizon_min_sample[seconds].append(
+                sample_errors[:, :, index].min(dim=0).values.cpu()
+            )
 
-        if index >= config.prediction_steps:
-            continue
+    def cat_mean(values: List[torch.Tensor]) -> float:
+        return float(torch.cat(values, dim=0).mean())
 
-        (
-            position_error,
-            heading_error,
-        ) = pose_error_arrays_torch(
-            predictions[:, index, :],
-            targets[:, index, :],
-        )
-
-        results[f"{seconds}s"] = {
-            "position_error_meters": float(
-                position_error.mean()
-            ),
-            "heading_error_degrees": float(
-                heading_error.mean()
+    horizon_metrics: Dict[str, Dict[str, float]] = {}
+    for seconds in horizon_indices:
+        horizon_metrics[f"{seconds}s"] = {
+            "expected_position_error_meters": cat_mean(horizon_expected[seconds]),
+            "modal_position_error_meters": cat_mean(horizon_modal[seconds]),
+            f"min_position_error_at_{num_samples}_meters": cat_mean(
+                horizon_min_sample[seconds]
             ),
         }
 
-    return results
-
-
-@torch.no_grad()
-def compute_current_state_metrics(
-    model: FrameInvariantRobotPoseLSTM,
-    loader: DataLoader,
-    device: torch.device,
-    quest_state_baselines: np.ndarray,
-    current_state_targets: np.ndarray,
-) -> dict:
-    """
-    Evaluate the auxiliary current-state head.
-
-    The learned prediction and the raw Quest baseline both estimate motion
-    from history start -> current anchor in their own locally normalized
-    frames, and both are compared against the GT relative-motion target.
-    """
-    model.eval()
-
-    predictions_all = []
-
-    for (
-        inputs,
-        _,
-        _,
-    ) in loader:
-        inputs = inputs.to(
-            device
-        )
-
-        (
-            _,
-            current_state_predictions,
-        ) = model(inputs)
-
-        predictions_all.append(
-            current_state_predictions.cpu()
-        )
-
-    predictions = torch.cat(
-        predictions_all,
-        dim=0,
-    ).numpy()
-
-    learned_metrics = (
-        compute_single_pose_array_metrics(
-            predictions=predictions,
-            targets=current_state_targets,
-        )
-    )
-
-    quest_metrics = (
-        compute_single_pose_array_metrics(
-            predictions=quest_state_baselines,
-            targets=current_state_targets,
-        )
-    )
-
     return {
-        "history_interval_seconds": None,
-        "learned_state_head": (
-            learned_metrics
+        "nll_per_horizon_point": total_nll / max(total_count, 1),
+        "expected_trajectory_ade_meters": cat_mean(expected_ade),
+        "expected_trajectory_fde_meters": cat_mean(expected_fde),
+        "modal_trajectory_ade_meters": cat_mean(modal_ade),
+        "modal_trajectory_fde_meters": cat_mean(modal_fde),
+        f"minade_at_{num_samples}_meters": cat_mean(min_ade),
+        f"minfde_at_{num_samples}_meters": cat_mean(min_fde),
+        f"paper_style_0p8s_minade_at_{num_samples}_meters": cat_mean(
+            paper_style_min_ade
         ),
-        "raw_quest_relative_motion": (
-            quest_metrics
+        f"paper_style_0p8s_minfde_at_{num_samples}_meters": cat_mean(
+            paper_style_min_fde
         ),
+        "paper_style_horizon_indices": paper_indices,
+        "horizon_metrics": horizon_metrics,
     }
 
 
 # ---------------------------------------------------------------------------
-# Kinematic baseline
+# Constant-velocity baseline using the translational velocity input channels
 # ---------------------------------------------------------------------------
 
-def predict_constant_turn_rate(
+
+def predict_constant_velocity(
     inputs: np.ndarray,
     config: SequenceConfig,
     estimation_seconds: float = 0.5,
 ) -> np.ndarray:
-    """
-    Predict future robot poses with a simple kinematic baseline.
-
-    The input examples must be the UNNORMALIZED QUEST-derived relative inputs
-    produced by build_example():
-
-        [x, z, heading_x, heading_z, velocity_x, velocity_z, yaw_rate]
-
-    The baseline assumes that, over the prediction horizon:
-
-        1. Translational velocity remains constant in the robot's local frame.
-        2. Yaw rate remains constant.
-
-    Velocity and yaw rate are estimated by averaging the final
-    `estimation_seconds` of observed history. Averaging a short recent window
-    makes the baseline less sensitive to frame-to-frame noise than using only
-    the final sample.
-
-    At the prediction anchor, the robot-relative frame is defined so that:
-
-        position = (0, 0)
-        heading = +Z
-
-    Returns:
-        predictions:
-            shape (N, prediction_steps, 4)
-
-            channels:
-                0: future_relative_x
-                1: future_relative_z
-                2: future_relative_heading_x
-                3: future_relative_heading_z
-    """
-
-    if inputs.ndim != 3 or inputs.shape[-1] != 7:
+    if inputs.ndim != 3 or inputs.shape[-1] < 4:
         raise ValueError(
-            "Expected inputs with shape "
-            "(N, history_steps, 7)."
+            "Expected inputs with shape (N, history_steps, >=4) and "
+            "velocity channels at indices 2:4."
         )
-
-    if estimation_seconds <= 0.0:
-        raise ValueError(
-            "estimation_seconds must be greater than 0."
-        )
-
-    history_steps = inputs.shape[1]
 
     estimation_steps = max(
         1,
-        int(
-            round(
-                estimation_seconds
-                * config.sample_rate_hz
-            )
-        ),
+        int(round(estimation_seconds * config.sample_rate_hz)),
     )
+    estimation_steps = min(estimation_steps, inputs.shape[1])
 
-    estimation_steps = min(
-        estimation_steps,
-        history_steps,
-    )
-
-    recent = inputs[
-        :,
-        -estimation_steps:,
-        :,
-    ]
-
-    # At t=0 the anchor frame and robot body frame coincide, so the recent
-    # robot-relative velocity components are a useful estimate of the current
-    # body-frame velocity.
-    velocity_x = recent[..., 4].mean(
-        axis=1
-    )
-
-    velocity_z = recent[..., 5].mean(
-        axis=1
-    )
-
-    yaw_rate = recent[..., 6].mean(
-        axis=1
-    )
-
+    recent_velocity = inputs[:, -estimation_steps:, 2:4].mean(axis=1)
     future_times = (
-        np.arange(
-            1,
-            config.prediction_steps + 1,
-            dtype=np.float64,
-        )
+        np.arange(1, config.prediction_steps + 1, dtype=np.float64)
         * config.dt
     )
 
-    batch_size = inputs.shape[0]
-    prediction_steps = config.prediction_steps
-
-    future_x = np.zeros(
-        (batch_size, prediction_steps),
-        dtype=np.float64,
-    )
-
-    future_z = np.zeros(
-        (batch_size, prediction_steps),
-        dtype=np.float64,
-    )
-
-    future_yaw = (
-        yaw_rate[:, None]
-        * future_times[None, :]
-    )
-
-    # Constant-turn-rate motion:
-    #
-    # The local body-frame velocity is rotated continuously as the robot
-    # changes yaw. For very small yaw rates, use the straight-line limit to
-    # avoid division by values near zero.
-    turning_mask = (
-        np.abs(yaw_rate)
-        >= 1e-4
-    )
-
-    straight_mask = ~turning_mask
-
-    if np.any(turning_mask):
-        omega = yaw_rate[
-            turning_mask
-        ][:, None]
-
-        vx = velocity_x[
-            turning_mask
-        ][:, None]
-
-        vz = velocity_z[
-            turning_mask
-        ][:, None]
-
-        angle = (
-            omega
-            * future_times[None, :]
-        )
-
-        sin_angle = np.sin(angle)
-        cos_angle = np.cos(angle)
-
-        future_x[turning_mask] = (
-            vx * sin_angle / omega
-            + vz * (1.0 - cos_angle) / omega
-        )
-
-        future_z[turning_mask] = (
-            vx * (cos_angle - 1.0) / omega
-            + vz * sin_angle / omega
-        )
-
-    if np.any(straight_mask):
-        future_x[straight_mask] = (
-            velocity_x[
-                straight_mask
-            ][:, None]
-            * future_times[None, :]
-        )
-
-        future_z[straight_mask] = (
-            velocity_z[
-                straight_mask
-            ][:, None]
-            * future_times[None, :]
-        )
-
-    future_heading_x = np.sin(
-        future_yaw
-    )
-
-    future_heading_z = np.cos(
-        future_yaw
-    )
-
-    predictions = np.stack(
-        [
-            future_x,
-            future_z,
-            future_heading_x,
-            future_heading_z,
-        ],
-        axis=-1,
-    )
-
-    return predictions.astype(
-        np.float32
-    )
+    return (
+        recent_velocity[:, None, :] * future_times[None, :, None]
+    ).astype(np.float32)
 
 
-
-def compute_single_pose_array_metrics(
-    predictions: np.ndarray,
-    targets: np.ndarray,
-) -> dict:
-    """
-    Metrics for arrays shaped (N, 4):
-        [x, z, heading_x, heading_z]
-    """
-    if (
-        predictions.ndim != 2
-        or predictions.shape[-1] != 4
-        or targets.shape != predictions.shape
-    ):
-        raise ValueError(
-            "Expected predictions and targets "
-            "with matching shape (N, 4)."
-        )
-
-    position_errors = np.linalg.norm(
-        predictions[:, :2]
-        - targets[:, :2],
-        axis=-1,
-    )
-
-    predicted_heading = (
-        predictions[:, 2:4]
-    )
-
-    target_heading = (
-        targets[:, 2:4]
-    )
-
-    predicted_heading = (
-        predicted_heading
-        / np.maximum(
-            np.linalg.norm(
-                predicted_heading,
-                axis=-1,
-                keepdims=True,
-            ),
-            1e-8,
-        )
-    )
-
-    target_heading = (
-        target_heading
-        / np.maximum(
-            np.linalg.norm(
-                target_heading,
-                axis=-1,
-                keepdims=True,
-            ),
-            1e-8,
-        )
-    )
-
-    cosine = np.sum(
-        predicted_heading
-        * target_heading,
-        axis=-1,
-    )
-
-    cosine = np.clip(
-        cosine,
-        -1.0,
-        1.0,
-    )
-
-    heading_errors_degrees = np.degrees(
-        np.arccos(cosine)
-    )
-
-    return {
-        "mean_position_error_meters": float(
-            position_errors.mean()
-        ),
-        "median_position_error_meters": float(
-            np.median(
-                position_errors
-            )
-        ),
-        "p90_position_error_meters": float(
-            np.percentile(
-                position_errors,
-                90.0,
-            )
-        ),
-        "mean_heading_error_degrees": float(
-            heading_errors_degrees.mean()
-        ),
-        "median_heading_error_degrees": float(
-            np.median(
-                heading_errors_degrees
-            )
-        ),
-        "p90_heading_error_degrees": float(
-            np.percentile(
-                heading_errors_degrees,
-                90.0,
-            )
-        ),
-    }
-
-
-def compute_array_metrics(
-    predictions: np.ndarray,
-    targets: np.ndarray,
-) -> dict:
-    """
-    Compute the same aggregate metrics used for the LSTM, but directly from
-    NumPy arrays. This is used by the kinematic baseline, which sees only Quest observations.
-    """
-
-    position_errors = np.linalg.norm(
-        predictions[..., :2]
-        - targets[..., :2],
-        axis=-1,
-    )
-
-    predicted_heading = (
-        predictions[..., 2:4]
-    )
-
-    target_heading = (
-        targets[..., 2:4]
-    )
-
-    predicted_heading = (
-        predicted_heading
-        / np.maximum(
-            np.linalg.norm(
-                predicted_heading,
-                axis=-1,
-                keepdims=True,
-            ),
-            1e-8,
-        )
-    )
-
-    target_heading = (
-        target_heading
-        / np.maximum(
-            np.linalg.norm(
-                target_heading,
-                axis=-1,
-                keepdims=True,
-            ),
-            1e-8,
-        )
-    )
-
-    cosine = np.sum(
-        predicted_heading
-        * target_heading,
-        axis=-1,
-    )
-
-    cosine = np.clip(
-        cosine,
-        -1.0,
-        1.0,
-    )
-
-    heading_errors_degrees = np.degrees(
-        np.arccos(cosine)
-    )
-
-    return {
-        "ade_meters": float(
-            position_errors.mean()
-        ),
-        "fde_meters": float(
-            position_errors[:, -1].mean()
-        ),
-        "mean_heading_error_degrees": float(
-            heading_errors_degrees.mean()
-        ),
-        "final_heading_error_degrees": float(
-            heading_errors_degrees[:, -1].mean()
-        ),
-    }
-
-
-def compute_array_horizon_metrics(
-    predictions: np.ndarray,
-    targets: np.ndarray,
+def compute_numpy_metrics(
+    prediction: np.ndarray,
+    target: np.ndarray,
     config: SequenceConfig,
-) -> dict:
-    """
-    Compute position and heading error at each whole-second horizon.
-    """
+) -> Dict[str, object]:
+    errors = np.linalg.norm(prediction - target, axis=-1)
+    horizon_metrics: Dict[str, Dict[str, float]] = {}
 
-    results = {}
+    for seconds in range(1, int(math.floor(config.prediction_seconds)) + 1):
+        index = int(round(seconds * config.sample_rate_hz)) - 1
+        if index < config.prediction_steps:
+            horizon_metrics[f"{seconds}s"] = {
+                "position_error_meters": float(errors[:, index].mean())
+            }
 
-    whole_second_horizons = range(
-        1,
-        int(
-            math.floor(
-                config.prediction_seconds
-            )
-        ) + 1,
-    )
-
-    for seconds in whole_second_horizons:
-        index = int(
-            round(
-                seconds
-                * config.sample_rate_hz
-            )
-        ) - 1
-
-        if index >= config.prediction_steps:
-            continue
-
-        position_error = np.linalg.norm(
-            predictions[:, index, :2]
-            - targets[:, index, :2],
-            axis=-1,
-        )
-
-        predicted_heading = (
-            predictions[:, index, 2:4]
-        )
-
-        target_heading = (
-            targets[:, index, 2:4]
-        )
-
-        predicted_heading = (
-            predicted_heading
-            / np.maximum(
-                np.linalg.norm(
-                    predicted_heading,
-                    axis=-1,
-                    keepdims=True,
-                ),
-                1e-8,
-            )
-        )
-
-        target_heading = (
-            target_heading
-            / np.maximum(
-                np.linalg.norm(
-                    target_heading,
-                    axis=-1,
-                    keepdims=True,
-                ),
-                1e-8,
-            )
-        )
-
-        cosine = np.sum(
-            predicted_heading
-            * target_heading,
-            axis=-1,
-        )
-
-        cosine = np.clip(
-            cosine,
-            -1.0,
-            1.0,
-        )
-
-        heading_error = np.degrees(
-            np.arccos(cosine)
-        )
-
-        results[f"{seconds}s"] = {
-            "position_error_meters": float(
-                position_error.mean()
-            ),
-            "heading_error_degrees": float(
-                heading_error.mean()
-            ),
-        }
-
-    return results
+    return {
+        "ade_meters": float(errors.mean()),
+        "fde_meters": float(errors[:, -1].mean()),
+        "horizon_metrics": horizon_metrics,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
+
 def run_epoch(
-    model: FrameInvariantRobotPoseLSTM,
+    model: RobotPoseMDNLSTM,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    future_heading_weight: float,
-    current_state_weight: float,
-    current_state_heading_weight: float,
     training: bool,
-) -> dict:
+) -> float:
     if training:
         model.train()
     else:
         model.eval()
 
-    sums = {
-        "loss": 0.0,
-        "future_loss": 0.0,
-        "future_position_loss": 0.0,
-        "future_heading_loss": 0.0,
-        "current_state_loss": 0.0,
-        "current_state_position_loss": 0.0,
-        "current_state_heading_loss": 0.0,
-    }
+    total = 0.0
+    count = 0
 
-    example_count = 0
-
-    for (
-        inputs,
-        future_targets,
-        current_state_targets,
-    ) in loader:
-        inputs = inputs.to(
-            device
-        )
-
-        future_targets = (
-            future_targets.to(
-                device
-            )
-        )
-
-        current_state_targets = (
-            current_state_targets.to(
-                device
-            )
-        )
+    for inputs, targets in loader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
 
         if training:
-            optimizer.zero_grad(
-                set_to_none=True
-            )
+            optimizer.zero_grad(set_to_none=True)
 
-        with torch.set_grad_enabled(
-            training
-        ):
-            (
-                future_predictions,
-                current_state_predictions,
-            ) = model(inputs)
+        with torch.set_grad_enabled(training):
+            output = model(inputs)
+            loss = mdn_nll(model, output, targets)
 
-            losses = combined_loss(
-                future_prediction=(
-                    future_predictions
-                ),
-                future_target=(
-                    future_targets
-                ),
-                current_state_prediction=(
-                    current_state_predictions
-                ),
-                current_state_target=(
-                    current_state_targets
-                ),
-                future_heading_weight=(
-                    future_heading_weight
-                ),
-                current_state_weight=(
-                    current_state_weight
-                ),
-                current_state_heading_weight=(
-                    current_state_heading_weight
-                ),
-            )
-
-            if training:
-                losses[
-                    "loss"
-                ].backward()
-
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    max_norm=5.0,
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    "Non-finite MDN loss encountered. "
+                    "Try a smaller learning rate or inspect trajectory scaling."
                 )
 
+            if training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 optimizer.step()
 
         batch_size = inputs.shape[0]
+        total += float(loss.item()) * batch_size
+        count += batch_size
 
-        for name in sums:
-            sums[name] += (
-                float(
-                    losses[name].item()
-                )
-                * batch_size
-            )
-
-        example_count += batch_size
-
-    return {
-        name: (
-            value
-            / example_count
-        )
-        for name, value
-        in sums.items()
-    }
+    return total / max(count, 1)
 
 
+def linear_lr_factor(epoch: int, total_epochs: int, end_factor: float) -> float:
+    if total_epochs <= 1:
+        return 1.0
+    progress = min(max(epoch, 0), total_epochs - 1) / float(total_epochs - 1)
+    return 1.0 + progress * (end_factor - 1.0)
 
-def has_aligned_ground_truth_data(
-    path: Path,
-) -> bool:
-    """
-    Return True only for .npz files produced by the Quest + robot-ground-truth
-    alignment server.
 
-    Older Quest-only motion-window files are ignored automatically.
-    """
-    required_keys = {
-        "quest_time_from_window_start",
-        "quest_positions",
-        "quest_headings",
-        "robot_ground_truth_positions",
-        "robot_ground_truth_headings",
-    }
-
-    try:
-        with np.load(
-            path,
-            allow_pickle=False,
-        ) as data:
-            return required_keys.issubset(
-                set(data.files)
-            )
-
-    except Exception as exc:
-        print(
-            f"WARNING: could not inspect "
-            f"{path.name}: {exc}"
-        )
-
-        return False
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-
-    # train_lstm.py lives in:
-    #
-    # robot_pose_prediction/model_training/
-    #
-    # Therefore the parent of model_training is robot_pose_prediction.
-    robot_pose_prediction_dir = (
-        Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(
+        description=(
+            "Robot-only, robot-relative per-horizon LSTM+MDN trajectory "
+            "forecasting using anchors where the robot is already moving."
+        )
     )
+
+    project_dir = Path(__file__).resolve().parent.parent
 
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=(
-            robot_pose_prediction_dir
-            / "data"
-        ),
+        default=project_dir / "data" /"robot_ground_truth",
     )
-
     parser.add_argument(
         "--weights-dir",
         type=Path,
-        default=(
-            robot_pose_prediction_dir
-            / "weights"
-        ),
+        default=project_dir / "weights",
     )
-
     parser.add_argument(
         "--eval-dir",
         type=Path,
-        default=(
-            robot_pose_prediction_dir
-            / "eval"
-        ),
+        default=project_dir / "eval",
     )
 
-    parser.add_argument(
-        "--sample-rate-hz",
-        type=float,
-        default=10.0,
-    )
+    parser.add_argument("--sample-rate-hz", type=float, default=10.0)
+    parser.add_argument("--history-seconds", type=float, default=3.0)
+    parser.add_argument("--prediction-seconds", type=float, default=4.0)
+    parser.add_argument("--anchor-stride-seconds", type=float, default=0.5)
 
+    # Keep only anchors where the robot has already begun moving according to
+    # the OBSERVED history. This avoids asking the model to predict an
+    # unobservable stop->move decision from a completely stationary history.
     parser.add_argument(
-        "--history-seconds",
+        "--min-recent-speed",
         type=float,
-        default=3.0,
-    )
-
-    parser.add_argument(
-        "--prediction-seconds",
-        type=float,
-        default=4.0,
-    )
-
-    parser.add_argument(
-        "--anchor-stride-seconds",
-        type=float,
-        default=0.5,
-    )
-
-    parser.add_argument(
-        "--kinematic-estimation-seconds",
-        type=float,
-        default=0.5,
+        default=0.15,
         help=(
-            "Amount of recent observed history used to estimate "
-            "velocity and yaw rate for the kinematic baseline."
+            "Minimum mean planar speed (m/s) over the final observed speed "
+            "window required to keep a training/evaluation anchor."
         ),
     )
-
     parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=128,
-    )
-
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        default=2,
-    )
-
-    parser.add_argument(
-        "--decoder-hidden-size",
-        type=int,
-        default=128,
-    )
-
-    parser.add_argument(
-        "--dropout",
+        "--movement-check-seconds",
         type=float,
-        default=0.1,
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=64,
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=100,
-    )
-
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=1e-3,
-    )
-
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-    )
-
-    parser.add_argument(
-        "--heading-weight",
-        type=float,
-        default=1.0,
+        default=0.2,
         help=(
-            "Weight on future heading loss relative "
-            "to future position loss."
+            "Length of observed history immediately before the anchor used "
+            "for the moving/stationary decision."
         ),
     )
 
-    parser.add_argument(
-        "--current-state-weight",
-        type=float,
-        default=0.5,
-        help=(
-            "Weight of the auxiliary current relative-state "
-            "loss in the total training objective."
-        ),
-    )
+    # Keep the released paper implementation's H=8, 1 layer, and 3 Gaussians,
+    # but extend its 4-D pos+velocity input with 3 robot-heading-dynamics
+    # features: sin(relative_yaw), cos(relative_yaw), and yaw_rate.
+    parser.add_argument("--hidden-size", type=int, default=32)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--num-mixtures", type=int, default=3)
 
-    parser.add_argument(
-        "--current-state-heading-weight",
-        type=float,
-        default=1.0,
-        help=(
-            "Weight on heading inside the auxiliary "
-            "current relative-state loss."
-        ),
-    )
-
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=15,
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-    )
+    # Paper reports batch 1024; released multi-dataset config uses 4096. Use 1024
+    # here because robot datasets are typically much smaller. This remains
+    # overridable without changing code.
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--epochs", type=int, default=2500)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--final-learning-rate", type=float, default=1e-7)
+    parser.add_argument("--num-eval-samples", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--print-every", type=int, default=25)
 
     args = parser.parse_args()
+
+    if args.sample_rate_hz <= 0:
+        raise ValueError("sample-rate-hz must be > 0.")
+    if args.history_seconds <= 0 or args.prediction_seconds <= 0:
+        raise ValueError("history/prediction seconds must be > 0.")
+    if args.epochs <= 0 or args.batch_size <= 0:
+        raise ValueError("epochs and batch-size must be > 0.")
+    if args.final_learning_rate <= 0 or args.learning_rate <= 0:
+        raise ValueError("learning rates must be > 0.")
+    if args.final_learning_rate > args.learning_rate:
+        raise ValueError("final-learning-rate should not exceed learning-rate.")
+    if args.min_recent_speed < 0.0:
+        raise ValueError("min-recent-speed must be >= 0.")
+    if args.movement_check_seconds <= 0.0:
+        raise ValueError("movement-check-seconds must be > 0.")
 
     set_seed(args.seed)
 
@@ -2583,202 +981,95 @@ def main() -> None:
         sample_rate_hz=args.sample_rate_hz,
         history_seconds=args.history_seconds,
         prediction_seconds=args.prediction_seconds,
-        anchor_stride_seconds=(
-            args.anchor_stride_seconds
-        ),
+        anchor_stride_seconds=args.anchor_stride_seconds,
     )
 
-    data_dir = args.data_dir.resolve()
-    weights_dir = args.weights_dir.resolve()
-    eval_dir = args.eval_dir.resolve()
+    data_dir = args.data_dir.expanduser().resolve()
+    weights_dir = args.weights_dir.expanduser().resolve()
+    eval_dir = args.eval_dir.expanduser().resolve()
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    eval_dir.mkdir(parents=True, exist_ok=True)
 
-    weights_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    all_files = sorted(data_dir.glob("*.npz"))
+    if not all_files:
+        raise RuntimeError(f"No .npz files found in {data_dir}")
 
-    eval_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    all_npz_files = sorted(
-        data_dir.glob("*.npz")
-    )
-
-    if not all_npz_files:
+    files = [path for path in all_files if has_robot_motion_data(path)]
+    if len(files) < 3:
         raise RuntimeError(
-            f"No .npz files found in {data_dir}"
+            f"Only {len(files)} compatible robot-motion files found; need >=3."
         )
 
-    files = [
-        path
-        for path in all_npz_files
-        if has_aligned_ground_truth_data(
-            path
-        )
-    ]
-
-    ignored_file_count = (
-        len(all_npz_files)
-        - len(files)
-    )
-
-    if not files:
-        raise RuntimeError(
-            "No aligned Quest + robot-ground-truth "
-            f".npz files found in {data_dir}. "
-            "Collect data with the updated alignment "
-            "server before training."
-        )
+    train_files, validation_files, test_files = split_files(files, args.seed)
 
     print()
+    print("=== Robot-only per-horizon LSTM+MDN (moving anchors only) ===")
+    print(f"Data directory:      {data_dir}")
+    print(f"Compatible files:    {len(files)}")
+    print(f"Train/val/test:      {len(train_files)}/{len(validation_files)}/{len(test_files)} files")
+    print(f"History/prediction:  {config.history_seconds:.1f}s -> {config.prediction_seconds:.1f}s")
     print(
-        f"Aligned motion-window files: "
-        f"{len(files)}"
+        "Anchor filter:       mean speed over final "
+        f"{args.movement_check_seconds:.2f}s >= "
+        f"{args.min_recent_speed:.3f} m/s"
     )
-
-    if ignored_file_count > 0:
-        print(
-            "Ignored older/incompatible .npz files: "
-            f"{ignored_file_count}"
-        )
-    print(f"Data directory: {data_dir}")
-    print(f"Weights directory: {weights_dir}")
-    print(f"Evaluation directory: {eval_dir}")
-    print()
-    print(
-        "LSTM input:  Quest-estimated robot motion"
-    )
-    print(
-        "Future target: robot GT motion relative "
-        "to the true current anchor"
-    )
-    print(
-        "Aux target:    robot GT motion from "
-        "history start -> current"
-    )
-    print(
-        "Frames:        Quest and robot GT are "
-        "normalized independently; no cross-frame transform"
-    )
+    print("Input:               [x, z, vx, vz, sin(dyaw), cos(dyaw), yaw_rate]")
+    print(f"Target:              future [x, z] in same robot frame")
+    print(f"MDN:                 {args.num_mixtures} bivariate Gaussians PER horizon")
+    print(f"LSTM hidden/layers:  {args.hidden_size}/{args.num_layers}")
+    print(f"Epochs/batch:        {args.epochs}/{args.batch_size}")
     print()
 
-    (
-        train_files,
-        validation_files,
-        test_files,
-    ) = split_files(
-        files=files,
-        seed=args.seed,
-    )
-
-    print(
-        f"Train files:      "
-        f"{len(train_files)}"
-    )
-    print(
-        f"Validation files: "
-        f"{len(validation_files)}"
-    )
-    print(
-        f"Test files:       "
-        f"{len(test_files)}"
-    )
-
-    print()
-    print("Generating robot-relative examples...")
-
-    (
-        train_inputs,
-        train_targets,
-        train_current_state_targets,
-        train_quest_state_baselines,
-    ) = build_dataset_arrays(
+    train_inputs, train_targets, train_filter_stats = build_dataset_arrays(
         train_files,
         config,
+        min_recent_speed=args.min_recent_speed,
+        movement_check_seconds=args.movement_check_seconds,
     )
-
-    (
-        validation_inputs,
-        validation_targets,
-        validation_current_state_targets,
-        validation_quest_state_baselines,
-    ) = build_dataset_arrays(
+    validation_inputs, validation_targets, validation_filter_stats = build_dataset_arrays(
         validation_files,
         config,
+        min_recent_speed=args.min_recent_speed,
+        movement_check_seconds=args.movement_check_seconds,
     )
-
-    (
-        test_inputs,
-        test_targets,
-        test_current_state_targets,
-        test_quest_state_baselines,
-    ) = build_dataset_arrays(
+    test_inputs, test_targets, test_filter_stats = build_dataset_arrays(
         test_files,
         config,
+        min_recent_speed=args.min_recent_speed,
+        movement_check_seconds=args.movement_check_seconds,
     )
 
     print(
-        f"Train examples:      "
-        f"{len(train_inputs)}"
+        "Train examples:      "
+        f"{len(train_inputs)} retained / "
+        f"{train_filter_stats['candidate_examples']} candidates "
+        f"({train_filter_stats['filtered_stationary_examples']} filtered)"
     )
     print(
-        f"Validation examples: "
-        f"{len(validation_inputs)}"
+        "Validation examples: "
+        f"{len(validation_inputs)} retained / "
+        f"{validation_filter_stats['candidate_examples']} candidates "
+        f"({validation_filter_stats['filtered_stationary_examples']} filtered)"
     )
     print(
-        f"Test examples:       "
-        f"{len(test_inputs)}"
+        "Test examples:       "
+        f"{len(test_inputs)} retained / "
+        f"{test_filter_stats['candidate_examples']} candidates "
+        f"({test_filter_stats['filtered_stationary_examples']} filtered)"
     )
 
-    # ---------------------------------------------------------------
-    # Normalize using training data only.
-    # ---------------------------------------------------------------
-
-    input_mean = train_inputs.mean(
-        axis=(0, 1),
-        keepdims=True,
-    ).astype(np.float32)
-
-    input_std = train_inputs.std(
-        axis=(0, 1),
-        keepdims=True,
-    ).astype(np.float32)
-
-    input_std = np.maximum(
-        input_std,
-        1e-6,
-    )
+    input_mean = train_inputs.mean(axis=(0, 1), keepdims=True).astype(np.float32)
+    input_std = train_inputs.std(axis=(0, 1), keepdims=True).astype(np.float32)
+    input_std = np.maximum(input_std, 1e-6)
 
     train_dataset = RobotTrajectoryDataset(
-        inputs=train_inputs,
-        future_targets=train_targets,
-        current_state_targets=(
-            train_current_state_targets
-        ),
-        input_mean=input_mean,
-        input_std=input_std,
+        train_inputs, train_targets, input_mean, input_std
     )
-
     validation_dataset = RobotTrajectoryDataset(
-        inputs=validation_inputs,
-        future_targets=validation_targets,
-        current_state_targets=(
-            validation_current_state_targets
-        ),
-        input_mean=input_mean,
-        input_std=input_std,
+        validation_inputs, validation_targets, input_mean, input_std
     )
-
     test_dataset = RobotTrajectoryDataset(
-        inputs=test_inputs,
-        future_targets=test_targets,
-        current_state_targets=(
-            test_current_state_targets
-        ),
-        input_mean=input_mean,
-        input_std=input_std,
+        test_inputs, test_targets, input_mean, input_std
     )
 
     train_loader = DataLoader(
@@ -2786,541 +1077,229 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
-
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
-
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    print()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print()
 
-    model = FrameInvariantRobotPoseLSTM(
+    model = RobotPoseMDNLSTM(
         input_size=7,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
-        prediction_steps=(
-            config.prediction_steps
-        ),
-        decoder_hidden_size=(
-            args.decoder_hidden_size
-        ),
-        dropout=args.dropout,
+        prediction_steps=config.prediction_steps,
+        num_mixtures=args.num_mixtures,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.learning_rate,
-        weight_decay=args.weight_decay,
     )
 
-    scheduler = (
-        torch.optim.lr_scheduler.ReduceLROnPlateau(
+    end_factor = args.final_learning_rate / args.learning_rate
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda epoch: linear_lr_factor(
+            epoch,
+            args.epochs,
+            end_factor,
+        ),
+    )
+
+    best_validation_nll = float("inf")
+    best_epoch = -1
+    best_path = weights_dir / "robot_pose_per_horizon_mdn_heading_moving_only_best.pt"
+
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        train_nll = run_epoch(
+            model,
+            train_loader,
             optimizer,
-            mode="min",
-            factor=0.5,
-            patience=5,
-        )
-    )
-
-    checkpoint_path = (
-        weights_dir
-        / "robot_pose_lstm_best.pt"
-    )
-
-    best_validation_loss = float("inf")
-    epochs_without_improvement = 0
-
-    training_history = []
-
-    # ---------------------------------------------------------------
-    # Training
-    # ---------------------------------------------------------------
-
-    for epoch in range(
-        1,
-        args.epochs + 1,
-    ):
-        train_result = run_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            future_heading_weight=(
-                args.heading_weight
-            ),
-            current_state_weight=(
-                args.current_state_weight
-            ),
-            current_state_heading_weight=(
-                args.current_state_heading_weight
-            ),
+            device,
             training=True,
         )
-
-        validation_result = run_epoch(
-            model=model,
-            loader=validation_loader,
-            optimizer=optimizer,
-            device=device,
-            future_heading_weight=(
-                args.heading_weight
-            ),
-            current_state_weight=(
-                args.current_state_weight
-            ),
-            current_state_heading_weight=(
-                args.current_state_heading_weight
-            ),
+        validation_nll = run_epoch(
+            model,
+            validation_loader,
+            optimizer,
+            device,
             training=False,
         )
 
-        validation_loss = (
-            validation_result["loss"]
-        )
-
-        scheduler.step(validation_loss)
-
-        current_lr = (
-            optimizer.param_groups[0]["lr"]
-        )
-
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train={train_result['loss']:.5f} | "
-            f"val={validation_loss:.5f} | "
-            f"f_pos={validation_result['future_position_loss']:.5f} | "
-            f"f_head={validation_result['future_heading_loss']:.5f} | "
-            f"state={validation_result['current_state_loss']:.5f} | "
-            f"lr={current_lr:.2e}"
-        )
-
-        training_history.append(
+        current_lr = float(optimizer.param_groups[0]["lr"])
+        history.append(
             {
                 "epoch": epoch,
+                "train_nll": train_nll,
+                "validation_nll": validation_nll,
                 "learning_rate": current_lr,
-                "train": train_result,
-                "validation": validation_result,
             }
         )
 
-        if (
-            validation_loss
-            < best_validation_loss
-        ):
-            best_validation_loss = (
-                validation_loss
-            )
-
-            epochs_without_improvement = 0
-
-            checkpoint = {
-                "model_state_dict": (
-                    model.state_dict()
-                ),
-                "model_config": (
-                    model.get_config()
-                ),
-                "sequence_config": (
-                    asdict(config)
-                ),
-                "data_sources": {
-                    "input": (
-                        "quest_estimated_pose_history"
-                    ),
-                    "future_target": (
-                        "aligned_robot_ground_truth_future"
-                    ),
-                    "current_state_target": (
-                        "ground_truth_motion_history_start_to_current"
-                    ),
-                    "coordinate_normalization": (
-                        "independent_local_frames_no_cross_frame_transform"
-                    ),
-                },
-                "loss_config": {
-                    "future_heading_weight": (
-                        args.heading_weight
-                    ),
-                    "current_state_weight": (
-                        args.current_state_weight
-                    ),
-                    "current_state_heading_weight": (
-                        args.current_state_heading_weight
-                    ),
-                },
-                "input_mean": (
-                    input_mean.squeeze(
-                        axis=(0, 1)
-                    )
-                ),
-                "input_std": (
-                    input_std.squeeze(
-                        axis=(0, 1)
-                    )
-                ),
-                "best_validation_loss": (
-                    best_validation_loss
-                ),
-                "epoch": epoch,
-                "train_files": [
-                    path.name
-                    for path in train_files
-                ],
-                "validation_files": [
-                    path.name
-                    for path in validation_files
-                ],
-                "test_files": [
-                    path.name
-                    for path in test_files
-                ],
-            }
-
+        if validation_nll < best_validation_nll:
+            best_validation_nll = validation_nll
+            best_epoch = epoch
             torch.save(
-                checkpoint,
-                checkpoint_path,
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model_config": model.get_config(),
+                    "sequence_config": asdict(config),
+                    "movement_filter": {
+                        "min_recent_speed": args.min_recent_speed,
+                        "movement_check_seconds": args.movement_check_seconds,
+                        "uses_future_information": False,
+                    },
+                    "input_mean": input_mean,
+                    "input_std": input_std,
+                    "best_epoch": best_epoch,
+                    "best_validation_nll": best_validation_nll,
+                    "input_features": [
+                        "relative_x",
+                        "relative_z",
+                        "relative_velocity_x",
+                        "relative_velocity_z",
+                        "sin_relative_yaw",
+                        "cos_relative_yaw",
+                        "yaw_rate",
+                    ],
+                    "target_features": [
+                        "future_relative_x",
+                        "future_relative_z",
+                    ],
+                },
+                best_path,
             )
 
-        else:
-            epochs_without_improvement += 1
+        scheduler.step()
 
         if (
-            epochs_without_improvement
-            >= args.patience
+            epoch == 1
+            or epoch == args.epochs
+            or epoch % args.print_every == 0
         ):
-            print()
             print(
-                "Early stopping: "
-                f"validation loss did not improve "
-                f"for {args.patience} epochs."
+                f"Epoch {epoch:4d}/{args.epochs} | "
+                f"train NLL {train_nll:.5f} | "
+                f"val NLL {validation_nll:.5f} | "
+                f"lr {current_lr:.3e} | "
+                f"best {best_validation_nll:.5f} @ {best_epoch}"
             )
-            break
 
-    # ---------------------------------------------------------------
-    # Reload best checkpoint.
-    # ---------------------------------------------------------------
+    checkpoint = torch.load(best_path, map_location=device, weights_only=False)
+    model = RobotPoseMDNLSTM(**checkpoint["model_config"]).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
 
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location=device,
-        weights_only=False,
+    # Fixed seed makes sampled minADE@20 reproducible across repeated eval runs.
+    torch.manual_seed(args.seed + 1000)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + 1000)
+
+    test_metrics = evaluate_model(
+        model,
+        test_loader,
+        device,
+        config,
+        num_samples=args.num_eval_samples,
     )
 
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
+    constant_velocity_predictions = predict_constant_velocity(
+        test_inputs,
+        config,
+    )
+    baseline_metrics = compute_numpy_metrics(
+        constant_velocity_predictions,
+        test_targets,
+        config,
     )
 
-    # ---------------------------------------------------------------
-    # Evaluation
-    # ---------------------------------------------------------------
-
-    test_metrics = compute_metrics(
-        model=model,
-        loader=test_loader,
-        device=device,
-    )
-
-    horizon_metrics = compute_horizon_metrics(
-        model=model,
-        loader=test_loader,
-        device=device,
-        config=config,
-    )
-
-    current_state_metrics = (
-        compute_current_state_metrics(
-            model=model,
-            loader=test_loader,
-            device=device,
-            quest_state_baselines=(
-                test_quest_state_baselines
-            ),
-            current_state_targets=(
-                test_current_state_targets
-            ),
-        )
-    )
-
-    current_state_metrics[
-        "history_interval_seconds"
-    ] = float(
-        (config.history_steps - 1)
-        * config.dt
-    )
-
-    # ---------------------------------------------------------------
-    # Constant-turn-rate kinematic baseline.
-    #
-    # IMPORTANT:
-    # Use the original UNNORMALIZED Quest-derived test_inputs here. The
-    # kinematic baseline sees the same observer-side information as the LSTM.
-    # ---------------------------------------------------------------
-
-    kinematic_predictions = (
-        predict_constant_turn_rate(
-            inputs=test_inputs,
-            config=config,
-            estimation_seconds=(
-                args.kinematic_estimation_seconds
-            ),
-        )
-    )
-
-    kinematic_test_metrics = (
-        compute_array_metrics(
-            predictions=kinematic_predictions,
-            targets=test_targets,
-        )
-    )
-
-    kinematic_horizon_metrics = (
-        compute_array_horizon_metrics(
-            predictions=kinematic_predictions,
-            targets=test_targets,
-            config=config,
-        )
-    )
-
-    print()
-    print("Final test metrics")
-    print("------------------")
-
-    metric_names = [
-        "ade_meters",
-        "fde_meters",
-        "mean_heading_error_degrees",
-        "final_heading_error_degrees",
-    ]
-
-    print(
-        f"{'Metric':<36}"
-        f"{'LSTM':>12}"
-        f"{'Kinematic':>14}"
-    )
-
-    print(
-        "-" * 62
-    )
-
-    for name in metric_names:
-        print(
-            f"{name:<36}"
-            f"{test_metrics[name]:>12.4f}"
-            f"{kinematic_test_metrics[name]:>14.4f}"
-        )
-
-    print()
-    print("Test metrics by prediction horizon")
-    print("----------------------------------")
-
-    print(
-        f"{'Horizon':<9}"
-        f"{'LSTM pos':>12}"
-        f"{'Kin pos':>12}"
-        f"{'LSTM head':>14}"
-        f"{'Kin head':>14}"
-    )
-
-    print(
-        "-" * 61
-    )
-
-    for horizon, metrics in horizon_metrics.items():
-        kinematic_metrics = (
-            kinematic_horizon_metrics[
-                horizon
-            ]
-        )
-
-        print(
-            f"{horizon:<9}"
-            f"{metrics['position_error_meters']:>10.3f} m"
-            f"{kinematic_metrics['position_error_meters']:>10.3f} m"
-            f"{metrics['heading_error_degrees']:>11.2f} deg"
-            f"{kinematic_metrics['heading_error_degrees']:>11.2f} deg"
-        )
-
-    print(
-        "-" * 61
-    )
-    print()
-
-    print(
-        "Current relative-state estimation"
-    )
-    print(
-        "---------------------------------"
-    )
-    print(
-        "This evaluates motion from history start "
-        "to the current prediction anchor."
-    )
-    print(
-        f"{'Metric':<34}"
-        f"{'LSTM state':>14}"
-        f"{'Raw Quest':>14}"
-    )
-    print(
-        "-" * 62
-    )
-
-    learned_state_metrics = (
-        current_state_metrics[
-            "learned_state_head"
-        ]
-    )
-
-    quest_state_metrics = (
-        current_state_metrics[
-            "raw_quest_relative_motion"
-        ]
-    )
-
-    print(
-        f"{'Mean position error':<34}"
-        f"{learned_state_metrics['mean_position_error_meters']:>11.3f} m"
-        f"{quest_state_metrics['mean_position_error_meters']:>11.3f} m"
-    )
-
-    print(
-        f"{'Mean heading error':<34}"
-        f"{learned_state_metrics['mean_heading_error_degrees']:>10.2f} deg"
-        f"{quest_state_metrics['mean_heading_error_degrees']:>10.2f} deg"
-    )
-
-    print(
-        f"{'P90 position error':<34}"
-        f"{learned_state_metrics['p90_position_error_meters']:>11.3f} m"
-        f"{quest_state_metrics['p90_position_error_meters']:>11.3f} m"
-    )
-
-    print(
-        f"{'P90 heading error':<34}"
-        f"{learned_state_metrics['p90_heading_error_degrees']:>10.2f} deg"
-        f"{quest_state_metrics['p90_heading_error_degrees']:>10.2f} deg"
-    )
-
-    print(
-        "-" * 62
-    )
-    print()
-
-    # ---------------------------------------------------------------
-    # Save evaluation results.
-    # ---------------------------------------------------------------
-
-    summary = {
+    results = {
+        "method": "paper_style_per_horizon_bivariate_mdn_with_heading_history_moving_only",
+        "best_epoch": best_epoch,
+        "best_validation_nll": best_validation_nll,
         "sequence_config": asdict(config),
-        "data_sources": {
-            "input": (
-                "quest_estimated_pose_history"
-            ),
-            "future_target": (
-                "aligned_robot_ground_truth_future"
-            ),
-            "current_state_target": (
-                "ground_truth_motion_history_start_to_current"
-            ),
-            "coordinate_normalization": (
-                "independent_local_frames_no_cross_frame_transform"
-            ),
+        "model_config": model.get_config(),
+        "movement_filter": {
+            "min_recent_speed": args.min_recent_speed,
+            "movement_check_seconds": args.movement_check_seconds,
+            "uses_future_information": False,
         },
-        "loss_config": {
-            "future_heading_weight": (
-                args.heading_weight
-            ),
-            "current_state_weight": (
-                args.current_state_weight
-            ),
-            "current_state_heading_weight": (
-                args.current_state_heading_weight
-            ),
+        "movement_filter_stats": {
+            "train": train_filter_stats,
+            "validation": validation_filter_stats,
+            "test": test_filter_stats,
         },
-        "model_config": (
-            checkpoint["model_config"]
-        ),
-        "best_validation_loss": (
-            checkpoint[
-                "best_validation_loss"
-            ]
-        ),
-        "best_epoch": checkpoint["epoch"],
+        "train_file_count": len(train_files),
+        "validation_file_count": len(validation_files),
+        "test_file_count": len(test_files),
+        "train_example_count": len(train_inputs),
+        "validation_example_count": len(validation_inputs),
+        "test_example_count": len(test_inputs),
         "test_metrics": test_metrics,
-        "horizon_metrics": horizon_metrics,
-        "current_state_metrics": (
-            current_state_metrics
-        ),
-        "kinematic_baseline": {
-            "type": (
-                "constant_body_velocity_"
-                "constant_yaw_rate"
-            ),
-            "estimation_seconds": (
-                args.kinematic_estimation_seconds
-            ),
-            "test_metrics": (
-                kinematic_test_metrics
-            ),
-            "horizon_metrics": (
-                kinematic_horizon_metrics
-            ),
-        },
-        "train_files": [
-            path.name
-            for path in train_files
-        ],
-        "validation_files": [
-            path.name
-            for path in validation_files
-        ],
-        "test_files": [
-            path.name
-            for path in test_files
-        ],
-        "training_history": training_history,
+        "constant_velocity_baseline": baseline_metrics,
+        "training_history": history,
     }
 
-    eval_summary_path = (
-        eval_dir
-        / "robot_pose_lstm_eval.json"
+    metrics_path = eval_dir / "robot_pose_per_horizon_mdn_heading_moving_only_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2)
+
+    print()
+    print("=== TEST RESULTS ===")
+    print(f"Best epoch:                 {best_epoch}")
+    print(f"Test NLL / horizon point:   {test_metrics['nll_per_horizon_point']:.5f}")
+    print(
+        f"Expected-path ADE/FDE:      "
+        f"{test_metrics['expected_trajectory_ade_meters']:.3f} / "
+        f"{test_metrics['expected_trajectory_fde_meters']:.3f} m"
+    )
+    print(
+        f"Modal-path ADE/FDE:         "
+        f"{test_metrics['modal_trajectory_ade_meters']:.3f} / "
+        f"{test_metrics['modal_trajectory_fde_meters']:.3f} m"
+    )
+    print(
+        f"minADE/minFDE@{args.num_eval_samples} (all steps): "
+        f"{test_metrics[f'minade_at_{args.num_eval_samples}_meters']:.3f} / "
+        f"{test_metrics[f'minfde_at_{args.num_eval_samples}_meters']:.3f} m"
+    )
+    print(
+        f"minADE/minFDE@{args.num_eval_samples} (0.8s):      "
+        f"{test_metrics[f'paper_style_0p8s_minade_at_{args.num_eval_samples}_meters']:.3f} / "
+        f"{test_metrics[f'paper_style_0p8s_minfde_at_{args.num_eval_samples}_meters']:.3f} m"
+    )
+    print(
+        f"Constant-velocity ADE/FDE:  "
+        f"{baseline_metrics['ade_meters']:.3f} / "
+        f"{baseline_metrics['fde_meters']:.3f} m"
     )
 
-    with open(
-        eval_summary_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            summary,
-            file,
-            indent=2,
+    print("\nPer-horizon:")
+    for horizon, values in test_metrics["horizon_metrics"].items():
+        print(
+            f"  {horizon}: expected={values['expected_position_error_meters']:.3f} m | "
+            f"modal={values['modal_position_error_meters']:.3f} m | "
+            f"min@{args.num_eval_samples}="
+            f"{values[f'min_position_error_at_{args.num_eval_samples}_meters']:.3f} m"
         )
 
-    print(
-        f"Best checkpoint: {checkpoint_path}"
-    )
-
-    print(
-        f"Evaluation results: {eval_summary_path}"
-    )
+    print(f"\nCheckpoint: {best_path}")
+    print(f"Metrics:    {metrics_path}")
 
 
 if __name__ == "__main__":

@@ -351,6 +351,9 @@ DEFAULT_COUNTERFACTUAL_CONFIG: dict[str, Any] = {
     "counterfactual": {
         "classification_weight": 1000.0,
         "reachability_weight": 1000.0,
+        "forward_extension_weight": 1000.0,
+        "forward_extension_min": 0.20,
+        "require_forward_extension_for_success": True,
         "max_iterations": 1000,
         "step_size": 0.01,
         "probability_margin": 1e-4,
@@ -1333,6 +1336,9 @@ def find_minimal_perturbation(
     reachability_weight: float,
     cross_body_weight: float = 1000.0,
     cross_body_margin: float = 0.05,
+    forward_extension_weight: float = 1000.0,
+    forward_extension_min: float = 0.20,
+    require_forward_extension_for_success: bool = True,
     max_iterations: int = 1000,
     bin_search_iterations: int = 10,
     step_size: float = 0.01,
@@ -1414,11 +1420,20 @@ def find_minimal_perturbation(
     Cross-body regularization adds one soft term to the optimization objective.
     It penalizes only additional movement of an active hand beyond the torso
     midline compared with that hand's original pose. A small cross_body_margin
-    permits natural near-midline positioning. It does not reward forward motion,
-    alter FABRIK, change elbow constraints, or add any whole-arm movement term.
+    permits natural near-midline positioning.
+
+    Forward-extension regularization adds a second semantic term for handoff
+    targets. A torso-forward axis is derived from the fixed chest/shoulder
+    geometry, and active hands are softly encouraged to lie at least
+    forward_extension_min meters in front of the shoulder midpoint. Once that
+    minimum is reached, the forward term becomes zero, so it does not reward
+    arbitrarily large reaches. When require_forward_extension_for_success is
+    True, the same minimum is also included in the success test so the later
+    binary search cannot shrink a good forward-reaching solution back behind
+    the semantic minimum. This forward rule is disabled for not-handoff targets.
 
     Robustness does NOT add another term to the optimization objective. The
-    distance/classification/reachability/cross-body objective is otherwise
+    distance/classification/reachability/cross-body/forward objective is otherwise
     unchanged. Robustness only changes the acceptance test for a successful
     counterfactual: the
     center pose must satisfy threshold +/- probability_margin, and most small
@@ -1454,6 +1469,16 @@ def find_minimal_perturbation(
     if cross_body_margin < 0.0:
         raise ValueError(
             "cross_body_margin must be nonnegative."
+        )
+
+    if forward_extension_weight < 0.0:
+        raise ValueError(
+            "forward_extension_weight must be nonnegative."
+        )
+
+    if forward_extension_min < 0.0:
+        raise ValueError(
+            "forward_extension_min must be nonnegative."
         )
 
     if probability_margin < 0.0:
@@ -1631,6 +1656,43 @@ def find_minimal_perturbation(
         eps=1e-8,
     )
 
+    # Torso-local forward axis. With the Quest/Unity joint convention used by
+    # this project, cross(right_shoulder - chest, left_shoulder - chest) points
+    # out through the front of the torso. This removes global yaw from the
+    # semantic rule: the axis turns with the person.
+    chest_position = get_original_joint_position("chest")
+    torso_forward_raw = torch.linalg.cross(
+        right_shoulder_position - chest_position,
+        left_shoulder_position - chest_position,
+        dim=0,
+    )
+
+    # Degenerate chest/shoulder geometry is unlikely, but use the shoulder axis
+    # and world-up direction as a stable fallback instead of producing NaNs.
+    world_up = torch.tensor(
+        [0.0, 1.0, 0.0],
+        dtype=original_joint_features.dtype,
+        device=original_joint_features.device,
+    )
+    torso_forward_fallback = torch.linalg.cross(
+        world_up,
+        torso_lateral_axis,
+        dim=0,
+    )
+    torso_forward_axis = unit_vector_or_fallback(
+        torso_forward_raw,
+        torso_forward_fallback,
+    ).detach()
+
+    # The semantic forward rule is only meaningful when optimizing toward a
+    # handoff. Setting forward_extension_weight=0 disables both the soft term
+    # and the optional success guard without changing any other behavior.
+    forward_extension_enabled = bool(
+        target_intent
+        and forward_extension_weight > 0.0
+        and forward_extension_min > 0.0
+    )
+
     original_hand_positions = {
         side: get_original_joint_position(f"{side}_hand")
         for side in active_sides
@@ -1703,6 +1765,89 @@ def find_minimal_perturbation(
             loss = loss + additional_crossing.square()
 
         return loss
+
+    def forward_extension_values_from_perturbation(
+        perturbation: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Signed active-hand distances along torso forward from shoulders."""
+        if object_arm == "both":
+            hand_deltas = {
+                "left": perturbation[0, 0:3],
+                "right": perturbation[0, 3:6],
+            }
+        else:
+            hand_deltas = {
+                object_arm: perturbation[0, 0:3],
+            }
+
+        return {
+            side: torch.dot(
+                original_hand_positions[side]
+                + hand_deltas[side]
+                - shoulder_midpoint,
+                torso_forward_axis,
+            )
+            for side in active_sides
+        }
+
+    def forward_extension_loss_from_perturbation(
+        perturbation: torch.Tensor,
+    ) -> torch.Tensor:
+        """Softly penalize handoff hands that remain too close to the torso."""
+        loss = torch.zeros(
+            (),
+            dtype=perturbation.dtype,
+            device=perturbation.device,
+        )
+
+        if not forward_extension_enabled:
+            return loss
+
+        minimum = torch.as_tensor(
+            forward_extension_min,
+            dtype=perturbation.dtype,
+            device=perturbation.device,
+        )
+
+        for extension in forward_extension_values_from_perturbation(
+            perturbation
+        ).values():
+            deficit = torch.relu(minimum - extension)
+            loss = loss + deficit.square()
+
+        return loss
+
+    def forward_extension_satisfied(
+        perturbation: torch.Tensor,
+    ) -> bool:
+        """Whether the semantic handoff-forward minimum is satisfied."""
+        if (
+            not forward_extension_enabled
+            or not require_forward_extension_for_success
+        ):
+            return True
+
+        with torch.no_grad():
+            values = forward_extension_values_from_perturbation(
+                perturbation
+            )
+            return all(
+                float(value.item()) + 1e-6
+                >= float(forward_extension_min)
+                for value in values.values()
+            )
+
+    def forward_extension_diagnostics(
+        perturbation: torch.Tensor,
+    ) -> dict[str, float]:
+        with torch.no_grad():
+            return {
+                side: float(value.item())
+                for side, value in (
+                    forward_extension_values_from_perturbation(perturbation)
+                    .items()
+                )
+            }
 
     def build_projection_features(
         candidate_joint_features: torch.Tensor,
@@ -2065,6 +2210,13 @@ def find_minimal_perturbation(
         ):
             return False, None
 
+        # The forward term is a soft optimization bias, but the binary-search
+        # minimizer below does not optimize the loss. When requested, guard the
+        # same semantic minimum here so binary search cannot erase the forward
+        # extension after a good solution has been found.
+        if not forward_extension_satisfied(perturbation):
+            return False, None
+
         robustness = evaluate_local_robustness(
             perturbation,
             central_probability=central_probability,
@@ -2118,6 +2270,22 @@ def find_minimal_perturbation(
             "robust_required_neighbor_count": int(
                 original_robustness["required_neighbor_count"]
             ),
+            "forward_extension_enabled": bool(forward_extension_enabled),
+            "forward_extension_weight": float(forward_extension_weight),
+            "forward_extension_min": float(forward_extension_min),
+            "require_forward_extension_for_success": bool(
+                require_forward_extension_for_success
+            ),
+            "torso_forward_axis": [
+                float(value)
+                for value in torso_forward_axis.detach().cpu().tolist()
+            ],
+            "forward_extensions": forward_extension_diagnostics(
+                zero_hand_perturbation
+            ),
+            "forward_extension_satisfied": bool(
+                forward_extension_satisfied(zero_hand_perturbation)
+            ),
         }
 
     hand_perturbation = torch.zeros(
@@ -2154,6 +2322,11 @@ def find_minimal_perturbation(
         cross_body_loss = cross_body_loss_from_perturbation(
             perturbation
         )
+        forward_extension_loss = (
+            forward_extension_loss_from_perturbation(
+                perturbation
+            )
+        )
 
         classification_target = torch.ones_like(probability) if target_intent else torch.zeros_like(probability)
         classification_loss = F.binary_cross_entropy(
@@ -2166,6 +2339,7 @@ def find_minimal_perturbation(
             + classification_weight * classification_loss
             + reachability_weight * reachability_loss
             + cross_body_weight * cross_body_loss
+            + forward_extension_weight * forward_extension_loss
         )
         return loss, distance_squared
 
@@ -2456,6 +2630,22 @@ def find_minimal_perturbation(
                 "robust_neighbor_count": 0,
                 "robust_neighbor_success_fraction": 0.0,
                 "robust_required_neighbor_count": 0,
+                "forward_extension_enabled": bool(forward_extension_enabled),
+                "forward_extension_weight": float(forward_extension_weight),
+                "forward_extension_min": float(forward_extension_min),
+                "require_forward_extension_for_success": bool(
+                    require_forward_extension_for_success
+                ),
+                "torso_forward_axis": [
+                    float(value)
+                    for value in torso_forward_axis.detach().cpu().tolist()
+                ],
+                "forward_extensions": forward_extension_diagnostics(
+                    best_progress_perturbation
+                ),
+                "forward_extension_satisfied": bool(
+                    forward_extension_satisfied(best_progress_perturbation)
+                ),
             }
 
     # Reduce the successful movement along the line from zero to the first
@@ -2568,6 +2758,22 @@ def find_minimal_perturbation(
                         "robust_neighbor_count": 0,
                         "robust_neighbor_success_fraction": 0.0,
                         "robust_required_neighbor_count": 0,
+                        "forward_extension_enabled": bool(forward_extension_enabled),
+                        "forward_extension_weight": float(forward_extension_weight),
+                        "forward_extension_min": float(forward_extension_min),
+                        "require_forward_extension_for_success": bool(
+                            require_forward_extension_for_success
+                        ),
+                        "torso_forward_axis": [
+                            float(value)
+                            for value in torso_forward_axis.detach().cpu().tolist()
+                        ],
+                        "forward_extensions": forward_extension_diagnostics(
+                            best_hand_perturbation
+                        ),
+                        "forward_extension_satisfied": bool(
+                            forward_extension_satisfied(best_hand_perturbation)
+                        ),
                     }
 
                 final_probability = fallback_probability
@@ -2627,6 +2833,22 @@ def find_minimal_perturbation(
         ),
         "robust_required_neighbor_count": int(
             final_robustness["required_neighbor_count"]
+        ),
+        "forward_extension_enabled": bool(forward_extension_enabled),
+        "forward_extension_weight": float(forward_extension_weight),
+        "forward_extension_min": float(forward_extension_min),
+        "require_forward_extension_for_success": bool(
+            require_forward_extension_for_success
+        ),
+        "torso_forward_axis": [
+            float(value)
+            for value in torso_forward_axis.detach().cpu().tolist()
+        ],
+        "forward_extensions": forward_extension_diagnostics(
+            final_hand_perturbation
+        ),
+        "forward_extension_satisfied": bool(
+            forward_extension_satisfied(final_hand_perturbation)
         ),
     }
 
@@ -2824,6 +3046,9 @@ def evaluate_counterfactual_weights(
                         reachability_weight=(
                             reachability_weight
                         ),
+                        forward_extension_weight=1000.0,
+                        forward_extension_min=0.20,
+                        require_forward_extension_for_success=True,
                         max_iterations=max_iterations,
                         step_size=step_size,
                         probability_margin=(
@@ -3626,6 +3851,24 @@ def visualize_counterfactual_samples(
                     counterfactual_config[
                         "reachability_weight"
                     ]
+                ),
+                forward_extension_weight=float(
+                    counterfactual_config.get(
+                        "forward_extension_weight",
+                        1000.0,
+                    )
+                ),
+                forward_extension_min=float(
+                    counterfactual_config.get(
+                        "forward_extension_min",
+                        0.20,
+                    )
+                ),
+                require_forward_extension_for_success=bool(
+                    counterfactual_config.get(
+                        "require_forward_extension_for_success",
+                        True,
+                    )
                 ),
                 max_iterations=int(
                     counterfactual_config[

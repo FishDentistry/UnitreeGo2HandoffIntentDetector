@@ -1,9 +1,9 @@
 counterfactual:
-  classification_weight: 1000.0
+  classification_weight: 10.0
   reachability_weight: 1000.0
   max_iterations: 1000
   step_size: 0.01
-  probability_margin: 0.0001
+  probability_margin: 0.2
   bone_relative_tolerance: 0.01
   bone_absolute_tolerance: 1.0e-06
   target_mode: opposite_prediction
@@ -20,3 +20,141 @@ counterfactual:
     - 10000.0
     minimum_success_rate: 0.95
     maximum_bone_violation_rate: 0.05
+  selection:
+    selected_at_utc: '2026-08-24T20:53:42.517972+00:00'
+    tuning_sample_count: 1620
+    met_configured_requirements: false
+    metrics:
+      attempted_count: 1620
+      success_count: 1259
+      failed_count: 361
+      success_rate: 0.7771604938271605
+      bone_valid_success_count: 1259
+      bone_valid_success_rate: 0.7771604938271605
+      bone_violation_count_among_successes: 0
+      bone_violation_rate_among_successes: 0.0
+      mean_perturbation_l2: 0.4792245280639675
+      median_perturbation_l2: 0.4037662148475647
+      max_perturbation_l2: 1.2603076696395874
+      mean_absolute_probability_change: 0.6761099209096424
+      mean_max_relative_bone_change: 1.1020988225180157e-07
+      max_relative_bone_change: 3.659521079231032e-07
+      mean_relative_bone_change: 5.153400890826071e-08
+      to_handoff_attempts: 705
+      to_handoff_successes: 440
+      to_handoff_success_rate: 0.624113475177305
+      to_not_handoff_attempts: 915
+      to_not_handoff_successes: 819
+      to_not_handoff_success_rate: 0.8950819672131147
+      latency_ms:
+        evaluation_total_ms: 39955965.34157265
+        attempted_sample_count: 1620
+        components:
+          arm_reconstruction:
+            total_ms: 23541897.571933746
+            call_count: 417555
+            sample_count: 1620
+            mean_per_call_ms: 56.38035126374668
+            mean_per_sample_ms: 14532.035538230708
+            median_per_sample_ms: 1531.4183731079102
+            max_per_sample_ms: 67565.63177871704
+          binary_search:
+            total_ms: 657885.1846008301
+            call_count: 1259
+            sample_count: 1259
+            mean_per_call_ms: 522.5458177925576
+            mean_per_sample_ms: 522.5458177925576
+            median_per_sample_ms: 615.3673095703125
+            max_per_sample_ms: 798.5189208984375
+          bone_validation:
+            total_ms: 706.0741456225514
+            call_count: 1620
+            sample_count: 1620
+            mean_per_call_ms: 0.435848238038612
+            mean_per_sample_ms: 0.435848238038612
+            median_per_sample_ms: 0.4574218764901161
+            max_per_sample_ms: 0.7326919585466385
+          classifier_forward:
+            total_ms: 473950.198216252
+            call_count: 419175
+            sample_count: 1620
+            mean_per_call_ms: 1.1306738193266583
+            mean_per_sample_ms: 292.56185075077286
+            median_per_sample_ms: 31.285807877779007
+            max_per_sample_ms: 1330.9434888362885
+          fabrik_solve:
+            total_ms: 22586620.908481598
+            call_count: 835110
+            sample_count: 1620
+            mean_per_call_ms: 27.046282416066862
+            mean_per_sample_ms: 13942.358585482469
+            median_per_sample_ms: 1470.465316772461
+            max_per_sample_ms: 64883.60021972656
+          feature_to_pose_conversion:
+            total_ms: 175.79415440559387
+            call_count: 1620
+            sample_count: 1620
+            mean_per_call_ms: 0.1085149101269098
+            mean_per_sample_ms: 0.1085149101269098
+            median_per_sample_ms: 0.10825041681528091
+            max_per_sample_ms: 0.16875378787517548
+          final_inference:
+            total_ms: 2225.1313269138336
+            call_count: 1620
+            sample_count: 1620
+            mean_per_call_ms: 1.3735378561196503
+            mean_per_sample_ms: 1.3735378561196503
+            median_per_sample_ms: 1.4721280336380005
+            max_per_sample_ms: 2.210207939147949
+          minimal_perturbation:
+            total_ms: 39931556.88043213
+            call_count: 1620
+            sample_count: 1620
+            mean_per_call_ms: 24649.109185451933
+            mean_per_sample_ms: 24649.109185451933
+            median_per_sample_ms: 2175.2950439453125
+            max_per_sample_ms: 110683.7734375
+          optimization_loop:
+            total_ms: 39234442.8551178
+            call_count: 1620
+            sample_count: 1620
+            mean_per_call_ms: 24218.791885875184
+            mean_per_sample_ms: 24218.791885875184
+            median_per_sample_ms: 1659.27685546875
+            max_per_sample_ms: 110604.3515625
+          optimizer_step:
+            total_ms: 14981986.381828308
+            call_count: 401725
+            sample_count: 1620
+            mean_per_call_ms: 37.29413499739451
+            mean_per_sample_ms: 9248.139741869327
+            median_per_sample_ms: 595.7727909088135
+            max_per_sample_ms: 49925.22425079346
+          original_inference:
+            total_ms: 2305.7886073589325
+            call_count: 1620
+            sample_count: 1620
+            mean_per_call_ms: 1.4233263008388473
+            mean_per_sample_ms: 1.4233263008388473
+            median_per_sample_ms: 1.4594720005989075
+            max_per_sample_ms: 3.2763519287109375
+          projection_regeneration:
+            total_ms: 398453.29342487454
+            call_count: 417555
+            sample_count: 1620
+            mean_per_call_ms: 0.9542534358943721
+            mean_per_sample_ms: 245.9588231017744
+            median_per_sample_ms: 25.176975905895233
+            max_per_sample_ms: 1218.3513896465302
+          sample_total:
+            total_ms: 39955808.1487352
+            call_count: 1620
+            sample_count: 1620
+            mean_per_call_ms: 24664.079104157532
+            mean_per_sample_ms: 24664.079104157532
+            median_per_sample_ms: 2180.421510245651
+            max_per_sample_ms: 110727.51556150615
+        timing_method: CUDA events for CUDA tensor regions; synchronized wall-clock
+          timing for CPU/MPS and whole-sample timing.
+        instrumentation_note: Timing instrumentation adds a small amount of overhead,
+          especially because every FABRIK invocation is measured.

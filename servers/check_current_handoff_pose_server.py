@@ -47,6 +47,10 @@ ROBOT_DETECTOR_CLASS_NAMES = [
     "robot dog"
 ]
 
+# Run the expensive visual heading estimator independently of the tracker.
+# 0.10 s corresponds to a maximum requested heading-update rate of 10 Hz.
+ROBOT_HEADING_INTERVAL_SECONDS = 0.10
+
 QUEST_MODEL_TYPES = ("mlp", "tabm")
 QUEST_MODEL_FEATURES_TYPES = (
     "keypoints_projections",
@@ -259,7 +263,8 @@ def format_robot_tracking_result(
         return None
 
     forward_valid = (
-        orientation is not None
+        result.found
+        and orientation is not None
         and orientation.robot_detected
         and orientation.relative_yaw_deg is not None
     )
@@ -317,6 +322,7 @@ def create_app(
     quest_model_features_type: str,
     robot_forward_estimator_path: Optional[str] = None,
     robot_forward_decoder: str = "mean",
+    user_handedness: Optional[str] = "both",
 ) -> FastAPI:
     app = FastAPI()
 
@@ -395,13 +401,18 @@ def create_app(
         max_verification_misses=10,
         replacement_confirmations=2,
         replacement_iou_threshold=0.20,
-        min_detection_score=0.50,
+        min_detection_score=0.6,
     )
 
-    # RobotDetectorTracker and OpenCV CSRT are stateful. Only one request may
-    # update the tracker at a time.
+    # RobotDetectorTracker / OSTrack is stateful. Only one request may update
+    # the tracker at a time. Heading estimation has a separate lock so an
+    # expensive Orient Anything inference does not keep the tracker locked.
     app.state.robot_tracker = robot_tracker
     app.state.robot_tracking_lock = threading.Lock()
+    app.state.robot_heading_lock = threading.Lock()
+    app.state.robot_heading_interval_seconds = ROBOT_HEADING_INTERVAL_SECONDS
+    app.state.last_robot_heading_started_monotonic = float("-inf")
+
     app.state.latest_robot_tracking_result = None
     app.state.latest_robot_orientation_estimate = None
     app.state.latest_robot_orientation_error = None
@@ -421,29 +432,45 @@ def create_app(
         """
         Decode and process one image.
 
-        This function runs in FastAPI/Starlette's thread pool so the tracker,
-        Orient Anything inference, and OpenCV work do not block the asyncio
-        event loop.
-        """
-        tracking_lock: threading.Lock = (
-            app.state.robot_tracking_lock
-        )
+        Tracking and heading estimation intentionally run under different locks:
 
-        # Do not let requests form an old-frame backlog. If one frame is
-        # already being processed, this request immediately receives the
-        # latest completed result.
+        1. The stateful tracker processes the newest accepted frame and publishes
+           its result while holding robot_tracking_lock.
+        2. robot_tracking_lock is released immediately after that tracker update.
+        3. Orient Anything runs only when its independent interval is due and its
+           own non-blocking lock is available.
+        4. Frames between heading updates reuse the latest valid heading.
+
+        This lets newer Quest frames continue updating robot position/bbox while
+        an expensive heading estimate is being calculated.
+        """
+        tracking_lock: threading.Lock = app.state.robot_tracking_lock
+        heading_lock: threading.Lock = app.state.robot_heading_lock
+
+        # Do not let requests form an old-frame backlog. If the stateful tracker
+        # is already processing a frame, return the newest completed result.
         if not tracking_lock.acquire(blocking=False):
+            latest_result = app.state.latest_robot_tracking_result
+            latest_orientation = app.state.latest_robot_orientation_estimate
+            latest_orientation_error = app.state.latest_robot_orientation_error
+
             return {
                 "accepted": False,
                 "reason": "tracker_busy",
                 "submitted_frame_id": frame_id,
                 "result": format_robot_tracking_result(
-                    app.state.latest_robot_tracking_result,
-                    app.state.latest_robot_orientation_estimate,
-                    app.state.latest_robot_orientation_error,
+                    latest_result,
+                    latest_orientation,
+                    latest_orientation_error,
                 ),
             }
 
+        # ------------------------------------------------------------------
+        # Fast/stateful tracking section.
+        #
+        # Keep this lock only as long as needed to decode the accepted frame,
+        # update the tracker, and publish the new tracking state.
+        # ------------------------------------------------------------------
         try:
             # frame_id must increase for a given Quest stream.
             if frame_id <= app.state.last_robot_frame_id:
@@ -480,8 +507,7 @@ def create_app(
                 )
 
             # Use a client timestamp only when the Quest and server clocks
-            # are synchronized. Otherwise, omit it and server receive time
-            # is used.
+            # are synchronized. Otherwise, server receive time is used.
             frame_timestamp = (
                 float(capture_timestamp_unix)
                 if capture_timestamp_unix is not None
@@ -494,116 +520,160 @@ def create_app(
                 frame_timestamp=frame_timestamp,
             )
 
-            # --------------------------------------------------------------
-            # Fine-tuned Orient Anything forward estimation
-            # --------------------------------------------------------------
-            #
-            # Reuse the tracker's current robot box. This avoids a second
-            # YOLO pass. The OA wrapper still applies the exact checkpoint-
-            # saved crop padding/JPEG round-trip/DINO preprocessing.
-            #
-            # Relative yaw requires only the Quest RGB frame + robot box.
-            # If Quest camera rotation + intrinsics are also supplied, the
-            # wrapper additionally back-projects the box center and returns a
-            # Quest-world robot_forward_world_unit vector. No robot-side pose
-            # or ground-truth forward vector is used.
-            orientation_estimate: Optional[OrientationEstimate] = None
-            orientation_error: Optional[str] = None
-
-            if result.found and result.bbox_xyxy is not None:
-                frame_rgb = cv2.cvtColor(
-                    frame_bgr,
-                    cv2.COLOR_BGR2RGB,
-                )
-
-                predict_kwargs: dict[str, Any] = {
-                    "robot_box_xyxy": result.bbox_xyxy,
-                }
-
-                if (
-                    camera_rotation is not None
-                    and camera_intrinsics is not None
-                ):
-                    predict_kwargs["camera_rotation_world_xyzw"] = (
-                        camera_rotation["x"],
-                        camera_rotation["y"],
-                        camera_rotation["z"],
-                        camera_rotation["w"],
-                    )
-                    predict_kwargs["camera_intrinsics"] = camera_intrinsics
-
-                try:
-                    orientation_estimate = robot_forward_estimator.predict(
-                        frame_rgb,
-                        **predict_kwargs,
-                    )
-                except Exception as exc:
-                    # Tracking should remain usable even if visual forward
-                    # estimation fails on one frame.
-                    orientation_error = (
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    print(
-                        "Robot forward estimation failed: "
-                        f"{orientation_error}",
-                        flush=True,
-                    )
-
-            # result = app.state.robot_tracker.process_frame_detector_only(
-            #         frame_bgr=frame_bgr,
-            #         frame_id=frame_id,
-            #         frame_timestamp=frame_timestamp,
-            #     )
-
-            # annotated_frame = draw_result(frame_bgr, result)
-
-            # output_path = (
-            #     Path(__file__).resolve().parent
-            #     / "latest_robot_detection.jpg"
-            # )
-
-            # saved = cv2.imwrite(
-            #     str(output_path),
-            #     annotated_frame,
-            # )
-
-            # print(
-            #     f"Annotated frame save: success={saved}, "
-            #     f"exists={output_path.exists()}, "
-            #     f"path={output_path}",
-            #     flush=True,
-            # )
-
-
-
+            # Publish the tracking result BEFORE any heading inference. New
+            # requests can use this position/bbox as soon as the lock releases.
             app.state.last_robot_frame_id = frame_id
             app.state.latest_robot_tracking_result = result
-            app.state.latest_robot_orientation_estimate = orientation_estimate
-            app.state.latest_robot_orientation_error = orientation_error
             app.state.latest_robot_camera_position = camera_position
             app.state.latest_robot_camera_rotation = camera_rotation
             app.state.latest_robot_camera_intrinsics = camera_intrinsics
 
-            res = {
-                "accepted": True,
-                "reason": "processed",
-                "submitted_frame_id": frame_id,
-                "image_width": int(frame_bgr.shape[1]),
-                "image_height": int(frame_bgr.shape[0]),
-                "camera_pose_received": camera_position is not None,
-                "camera_intrinsics_received": camera_intrinsics is not None,
-                "result": format_robot_tracking_result(
-                    result,
-                    orientation_estimate,
-                    orientation_error,
-                ),
-            }
-            print(res)
-
-            return res
-
         finally:
             tracking_lock.release()
+
+        # ------------------------------------------------------------------
+        # Slower visual heading estimation.
+        #
+        # This section is deliberately outside robot_tracking_lock. It is also
+        # throttled and guarded by its own non-blocking lock so there can be at
+        # most one Orient Anything inference in flight.
+        # ------------------------------------------------------------------
+        orientation_estimate: Optional[OrientationEstimate] = (
+            app.state.latest_robot_orientation_estimate
+        )
+        orientation_error: Optional[str] = (
+            app.state.latest_robot_orientation_error
+        )
+
+        if result.found and result.bbox_xyxy is not None:
+            now_monotonic = time.monotonic()
+            heading_due = (
+                now_monotonic
+                - app.state.last_robot_heading_started_monotonic
+                >= app.state.robot_heading_interval_seconds
+            )
+
+            if heading_due and heading_lock.acquire(blocking=False):
+                try:
+                    # Recheck after acquiring the lock in case another request
+                    # completed a heading estimate between the first check and
+                    # this acquisition.
+                    now_monotonic = time.monotonic()
+                    heading_due = (
+                        now_monotonic
+                        - app.state.last_robot_heading_started_monotonic
+                        >= app.state.robot_heading_interval_seconds
+                    )
+
+                    if heading_due:
+                        # Record the start time before inference. The heading
+                        # lock itself prevents overlapping OA calls; this
+                        # timestamp additionally caps requested starts at 10 Hz.
+                        app.state.last_robot_heading_started_monotonic = (
+                            now_monotonic
+                        )
+
+                        frame_rgb = cv2.cvtColor(
+                            frame_bgr,
+                            cv2.COLOR_BGR2RGB,
+                        )
+
+                        predict_kwargs: dict[str, Any] = {
+                            "robot_box_xyxy": result.bbox_xyxy,
+                        }
+
+                        if (
+                            camera_rotation is not None
+                            and camera_intrinsics is not None
+                        ):
+                            predict_kwargs[
+                                "camera_rotation_world_xyzw"
+                            ] = (
+                                camera_rotation["x"],
+                                camera_rotation["y"],
+                                camera_rotation["z"],
+                                camera_rotation["w"],
+                            )
+                            predict_kwargs[
+                                "camera_intrinsics"
+                            ] = camera_intrinsics
+
+                        try:
+                            new_orientation_estimate = (
+                                robot_forward_estimator.predict(
+                                    frame_rgb,
+                                    **predict_kwargs,
+                                )
+                            )
+
+                            orientation_estimate = (
+                                new_orientation_estimate
+                            )
+                            orientation_error = None
+
+                            # Only publish the completed heading if the newest
+                            # tracker state still has the robot. If tracking was
+                            # lost while OA was running, do not resurrect a stale
+                            # valid heading in shared state.
+                            latest_tracking_result = (
+                                app.state.latest_robot_tracking_result
+                            )
+                            if (
+                                latest_tracking_result is not None
+                                and latest_tracking_result.found
+                            ):
+                                app.state.latest_robot_orientation_estimate = (
+                                    new_orientation_estimate
+                                )
+                                app.state.latest_robot_orientation_error = None
+
+                        except Exception as exc:
+                            # Keep the previous valid orientation estimate if
+                            # one OA update fails. The error remains available
+                            # diagnostically, while tracking can continue.
+                            orientation_error = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            app.state.latest_robot_orientation_error = (
+                                orientation_error
+                            )
+                            orientation_estimate = (
+                                app.state.latest_robot_orientation_estimate
+                            )
+
+                            print(
+                                "Robot forward estimation failed: "
+                                f"{orientation_error}",
+                                flush=True,
+                            )
+
+                finally:
+                    heading_lock.release()
+
+        else:
+            # A cached heading may be retained internally for the next tracked
+            # frame, but it must not be reported as valid while the current
+            # tracker result says the robot is absent.
+            orientation_estimate = None
+
+        res = {
+            "accepted": True,
+            "reason": "processed",
+            "submitted_frame_id": frame_id,
+            "image_width": int(frame_bgr.shape[1]),
+            "image_height": int(frame_bgr.shape[0]),
+            "camera_pose_received": camera_position is not None,
+            "camera_intrinsics_received": camera_intrinsics is not None,
+            "result": format_robot_tracking_result(
+                result,
+                orientation_estimate,
+                orientation_error,
+            ),
+        }
+        print(res)
+
+        return res
+
 
     configure_posefix_for_hand_guidance()
 
@@ -642,6 +712,14 @@ def create_app(
                 f"Invalid quest_model_features_type: "
                 f"{quest_model_features_type}"
             )
+
+        probability_margin = 0.3
+
+        target_probability = min(
+            0.5 + probability_margin,
+            1.0,
+        )
+
         
         original_prediction = model.predict_features(
             quest_features
@@ -650,7 +728,7 @@ def create_app(
 
         target_intent = True
 
-        if original_prediction.is_handoff == target_intent:
+        if original_prediction.probability >= target_probability:
             print("NO PERTURBATIONS NEEDED")
             return {
                 "perturbations_needed": False,
@@ -662,15 +740,22 @@ def create_app(
         perturbed_result = find_minimal_perturbation(
             model=model,
             joint_feat_vec=quest_features,
-            target_intent=True,
+            target_intent=target_intent,
             features_type=quest_model_features_type,
             original_probability=original_prediction.probability,
             classification_weight=1000.0,
             reachability_weight=1000.0,
-            probability_margin=0.05,
-            max_iterations=100,
+            cross_body_weight= 1000.0,
+            cross_body_margin=0.1,
+            require_forward_extension_for_success=True,
+            forward_extension_weight=1000.0,
+            forward_extension_min=0.2,
+            probability_margin=probability_margin,
+            robustness_radius = 0.015,
+            robustness_neighbor_margin = 0.15, 
+            max_iterations=50,
             bin_search_iterations=5,
-            object_arm="right"
+            object_arm=user_handedness
         )
         perturbation_success = perturbed_result["reached_target"]
         perturbed_features = perturbed_result["features"]
@@ -920,16 +1005,25 @@ def create_app(
         tracking_lock: threading.Lock = (
             app.state.robot_tracking_lock
         )
+        heading_lock: threading.Lock = (
+            app.state.robot_heading_lock
+        )
 
+        # process_robot_frame never holds these two locks simultaneously:
+        # tracking is released before heading is acquired. Acquiring both here
+        # prevents an in-flight heading estimate from writing stale state after
+        # the reset completes.
         with tracking_lock:
-            app.state.robot_tracker.reset()
-            app.state.latest_robot_tracking_result = None
-            app.state.latest_robot_orientation_estimate = None
-            app.state.latest_robot_orientation_error = None
-            app.state.last_robot_frame_id = -1
-            app.state.latest_robot_camera_position = None
-            app.state.latest_robot_camera_rotation = None
-            app.state.latest_robot_camera_intrinsics = None
+            with heading_lock:
+                app.state.robot_tracker.reset()
+                app.state.latest_robot_tracking_result = None
+                app.state.latest_robot_orientation_estimate = None
+                app.state.latest_robot_orientation_error = None
+                app.state.last_robot_frame_id = -1
+                app.state.last_robot_heading_started_monotonic = float("-inf")
+                app.state.latest_robot_camera_position = None
+                app.state.latest_robot_camera_rotation = None
+                app.state.latest_robot_camera_intrinsics = None
 
         return {
             "success": True,
@@ -975,6 +1069,15 @@ def main() -> None:
             "and --quest-model-features-type."
         ),
     )
+
+    parser.add_argument(
+            "--user-handedness",
+            type=str,
+            default=None,
+            help=(
+                "Optional explicit user handedness for counterfactual optimization. If supplied, this will make optimization run for only one arm, assuming this is the most likely arm for an object to be held in. Defaults to both."
+            ),
+        )
 
     parser.add_argument(
         "--robot-obj-det-weights-path",
@@ -1045,6 +1148,7 @@ def main() -> None:
         args.quest_model_features_type,
         args.robot_forward_estimator_path,
         args.robot_forward_decoder,
+        user_handedness=args.user_handedness
     )
 
     uvicorn.run(

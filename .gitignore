@@ -17,6 +17,7 @@ recordings/
 runs/
 test_data/
 test_videos/
+study_data/
 
 # Model files
 *.pt
@@ -59,12 +60,14 @@ wandb/
 *.pt
 *.ckpt
 *.onnx
+models--facebook--dinov2-small/
 
 # Project-specific artifacts
 model_training_and_implementation/handoff_dataset.zip
 model_training_and_implementation/test_data/
 model_training_and_implementation/result.jpg
 *.egg-info/
+mindreadar_study_server.py
 
 # External repositories
 Orient-Anything/

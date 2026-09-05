@@ -1,0 +1,31 @@
+{
+  "split": {
+    "strategy": "all available data",
+    "train_session_ids": [
+      "quest_robot_forward_20260814T181318899Z",
+      "quest_robot_forward_20260814T182045301Z",
+      "quest_robot_forward_20260814T191833108Z",
+      "quest_robot_forward_20260814T192232594Z",
+      "quest_robot_forward_20260814T203404629Z",
+      "quest_robot_forward_20260814T215603516Z"
+    ]
+  },
+  "counts": {
+    "train": 9820
+  },
+  "final_train": {
+    "n": 9820,
+    "mean_error_deg": 0.6424420911690709,
+    "median_error_deg": 0.5120764659179429,
+    "p90_error_deg": 1.3426302803196366,
+    "p95_error_deg": 1.687649161212066,
+    "max_error_deg": 4.924249589531314,
+    "within_5_deg": 1.0,
+    "within_10_deg": 1.0,
+    "within_15_deg": 1.0,
+    "within_30_deg": 1.0
+  },
+  "best_epoch": 98,
+  "best_train_mean_error_deg": 0.6424420911690709,
+  "checkpoint_path": "/home/christianfronk/HandoffIntent/UnitreeGo2HandoffIntentDetector/robot_fov_estimation/outputs/resnet18_forward_estimation_weights/best_go2_resnet18_forward_estimation.pt"
+}
