@@ -83,7 +83,7 @@ class RandomNav2Patrol(Node):
         # to a variable arrival orientation, dwell, then continue.
         self.declare_parameter('stop_duration_sec', 5.0)
         self.declare_parameter('pickup_turn_min_deg', 30.0)
-        self.declare_parameter('pickup_turn_max_deg', 140.0)
+        self.declare_parameter('pickup_turn_max_deg', 110.0)
 
         self.num_points = int(
             self.get_parameter('num_points').value
