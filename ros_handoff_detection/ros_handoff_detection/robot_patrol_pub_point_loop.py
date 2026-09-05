@@ -182,8 +182,10 @@ class RandomNav2Patrol(Node):
         self.manual_pause_requested = False
         self.pause_cancel_requested = False
 
-        # If an auxiliary orientation goal is canceled by a pause, retry it
-        # when every external pause source is released.
+        # If initial positioning is canceled by a pause, retry it when the
+        # pause is released. Interrupted in-place turn goals are deliberately
+        # NOT retried; retrying a same-position orientation goal immediately
+        # after Nav2 cancellation can leave Nav2 in its Spin recovery behavior.
         self.retry_goal_kind_after_pause: Optional[str] = None
 
         # Candidate stops selected for the current traversal. Each tuple is
@@ -492,16 +494,9 @@ class RandomNav2Patrol(Node):
             self.send_current_goal()
             return
 
-        if self.retry_goal_kind_after_pause == 'random_orientation':
-            self.retry_goal_kind_after_pause = None
-            self.send_random_orientation_goal()
-            return
-
-        if self.retry_goal_kind_after_pause == 'endpoint_turn':
-            self.retry_goal_kind_after_pause = None
-            self.send_endpoint_turn_goal()
-            return
-
+        # Only initial positioning is retried after a pause. Random-stop and
+        # endpoint in-place turns are converted into travel state when their
+        # cancellation result is received (see goal_result_callback).
         if self.retry_goal_kind_after_pause == 'initial_position':
             self.retry_goal_kind_after_pause = None
             self.send_initial_position_goal()
@@ -1125,13 +1120,47 @@ class RandomNav2Patrol(Node):
                 f'{goal_kind} goal paused. Patrol state will be preserved.'
             )
 
-            if goal_kind in (
-                'random_orientation',
-                'endpoint_turn',
-                'initial_position',
-            ):
-                self.retry_goal_kind_after_pause = goal_kind
+            if goal_kind == 'random_orientation':
+                # Do not re-issue an interrupted same-position turn after a
+                # pause. Treat this random stop as serviced and continue toward
+                # the same endpoint once the pause releases. This avoids Nav2
+                # immediately re-entering its Spin recovery behavior.
+                completed_stop = self.pending_stop_name
+                self.pending_random_yaw = None
+                self.pending_random_angle_deg = None
+                self.pending_stop_name = None
+                self.pending_stop_waypoint = None
+                self.current_leg_stop_index += 1
+                self.retry_goal_kind_after_pause = None
+                self.get_logger().info(
+                    f'{completed_stop or "Random stop"} turn was interrupted by '
+                    'pause; skipping the remainder of that turn.'
+                )
+
+            elif goal_kind == 'endpoint_turn':
+                # The robot is already physically at the endpoint. Do not retry
+                # the pure orientation goal after cancellation; advance the
+                # patrol state to the return leg and let the next travel goal
+                # perform whatever heading correction is necessary.
+                reached_index = self.target_index
+                opposite_index = 1 - reached_index
+                self.target_index = opposite_index
+                self.leg_number += 1
+                self.prepare_stops_for_current_leg()
+                self.retry_goal_kind_after_pause = None
+                self.get_logger().info(
+                    f'Endpoint P{reached_index + 1} turn was interrupted by '
+                    f'pause; continuing toward P{opposite_index + 1} on resume.'
+                )
+
+            elif goal_kind == 'initial_position':
+                # Initial positioning establishes the patrol's starting state,
+                # so this one must be retried.
+                self.retry_goal_kind_after_pause = 'initial_position'
+
             else:
+                # Travel/candidate-travel goals are safely reconstructed by
+                # send_current_goal() from the preserved patrol state.
                 self.retry_goal_kind_after_pause = None
 
             # If all pause sources were already released while cancellation
