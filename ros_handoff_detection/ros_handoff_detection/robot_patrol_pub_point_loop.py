@@ -27,22 +27,22 @@ class Waypoint:
 
 class RandomNav2Patrol(Node):
     """
-    Two-waypoint Nav2 patrol with one pickup stop at the route midpoint.
+    Two-waypoint Nav2 patrol with random in-place orientation stops.
 
     Patrol behavior:
       1. Exactly two clicked waypoints are collected: P1 and P2.
       2. The robot first moves to P1 and faces P2.
       3. It then shuttles continuously P1 <-> P2.
-      4. On every traversal, the robot always stops at the exact midpoint of
-         the P1-P2 segment.
-      5. At the midpoint it rotates in place by a random configured angle,
-         dwells for stop_duration_sec, then resumes toward the same endpoint.
-      6. P1 -> P2 midpoint stops turn RIGHT relative to the route heading.
-      7. P2 -> P1 midpoint stops turn LEFT relative to the route heading.
-      8. The random turn magnitude defaults to 30..140 degrees.
-      9. pickup_state_topic is True only after the midpoint orientation has
-         been reached and remains True until patrol travel actually resumes.
-     10. On reaching an endpoint, the robot explicitly turns in place to face
+      4. Two candidate stopping positions are placed near the middle of the
+         P1-P2 segment. On each traversal, each candidate independently has a
+         configurable chance of being used. Unselected candidates are ignored.
+      5. At a selected candidate, the robot stops, rotates in place, dwells for
+         stop_duration_sec, then resumes toward the same endpoint.
+      6. P1 -> P2 stops only turn RIGHT by 0..180 degrees relative to the
+         P1->P2 route heading.
+      7. P2 -> P1 stops only turn LEFT by 0..180 degrees relative to the
+         P2->P1 route heading.
+      8. On reaching an endpoint, the robot explicitly turns in place to face
          the opposite endpoint before beginning the return traversal.
 
     ROS planar convention assumed here:
@@ -65,10 +65,6 @@ class RandomNav2Patrol(Node):
             'handoff_pause_topic',
             '/handoff_pause_patrol',
         )
-        self.declare_parameter(
-            'pickup_state_topic',
-            '/pickup_state',
-        )
 
         # If true, continue after a Nav2 failure. For a failed travel goal,
         # the failed endpoint is skipped. For an auxiliary turn goal, patrol
@@ -76,14 +72,17 @@ class RandomNav2Patrol(Node):
         self.declare_parameter('continue_on_failure', True)
 
         # -1 = nondeterministic randomness. Any non-negative value makes the
-        # midpoint pickup angles reproducible.
+        # candidate-stop choices and stop angles reproducible.
         self.declare_parameter('random_seed', -1)
 
-        # Pickup behavior: stop at the exact route midpoint on every leg, turn
-        # to a variable arrival orientation, dwell, then continue.
+        # Random stop behavior. The two stop fractions are measured from P1
+        # toward P2, so 0.40 and 0.60 place them on either side of path center.
+        # On every P1<->P2 traversal, each stop is independently selected with
+        # candidate_stop_probability.
         self.declare_parameter('stop_duration_sec', 5.0)
-        self.declare_parameter('pickup_turn_min_deg', 30.0)
-        self.declare_parameter('pickup_turn_max_deg', 140.0)
+        self.declare_parameter('candidate_stop_1_fraction', 0.40)
+        self.declare_parameter('candidate_stop_2_fraction', 0.60)
+        self.declare_parameter('candidate_stop_probability', 0.50)
 
         self.num_points = int(
             self.get_parameter('num_points').value
@@ -106,10 +105,6 @@ class RandomNav2Patrol(Node):
             self.get_parameter('handoff_pause_topic').value
         )
 
-        self.pickup_state_topic = str(
-            self.get_parameter('pickup_state_topic').value
-        )
-
         self.continue_on_failure = bool(
             self.get_parameter('continue_on_failure').value
         )
@@ -118,24 +113,31 @@ class RandomNav2Patrol(Node):
             self.get_parameter('stop_duration_sec').value
         )
 
-        self.pickup_turn_min_deg = float(
-            self.get_parameter('pickup_turn_min_deg').value
+        self.candidate_stop_1_fraction = float(
+            self.get_parameter('candidate_stop_1_fraction').value
         )
-        self.pickup_turn_max_deg = float(
-            self.get_parameter('pickup_turn_max_deg').value
+        self.candidate_stop_2_fraction = float(
+            self.get_parameter('candidate_stop_2_fraction').value
+        )
+        self.candidate_stop_probability = float(
+            self.get_parameter('candidate_stop_probability').value
         )
 
         if self.stop_duration_sec < 0.0:
             raise ValueError('stop_duration_sec must be >= 0.')
 
         if not (
-            0.0 <= self.pickup_turn_min_deg
-            <= self.pickup_turn_max_deg
-            <= 180.0
+            0.0 < self.candidate_stop_1_fraction
+            < self.candidate_stop_2_fraction < 1.0
         ):
             raise ValueError(
-                'pickup turn limits must satisfy '
-                '0 <= min <= max <= 180 degrees.'
+                'candidate stop fractions must satisfy '
+                '0 < stop_1 < stop_2 < 1.'
+            )
+
+        if not 0.0 <= self.candidate_stop_probability <= 1.0:
+            raise ValueError(
+                'candidate_stop_probability must be between 0 and 1.'
             )
 
         random_seed = int(
@@ -184,16 +186,12 @@ class RandomNav2Patrol(Node):
         # when every external pause source is released.
         self.retry_goal_kind_after_pause: Optional[str] = None
 
-        # Every leg contains exactly one pickup stop at the route midpoint.
-        # The existing stop-list state is retained so pause/failure behavior
-        # remains minimally changed.
+        # Candidate stops selected for the current traversal. Each tuple is
+        # (name, waypoint), ordered in the actual direction of travel.
         self.current_leg_stops = []
         self.current_leg_stop_index = 0
 
-        # True only while the robot is stopped in the midpoint pickup pose.
-        self.pickup_state_active = False
-
-        # Random orientation selected for the midpoint pickup stop.
+        # Random orientation selected for the current candidate stop.
         self.pending_random_yaw: Optional[float] = None
         self.pending_random_angle_deg: Optional[float] = None
         self.pending_stop_name: Optional[str] = None
@@ -232,17 +230,6 @@ class RandomNav2Patrol(Node):
             self.handoff_pause_callback,
             pause_qos,
         )
-
-        # Publish the pickup state with transient-local durability so the
-        # detector always receives the latest state, even if it starts later.
-        pickup_qos = QoSProfile(depth=1)
-        pickup_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        self.pickup_state_pub = self.create_publisher(
-            Bool,
-            self.pickup_state_topic,
-            pickup_qos,
-        )
-        self._publish_pickup_state(False)
 
         # ------------------------------------------------------------
         # Nav2 action client / timers
@@ -316,19 +303,6 @@ class RandomNav2Patrol(Node):
         if self.target_index == 1:
             return self.forward_route_yaw()
         return self.reverse_route_yaw()
-
-    def _publish_pickup_state(self, active: bool) -> None:
-        """Publish whether the robot is currently stopped in pickup state."""
-        active = bool(active)
-        self.pickup_state_active = active
-
-        msg = Bool()
-        msg.data = active
-        self.pickup_state_pub.publish(msg)
-
-        self.get_logger().info(
-            f'Pickup state: {"ACTIVE" if active else "INACTIVE"}.'
-        )
 
     # ==================================================================
     # Manual keyboard pause / resume
@@ -515,7 +489,6 @@ class RandomNav2Patrol(Node):
 
         if self.dwell_complete_waiting_for_resume:
             self.dwell_complete_waiting_for_resume = False
-            self._publish_pickup_state(False)
             self.send_current_goal()
             return
 
@@ -640,63 +613,86 @@ class RandomNav2Patrol(Node):
         self.send_initial_position_goal()
 
     # ==================================================================
-    # Midpoint pickup behavior
+    # Candidate stop selection / behavior
     # ==================================================================
 
-    def midpoint_pickup_waypoint(self) -> Waypoint:
-        """Return the exact midpoint of the P1-P2 patrol segment."""
+    def candidate_stop_waypoints(self):
+        """Return the two fixed candidate stops measured from P1 toward P2."""
         p1 = self.points[0]
         p2 = self.points[1]
-        return Waypoint(
-            x=0.5 * (p1.x + p2.x),
-            y=0.5 * (p1.y + p2.y),
-            frame_id=p1.frame_id,
-        )
+
+        def interpolate(fraction: float) -> Waypoint:
+            return Waypoint(
+                x=p1.x + fraction * (p2.x - p1.x),
+                y=p1.y + fraction * (p2.y - p1.y),
+                frame_id=p1.frame_id,
+            )
+
+        return [
+            ('S1', interpolate(self.candidate_stop_1_fraction)),
+            ('S2', interpolate(self.candidate_stop_2_fraction)),
+        ]
 
     def prepare_stops_for_current_leg(self) -> None:
-        """Configure the single mandatory midpoint pickup stop for this leg."""
-        self.current_leg_stops = [
-            ('PICKUP_CENTER', self.midpoint_pickup_waypoint())
-        ]
+        """Randomly choose which of the two candidate stops this leg uses."""
+        candidates = self.candidate_stop_waypoints()
+
+        # When traveling P2 -> P1, visit the same physical stops in reverse
+        # spatial order so the robot always progresses monotonically along the
+        # segment.
+        if self.target_index == 0:
+            candidates = list(reversed(candidates))
+
+        selected = []
+        decisions = []
+        for name, waypoint in candidates:
+            use_stop = (
+                self.random_generator.random()
+                < self.candidate_stop_probability
+            )
+            decisions.append(f'{name}={"STOP" if use_stop else "SKIP"}')
+            if use_stop:
+                selected.append((name, waypoint))
+
+        self.current_leg_stops = selected
         self.current_leg_stop_index = 0
 
         direction = 'P1 -> P2' if self.target_index == 1 else 'P2 -> P1'
         self.get_logger().info(
-            f'Leg {self.leg_number} ({direction}): midpoint pickup stop enabled.'
+            f'Leg {self.leg_number} candidate stops ({direction}): '
+            + ', '.join(decisions)
         )
 
     def choose_random_stop_orientation(self) -> None:
-        """Choose the configured direction-specific random pickup orientation."""
-        angle_deg = self.random_generator.uniform(
-            self.pickup_turn_min_deg,
-            self.pickup_turn_max_deg,
-        )
+        """Choose a legal route-relative orientation for the current stop."""
+        angle_deg = self.random_generator.uniform(0.0, 180.0)
         angle_rad = math.radians(angle_deg)
         base_yaw = self.current_leg_yaw()
 
         if self.target_index == 1:
-            # P1 -> P2: turn RIGHT. In standard ROS yaw, right is negative.
+            # P1 -> P2: RIGHT only. In standard ROS yaw, right is negative.
             random_yaw = self.normalize_angle(base_yaw - angle_rad)
             direction_text = 'RIGHT'
         else:
-            # P2 -> P1: turn LEFT. Positive yaw is counter-clockwise/left.
+            # P2 -> P1: LEFT only. Positive yaw is counter-clockwise/left.
             random_yaw = self.normalize_angle(base_yaw + angle_rad)
             direction_text = 'LEFT'
 
         self.pending_random_yaw = random_yaw
         self.pending_random_angle_deg = angle_deg
 
+        stop_name = self.pending_stop_name or '?'
         self.get_logger().info(
-            f'Midpoint pickup: selected {direction_text} turn of '
+            f'{stop_name}: selected {direction_text} turn of '
             f'{angle_deg:.1f} deg relative to route heading.'
         )
 
     def begin_random_stop_dwell(self) -> None:
-        """Enter pickup state and hold the randomized midpoint orientation."""
-        self._publish_pickup_state(True)
+        """Hold the selected orientation for stop_duration_sec."""
 
         self.get_logger().info(
-            f'Holding pickup orientation for {self.stop_duration_sec:.2f} s.'
+            f'Holding random orientation for '
+            f'{self.stop_duration_sec:.2f} s.'
         )
 
         if self.stop_duration_sec <= 0.0:
@@ -722,20 +718,18 @@ class RandomNav2Patrol(Node):
         self.pending_stop_name = None
         self.pending_stop_waypoint = None
 
-        # The midpoint stop is complete for this traversal.
+        # The selected candidate has now been fully serviced. Advance to the
+        # next selected candidate (if any), otherwise the endpoint.
         self.current_leg_stop_index += 1
 
         self.get_logger().info(
-            f'{completed_stop or "Midpoint pickup"} dwell complete.'
+            f'{completed_stop or "Candidate stop"} dwell complete.'
         )
 
-        # If a handoff/manual pause is active, remain in pickup state until the
-        # robot is actually allowed to resume moving.
         if self._patrol_paused():
             self.dwell_complete_waiting_for_resume = True
             return
 
-        self._publish_pickup_state(False)
         self.send_current_goal()
 
     # ==================================================================
@@ -815,7 +809,7 @@ class RandomNav2Patrol(Node):
         )
 
     def send_current_goal(self) -> None:
-        """Send/resend the midpoint pickup stop or current endpoint goal."""
+        """Send/resend the next selected stop or current endpoint goal."""
 
         if self._patrol_paused():
             return
@@ -827,7 +821,7 @@ class RandomNav2Patrol(Node):
             self.send_initial_position_goal()
             return
 
-        # Visit the mandatory midpoint pickup stop once per traversal.
+        # Visit only the candidate stops selected for this traversal.
         if self.current_leg_stop_index < len(self.current_leg_stops):
             stop_name, stop = self.current_leg_stops[
                 self.current_leg_stop_index
@@ -844,7 +838,7 @@ class RandomNav2Patrol(Node):
             self.send_goal(
                 goal,
                 'candidate_travel',
-                f'Heading to midpoint pickup {stop_name} '
+                f'Heading to selected candidate {stop_name} '
                 f'({stop.x:.3f}, {stop.y:.3f}) on leg '
                 f'{self.leg_number}.',
             )
@@ -913,7 +907,7 @@ class RandomNav2Patrol(Node):
         self.send_goal(
             goal,
             'random_orientation',
-            f'Rotating in place at {self.pending_stop_name or "midpoint pickup"} '
+            f'Rotating in place at {self.pending_stop_name or "candidate stop"} '
             f'({angle_text} deg from route heading).',
         )
 
@@ -1072,8 +1066,8 @@ class RandomNav2Patrol(Node):
                 self.choose_random_stop_orientation()
 
                 self.get_logger().info(
-                    f'Reached midpoint pickup {stop_name}; '
-                    'starting in-place randomized arrival orientation.'
+                    f'Reached selected candidate {stop_name}; '
+                    'starting in-place random orientation.'
                 )
                 self.send_random_orientation_goal()
                 return
@@ -1109,7 +1103,7 @@ class RandomNav2Patrol(Node):
 
             if goal_kind == 'random_orientation':
                 self.get_logger().info(
-                    'Midpoint pickup orientation reached.'
+                    'Random stop orientation reached.'
                 )
                 self.begin_random_stop_dwell()
                 return
@@ -1180,10 +1174,9 @@ class RandomNav2Patrol(Node):
         # Auxiliary turn failures should not cause an endpoint to be skipped.
         if goal_kind == 'random_orientation':
             self.get_logger().warning(
-                'Pickup orientation goal failed; leaving pickup inactive and '
+                'Random orientation goal failed; skipping this stop and '
                 'resuming travel toward the same endpoint.'
             )
-            self._publish_pickup_state(False)
             self.pending_random_yaw = None
             self.pending_random_angle_deg = None
             self.pending_stop_name = None
@@ -1227,8 +1220,8 @@ class RandomNav2Patrol(Node):
                 ][0]
 
             self.get_logger().warning(
-                f'Midpoint pickup {stop_name} travel failed; skipping this '
-                'pickup opportunity and continuing toward the same endpoint.'
+                f'Candidate {stop_name} travel failed; skipping this '
+                'candidate and continuing toward the same endpoint.'
             )
             self.current_leg_stop_index += 1
             self.send_current_goal()
@@ -1261,12 +1254,6 @@ class RandomNav2Patrol(Node):
 
     def destroy_node(self):
         """Restore terminal state and stop timers before shutdown."""
-
-        if hasattr(self, 'pickup_state_pub'):
-            try:
-                self._publish_pickup_state(False)
-            except Exception:
-                pass
 
         if self.keyboard_timer is not None:
             try:
