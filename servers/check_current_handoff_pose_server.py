@@ -683,6 +683,8 @@ def create_app(
     @app.post("/quest_joints")
     def receive_quest_joints(packet: QuestJointsPacket):
         print ("Received packet")
+        for i in range(0,100):
+            print(" ")
         if hasattr(packet, "model_dump"):
             payload = packet.model_dump()
         else:
