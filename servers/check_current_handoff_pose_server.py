@@ -755,7 +755,7 @@ def create_app(
             probability_margin=probability_margin,
             robustness_radius = 0.015,
             robustness_neighbor_margin = 0.25, #0.15
-            max_iterations=75,
+            max_iterations=100,
             bin_search_iterations=5,
             object_arm=user_handedness
         )
