@@ -204,6 +204,11 @@ class RandomNav2Patrol(Node):
         self.dwell_timer = None
         self.dwell_complete_waiting_for_resume = False
 
+        # True after the detector requests a handoff pause during the current
+        # midpoint pickup. When that handoff pause is later released, the
+        # remaining pickup dwell is ended immediately so patrol can continue.
+        self.handoff_detected_current_pickup = False
+
         # Terminal keyboard handling for the manual P-key pause.
         self._stdin_fd = None
         self._stdin_termios_original = None
@@ -457,6 +462,12 @@ class RandomNav2Patrol(Node):
         self.handoff_pause_requested = should_pause
 
         if should_pause:
+            # The detector publishes True only after a confident handoff has
+            # been confirmed. Remember that this pickup produced a handoff so
+            # its remaining dwell can be skipped when the handoff hold ends.
+            if self.pickup_state_active:
+                self.handoff_detected_current_pickup = True
+
             self.get_logger().info(
                 'Handoff pause requested. Temporarily stopping patrol.'
             )
@@ -467,6 +478,26 @@ class RandomNav2Patrol(Node):
             'Handoff pause released. Resuming patrol.'
         )
 
+        # A False from the handoff detector after a preceding True means the
+        # successful handoff interval has finished. If the normal midpoint
+        # dwell still has time remaining, end it now instead of waiting for the
+        # original dwell timer. random_stop_dwell_complete() preserves manual
+        # pause behavior, marks this midpoint stop complete, clears pickup
+        # state, and resumes toward the current endpoint.
+        if (
+            self.handoff_detected_current_pickup
+            and self.pickup_state_active
+            and self.dwell_timer is not None
+        ):
+            self.handoff_detected_current_pickup = False
+            self.get_logger().info(
+                'Successful handoff complete; ending remaining midpoint dwell '
+                'and continuing patrol immediately.'
+            )
+            self.random_stop_dwell_complete()
+            return
+
+        self.handoff_detected_current_pickup = False
         self.resume_patrol_if_possible()
 
     def request_pause_cancel(self) -> None:
@@ -693,6 +724,7 @@ class RandomNav2Patrol(Node):
 
     def begin_random_stop_dwell(self) -> None:
         """Enter pickup state and hold the randomized midpoint orientation."""
+        self.handoff_detected_current_pickup = False
         self._publish_pickup_state(True)
 
         self.get_logger().info(
