@@ -751,11 +751,11 @@ def create_app(
             cross_body_margin=0.1,
             require_forward_extension_for_success=True,
             forward_extension_weight=1000.0,
-            forward_extension_min=0.2,
+            forward_extension_min=0.3,
             probability_margin=probability_margin,
             robustness_radius = 0.015,
             robustness_neighbor_margin = 0.15, 
-            max_iterations=150,
+            max_iterations=50,
             bin_search_iterations=5,
             object_arm=user_handedness
         )
