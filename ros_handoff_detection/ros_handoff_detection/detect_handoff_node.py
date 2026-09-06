@@ -71,7 +71,7 @@ class HandoffInferenceNode(Node):
         # adding only one frame of confirmation latency.
         self.declare_parameter(
             "handoff_confirmation_frames",
-            4,
+            3,
         )
 
         self.declare_parameter(
