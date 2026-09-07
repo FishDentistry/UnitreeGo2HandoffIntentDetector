@@ -715,7 +715,7 @@ def create_app(
                 f"{quest_model_features_type}"
             )
 
-        probability_margin = 0.3
+        probability_margin = 0.4
 
         target_probability = min(
             0.5 + probability_margin,
